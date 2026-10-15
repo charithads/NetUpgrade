@@ -14,13 +14,18 @@ management security boundary.
 - Keep the dashboard bound to loopback unless remote access is required. If
   remote access is enabled, require HTTPS, restrict client addresses, and place
   it behind network controls that limit access to approved administrators.
+- The direct manager cannot be exposed remotely. Remote binding is accepted
+  only through the desktop launcher with configured users, HTTPS, and the
+  explicit remote-access setting.
 - Use individual, least-privilege switch accounts where the platform supports
   them. Do not reuse personal credentials or share credentials across teams.
 - Limit device management access to the required management VLAN and hosts.
 - Keep configuration backups and audit records access-controlled and backed
   up. They may contain sensitive topology and configuration data.
-- Verify image provenance and integrity against Cisco-published values before
-  distribution. Keep a tested recovery image and out-of-band access available.
+- Upload the `.bin` image and the matching `.bin.sha256` manifest downloaded
+  from Cisco's software download page. The application blocks image staging
+  and activation if the manifest is missing, malformed, or mismatched. Keep a
+  tested recovery image and out-of-band access available.
 - Upgrade a lab device and a small canary group first. Require a human change
   approval, a maintenance window, pre-check evidence, post-check evidence, and
   an explicit stop decision before expanding a rollout.

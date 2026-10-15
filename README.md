@@ -19,7 +19,7 @@ The dashboard shows switch availability, backup and upgrade state, events, and l
 - Test and manage device credentials.
 - Back up running configuration, version, boot, inventory, and optional additional commands.
 - Run readiness checks before upgrading, distribute IOS-XE images, activate upgrades, and verify the version after reload.
-- Verify an optional `<image>.bin.sha256` sidecar before scheduling or starting an upgrade; use the digest published by Cisco.
+- Require a matching `.bin.sha256` manifest and verify its Cisco-published SHA-256 digest before scheduling or starting an upgrade.
 - Start upgrades immediately or schedule them for a later date and time; view each worker's live progress in the dashboard.
 - Review device events, backups, and per-device command history. Command logs record commands and results metadata, not switch command output.
 - Use role-based dashboard accounts, access controls, and optional HTTPS from the desktop launcher.
@@ -37,7 +37,7 @@ The dashboard shows switch availability, backup and upgrade state, events, and l
 Install the application dependencies in PowerShell:
 
 ```powershell
-py -m pip install netmiko openpyxl psutil pystray pillow cryptography
+py -m pip install -r requirements.txt
 ```
 
 Start the desktop launcher:
@@ -70,7 +70,9 @@ Run the interactive whole-inventory upgrade flow:
 py launcher.py --cli
 ```
 
-The CLI prompts for the inventory, credentials, and image, then upgrades eligible switches in parallel.
+The CLI prompts for the inventory, credentials, and image, then upgrades eligible switches sequentially.
+Each reload-capable run requires a matching Cisco-published `.bin.sha256` checksum file. Only one
+reload-capable dashboard upgrade can run at a time; additional scheduled upgrades wait for capacity.
 
 ### Direct manager options
 
@@ -84,14 +86,14 @@ For example, use TCP checks when ICMP is blocked, set a custom dashboard port, o
 py ios_xe_upgrade_manager.py --mode tcp --port 22 --web-port 9000 --open
 ```
 
-Monitoring starts when requested from the dashboard. The direct manager listens on `127.0.0.1` by default. Binding to a non-local address requires `--allow-remote`; only enable remote access on a trusted network.
+Monitoring starts when requested from the dashboard. The direct manager listens on `127.0.0.1` by default and cannot be exposed remotely. Remote access must be enabled through the desktop launcher, with configured users and HTTPS.
 
 ## Build the Windows executable
 
 Install PyInstaller and the application dependencies, then build the launcher:
 
 ```powershell
-py -m pip install pyinstaller netmiko openpyxl psutil pystray pillow cryptography
+py -m pip install -r requirements.txt pyinstaller==6.22.3
 py -m PyInstaller --noconsole --onefile --name IOSXEUpgradeManager --icon app.ico --add-data "app.ico;." --hidden-import ios_xe_upgrade_manager --collect-all netmiko --collect-all cryptography launcher.py
 ```
 
@@ -111,7 +113,20 @@ The direct manager defaults to loopback. Enabling remote access exposes switch-m
 
 This application can run privileged commands that change network software. Use it in a controlled pilot until it has been reviewed and validated for your environment. See [SECURITY.md](SECURITY.md) for a deployment baseline and [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for the engineering and operational gates that remain before fleet-wide production use.
 
-For an additional local image-integrity check, place the Cisco-published SHA-256 digest in a text file named `<image filename>.sha256` beside the `.bin` image (for example, `cat9k_iosxe.bin.sha256`). The first token must be the 64-character hexadecimal digest. If the sidecar exists, a malformed file or digest mismatch blocks the upgrade. This check is optional for compatibility; it does not authenticate a digest copied from an untrusted source.
+Before starting or scheduling an upgrade, upload both the `.bin` image and the matching `.bin.sha256` manifest downloaded from Cisco's software download page. The manifest's first token must be the 64-character hexadecimal SHA-256 digest. The dashboard verifies the manifest and image bytes before saving it; a missing or mismatched manifest blocks upgrade and scheduling. Do not generate the expected digest from the local image or trust a checksum from an unverified source.
+
+## Verification
+
+Install the pinned development tools and run the automated checks from PowerShell:
+
+```powershell
+py -m pip install -r requirements-dev.txt
+py -m unittest discover -s tests -p "test_*.py" -v
+py tests/smoke_test.py
+pip-audit -r requirements.txt
+```
+
+CI runs the unit and smoke suites on supported Python versions, performs static checks and dependency auditing, and builds the Windows executable. The tests do not replace hardware-in-the-loop validation on every supported switch and IOS-XE release.
 
 ## Project files
 

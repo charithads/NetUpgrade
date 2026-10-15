@@ -11,7 +11,9 @@ The application provides a local dashboard, user roles, optional HTTPS and
 client restrictions, device monitoring, configuration backups, readiness
 checks, an IOS-XE install workflow, scheduling, and post-upgrade checks. CI
 currently performs a static Python check, a startup smoke test, and a Windows
-packaging dry run.
+packaging dry run. The application now requires and verifies a Cisco-published
+SHA-256 sidecar for every uploaded upgrade image, and CI includes unit and
+dependency-audit jobs.
 
 These capabilities are valuable, but do not by themselves demonstrate safe
 operation at fleet scale. In particular, each supported platform and IOS-XE
@@ -35,7 +37,8 @@ partially upgraded.
 
 ### 2. Safe upgrade orchestration
 
-- Require image checksum/signature verification against a trusted manifest.
+- Add cryptographic signature verification where Cisco publishes a verifiable
+  signature, and retain the trusted-source checksum gate for each image.
 - Make pre-check results explicit and block upgrades on failed or stale checks.
 - Add configurable canary batches, concurrency limits, maintenance windows,
   approval gates, and a fleet-wide stop control.

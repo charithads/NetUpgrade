@@ -22,8 +22,8 @@ What it does
                      finally shows the NEW software version. Any number of switches can upgrade
                      at the same time.
   * CLI upgrade    - "--cli" runs the original interactive, whole-list upgrade flow with no GUI
-                     (asks for credentials once, confirms, then upgrades every switch in parallel
-                     threads). This is independent of the GUI and mainly useful for scripting.
+                     (asks for credentials once, confirms, then upgrades switches sequentially
+                     to limit reload risk). This is independent of the GUI and mainly useful for scripting.
 
 This file is also the single source used to build the one-click Windows .exe (see
 build_exe.bat / BUILD.md) - "--job" is how the .exe re-launches itself as a per-switch worker,
@@ -50,7 +50,7 @@ backed up or upgraded).
 
 Security notes
   * The dashboard can back up and upgrade switches, so it only listens on 127.0.0.1 by default.
-    Any other --host needs --allow-remote and should only be used on a trusted network.
+    Remote binding is accepted only through the desktop launcher with configured users and HTTPS.
   * Credentials are typed into the GUI and sent only to this program. They are never written to
     logs. The upgrade worker receives them through a temporary file (owner-only permissions)
     that is deleted as soon as it has been read.
@@ -62,6 +62,7 @@ import csv
 import functools
 import getpass
 import hashlib
+import hmac
 import io
 import ipaddress
 import json
@@ -69,6 +70,7 @@ import os
 import platform
 import queue
 import re
+import secrets
 import shutil
 import smtplib
 import socket
@@ -406,6 +408,19 @@ def platform_family(model):
     return None
 
 
+def dashboard_exposure_error(host, allow_remote, access, tls):
+    """Refuse a remote dashboard unless authentication and HTTPS are active."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return None
+    if not allow_remote:
+        return "Refusing to listen on a non-local address without --allow-remote."
+    if access is None or not access.get("users"):
+        return "Remote access requires configured dashboard users through the desktop launcher."
+    if not tls:
+        return "Remote access requires HTTPS. Enable HTTPS in the desktop launcher."
+    return None
+
+
 def check_image_for_device(image_name, model, current_version):
     """Reasons (plain English) why this image looks wrong for this switch; [] = looks fine.
     Only checks what it can be sure about: an unknown model or version is simply not judged."""
@@ -695,15 +710,15 @@ def check_md5(filename, chunk_size=1024 * 1024):
             md5.update(chunk)
     return md5.hexdigest()
 #------------------------------------------------------------------------------
-def verify_image_sha256_sidecar(filename, chunk_size=1024 * 1024):
-    """Verify an optional <image>.sha256 manifest before an image can be queued.
+def verify_image_sha256_sidecar(filename, chunk_size=1024 * 1024, sidecar_path=None):
+    """Require and verify a <image>.sha256 manifest before an image can be queued.
 
     Obtain the expected digest independently from Cisco's trusted download page.
     """
     image_path = Path(filename)
-    sidecar = Path(str(image_path) + '.sha256')
+    sidecar = Path(sidecar_path) if sidecar_path else Path(str(image_path) + '.sha256')
     if not sidecar.exists():
-        return None
+        raise ValueError('missing SHA-256 sidecar {}'.format(sidecar.name))
     try:
         line = next((line.strip() for line in sidecar.read_text(encoding='utf-8').splitlines()
                      if line.strip() and not line.lstrip().startswith('#')), '')
@@ -1825,6 +1840,10 @@ def job_main(job_path):
             image_path = job['image_path']
             if not os.path.isfile(image_path):
                 raise RuntimeError('Image file not found: {}'.format(image_path))
+            try:
+                verify_image_sha256_sidecar(image_path)
+            except ValueError as exc:
+                raise RuntimeError('Image integrity check failed before worker execution: {}'.format(exc)) from exc
             image_name = os.path.basename(image_path)      # name on the switch's flash
 
             report('md5', 'Calculating the local MD5 of {} ...'.format(image_name))
@@ -1895,6 +1914,10 @@ def interactive_main():
     if not os.path.isfile(image_path):
         sys.exit('Image file not found: {}'.format(image_path))
     image_name = os.path.basename(image_path)          # name on the switch's flash
+    try:
+        verify_image_sha256_sidecar(image_path)
+    except ValueError as exc:
+        sys.exit('Image integrity check failed: {}'.format(exc))
 
     username = input('Enter Username: ').strip()
     try:
@@ -1918,20 +1941,14 @@ def interactive_main():
     print('Local MD5: {}'.format(md5))
 
     results = {}
-    config_threads_list = []
-
+    print('\n---- Starting one switch at a time; stopping after the first failed upgrade ----\n')
     for ipaddr, device in devices.items():
-        print('Creating thread for: ', device)
-        config_threads_list.append(threading.Thread(
-            target=command_worker, name=device['name'],
-            args=(device, creds, image_path, image_name, md5, results)))
-
-    print('\n---- Begin running command threading ----\n')
-    for config_thread in config_threads_list:
-        config_thread.start()
-
-    for config_thread in config_threads_list:
-        config_thread.join()
+        print('Starting sequential upgrade for: ', device)
+        command_worker(device, creds, image_path, image_name, md5, results)
+        status = results.get(ipaddr, 'UNKNOWN')
+        if status.startswith('FAILED'):
+            print('Stopping the rollout after {} failed: {}'.format(device['name'], status))
+            break
 
     print('\n---- Summary --------------------------')
     for ipaddr, device in devices.items():
@@ -1946,6 +1963,7 @@ def interactive_main():
 
 MIN_DURATION_MIN = 10         # minimum monitoring time when --duration is used
 BACKUP_WORKERS = 10           # parallel backup connections
+MAX_CONCURRENT_RELOADS = 1    # a single switch can reload at a time; scheduled jobs wait for capacity
 STALE_SECONDS = 90            # no heartbeat from an upgrade worker for this long = lost
 SCHEDULE_POLL = 2             # seconds between checks of pending scheduled upgrades
 MIN_SCHEDULE_LEAD = 30        # a scheduled time must be at least this far in the future
@@ -1963,6 +1981,7 @@ EXTRA_COMMANDS = [("show version", "show_version"), ("show boot", "show_boot"),
 
 IMAGES_DIRNAME = "IOS Images"       # folder (next to the program) where uploaded images are kept
 MAX_IMAGE_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024    # 2 GB - generous for any IOS-XE image
+MAX_CHECKSUM_UPLOAD_BYTES = 8192                   # includes multipart headers for a few lines of text
 MAX_DEVICE_LIST_UPLOAD_BYTES = 10 * 1024 * 1024    # 10 MB - an .xlsx switch list is tiny
 
 
@@ -2217,7 +2236,7 @@ def images_dir():
 def list_images():
     """Image filenames available for upload/upgrade, newest first."""
     d = images_dir()
-    files = [p for p in d.iterdir() if p.is_file() and not p.name.startswith(".")]
+    files = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() == ".bin"]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return [p.name for p in files]
 
@@ -4110,6 +4129,11 @@ class Manager:
     def _upgrade_active(self, host):
         return self.ops[host]["upgrade"]["state"] in ACTIVE
 
+    def _active_reload_count(self):
+        return sum(1 for host in self.order
+                   if self._upgrade_active(host)
+                   and self.ops[host]["upgrade"].get("action") in ("full", "activate"))
+
     # ---- backup ------------------------------------------------------------ #
     MAX_CUSTOM_COMMANDS = 20
     MAX_COMMAND_LENGTH = 200
@@ -4441,6 +4465,10 @@ class Manager:
         with self.lock:
             self._poll_all()
             self._check_upgradable(hosts)
+            reloads_requested = len(hosts) if action in ("full", "activate") else 0
+            if self._active_reload_count() + reloads_requested > MAX_CONCURRENT_RELOADS:
+                raise ApiError("Only one reload-capable switch upgrade may run at a time. "
+                               "Start one switch now or schedule the remaining switches.", 409)
             if not backup_first:                 # a backup-first run reads the platform itself
                 self._require_platform_known(hosts)
             if image:
@@ -4560,9 +4588,12 @@ class Manager:
                         # busy right this second (e.g. a manual backup just started) - try again shortly
                         entry["run_at"] = now + SCHEDULE_POLL
                         continue
+                    action = entry.get("action") or "full"
+                    if action in ("full", "activate") and self._active_reload_count() >= MAX_CONCURRENT_RELOADS:
+                        entry["run_at"] = now + SCHEDULE_POLL
+                        continue
                     del self.schedule[h]
                     self._save_schedule()
-                    action = entry.get("action") or "full"
                     by = f"{entry.get('scheduled_by') or 'local'} (scheduled)"
                     if entry.get("image_path") and not Path(entry["image_path"]).is_file():
                         self.ops[h]["upgrade"] = self._new_ops()["upgrade"]
@@ -6107,6 +6138,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <input type="file" id="image-file" accept=".bin">
         <div class="note" id="image-file-last"></div>
         <div class="row"><button class="btn" id="btn-upload-image" disabled>Upload image</button></div>
+        <label for="image-checksum-file">Upload Cisco-published SHA-256 manifest (.bin.sha256)</label>
+        <input type="file" id="image-checksum-file" accept=".sha256">
+        <div class="row"><button class="btn" id="btn-upload-checksum" disabled>Upload and verify checksum</button></div>
         <div class="hint" id="image-upload-status"></div>
         <label for="image-select" id="image-select-label">Select image to install</label>
         <select id="image-select"><option value="">No images uploaded yet</option></select>
@@ -7060,6 +7094,28 @@ $("btn-add-device").addEventListener("click", async () => {
 
 $("image-file").addEventListener("change", () => {
   $("btn-upload-image").disabled = !$("image-file").files.length;
+});
+$("image-checksum-file").addEventListener("change", () => {
+  $("btn-upload-checksum").disabled = !$("image-checksum-file").files.length;
+});
+$("btn-upload-checksum").addEventListener("click", async () => {
+  const file = $("image-checksum-file").files[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".bin.sha256")) {
+    sayIn(4, "err", "Name the checksum file after its image, ending in .bin.sha256."); return;
+  }
+  const status = $("image-upload-status");
+  $("btn-upload-checksum").disabled = true;
+  status.textContent = "Uploading and verifying " + file.name + " ...";
+  status.className = "hint";
+  try {
+    const r = await postFile("/api/images/checksum-upload", file);
+    status.textContent = r.message;
+    sayIn(4, "ok", r.message);
+    $("image-checksum-file").value = "";
+  } catch (e) {
+    status.textContent = ""; sayIn(4, "err", e.message);
+  } finally { $("btn-upload-checksum").disabled = !$("image-checksum-file").files.length; }
 });
 $("btn-upload-image").addEventListener("click", async () => {
   const file = $("image-file").files[0];
@@ -8414,7 +8470,7 @@ def make_handler(manager, allowed_hosts, any_host):
             else:
                 raise ApiError("File not found.", 404)
 
-        UPLOAD_PATHS = ("/api/images/upload", "/api/devices/upload")
+        UPLOAD_PATHS = ("/api/images/upload", "/api/images/checksum-upload", "/api/devices/upload")
 
         def _check_request(self, post, path=None):
             """Reject DNS-rebinding and cross-site requests (this GUI can start upgrades)."""
@@ -8584,6 +8640,34 @@ def make_handler(manager, allowed_hosts, any_host):
                         "message": f"Uploaded {chosen['name']} ({size / 1_048_576:.1f} MB).",
                         "filename": chosen["name"], "images": list_images(),
                     })
+
+                elif path == "/api/images/checksum-upload":
+                    chosen = {}
+
+                    def dest_for_checksum(filename):
+                        name = safe_upload_filename(filename)
+                        if not name.lower().endswith(".bin.sha256"):
+                            raise ValueError("Checksum file must be named <image>.bin.sha256.")
+                        image_name = name[:-len(".sha256")]
+                        image_path = images_dir() / image_name
+                        if not image_path.is_file() or image_path.suffix.lower() != ".bin":
+                            raise ValueError("Upload the matching .bin image before its checksum.")
+                        chosen.update(name=name, image_path=image_path,
+                                      final_path=Path(str(image_path) + ".sha256"))
+                        return str(images_dir() / ("." + name + "." + secrets.token_hex(8) + ".upload"))
+
+                    _, _, size, temp_path = read_multipart_file(
+                        self.rfile, length, ctype, MAX_CHECKSUM_UPLOAD_BYTES, dest_for_checksum)
+                    try:
+                        verify_image_sha256_sidecar(chosen["image_path"], sidecar_path=temp_path)
+                        os.replace(temp_path, chosen["final_path"])
+                    except (OSError, ValueError) as exc:
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                        raise ApiError(f"Checksum manifest rejected: {exc}") from exc
+                    self._json(200, {"message": f"Verified Cisco SHA-256 manifest for {chosen['name']}."})
 
                 elif path == "/api/devices/upload":
                     filename, data, size, _ = read_multipart_file(
@@ -9178,7 +9262,7 @@ def gui_main(embedded=False, argv=None, access=None, tls=None):
                    help="Consecutive failed checks before a switch is marked DOWN (default: 2)")
     p.add_argument("--host", default="127.0.0.1", help="Dashboard bind address (default: 127.0.0.1)")
     p.add_argument("--allow-remote", action="store_true",
-                   help="Required to bind to anything other than localhost (the GUI can upgrade switches!)")
+                   help="Request remote binding; requires the desktop launcher's login and HTTPS controls")
     p.add_argument("--web-port", type=int, default=8080, help="Dashboard port (default: 8080)")
     p.add_argument("--open", action="store_true", help="Open the dashboard in your browser")
     args = p.parse_args(argv)
@@ -9188,9 +9272,9 @@ def gui_main(embedded=False, argv=None, access=None, tls=None):
     if args.interval <= 0 or args.timeout <= 0 or args.fail_threshold < 1:
         p.error("--interval and --timeout must be > 0 and --fail-threshold must be >= 1")
     loopback = args.host in ("127.0.0.1", "localhost", "::1")
-    if not loopback and not args.allow_remote:
-        p.error("Refusing to listen on a non-local address: this GUI can back up and upgrade switches "
-                "and has no login. Add --allow-remote if you really want that (trusted network only).")
+    exposure_error = dashboard_exposure_error(args.host, args.allow_remote, access, tls)
+    if exposure_error:
+        p.error(exposure_error)
     if args.mode == "icmp" and shutil.which("ping") is None:
         sys.exit("The 'ping' command was not found. Install it or use: --mode tcp --port 22")
 
