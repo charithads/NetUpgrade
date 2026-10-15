@@ -1,0 +1,68 @@
+name: CI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Check code
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install netmiko openpyxl pystray pillow psutil cryptography flake8
+
+      - name: Syntax + undefined-name check
+        run: flake8 ios_xe_upgrade_manager.py launcher.py --select=E9,F63,F7,F82 --show-source
+
+      - name: Smoke test (versions, Excel, dashboard starts)
+        run: python tests/smoke_test.py
+
+  build-dry-run:
+    name: PyInstaller dry run
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install netmiko openpyxl pystray pillow psutil cryptography pyinstaller
+
+      - name: Build .exe
+        shell: pwsh
+        run: |
+          $args = @("--noconsole","--onefile","--name","IOSXEUpgradeManager",
+                    "--hidden-import","ios_xe_upgrade_manager",
+                    "--collect-all","netmiko","--collect-all","cryptography")
+          if (Test-Path app.ico) { $args += @("--icon","app.ico","--add-data","app.ico;.") }
+          pyinstaller @args launcher.py
+
+      - name: Confirm the .exe exists
+        shell: pwsh
+        run: if (-not (Test-Path dist/IOSXEUpgradeManager.exe)) { throw "exe not built" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IOSXEUpgradeManager
+          path: dist/IOSXEUpgradeManager.exe
+          retention-days: 7
