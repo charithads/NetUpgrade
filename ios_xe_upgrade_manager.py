@@ -695,6 +695,37 @@ def check_md5(filename, chunk_size=1024 * 1024):
             md5.update(chunk)
     return md5.hexdigest()
 #------------------------------------------------------------------------------
+def verify_image_sha256_sidecar(filename, chunk_size=1024 * 1024):
+    """Verify an optional <image>.sha256 manifest before an image can be queued.
+
+    Obtain the expected digest independently from Cisco's trusted download page.
+    """
+    image_path = Path(filename)
+    sidecar = Path(str(image_path) + '.sha256')
+    if not sidecar.exists():
+        return None
+    try:
+        line = next((line.strip() for line in sidecar.read_text(encoding='utf-8').splitlines()
+                     if line.strip() and not line.lstrip().startswith('#')), '')
+    except (OSError, UnicodeError) as exc:
+        raise ValueError('could not read SHA-256 sidecar: {}'.format(exc)) from exc
+    match = re.fullmatch(r'([0-9a-fA-F]{64})(?:\s+\*?.*)?', line)
+    if not match:
+        raise ValueError('SHA-256 sidecar must start with a 64-character hexadecimal digest')
+    expected = match.group(1).lower()
+    digest = hashlib.sha256()
+    try:
+        with image_path.open('rb') as image:
+            for chunk in iter(lambda: image.read(chunk_size), b''):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValueError('could not read image for SHA-256 verification: {}'.format(exc)) from exc
+    actual = digest.hexdigest()
+    if not hmac.compare_digest(actual, expected):
+        raise ValueError('SHA-256 mismatch for {} (expected {}, got {})'.format(
+            image_path.name, expected, actual))
+    return actual
+#------------------------------------------------------------------------------
 def software_install(net_connect, image_name, device, timeout=None, mode='full'):
     """IOS-XE install mode. `mode` selects which install command is actually run:
       'full'       - install add file ... activate commit   (upload+add+activate+reload, one step;
@@ -4070,6 +4101,10 @@ class Manager:
         size = p.stat().st_size
         if size == 0:
             raise ApiError("The image file is empty.")
+        try:
+            verify_image_sha256_sidecar(p)
+        except ValueError as exc:
+            raise ApiError(f"Image integrity check failed: {exc}") from exc
         return str(p.resolve()), size
 
     def _upgrade_active(self, host):

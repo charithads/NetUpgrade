@@ -19,6 +19,7 @@ The dashboard shows switch availability, backup and upgrade state, events, and l
 - Test and manage device credentials.
 - Back up running configuration, version, boot, inventory, and optional additional commands.
 - Run readiness checks before upgrading, distribute IOS-XE images, activate upgrades, and verify the version after reload.
+- Verify an optional `<image>.bin.sha256` sidecar before scheduling or starting an upgrade; use the digest published by Cisco.
 - Start upgrades immediately or schedule them for a later date and time; view each worker's live progress in the dashboard.
 - Review device events, backups, and per-device command history. Command logs record commands and results metadata, not switch command output.
 - Use role-based dashboard accounts, access controls, and optional HTTPS from the desktop launcher.
@@ -109,6 +110,8 @@ Application settings, audit logs, application logs, and TLS files are stored und
 The direct manager defaults to loopback. Enabling remote access exposes switch-management capabilities to reachable clients, so configure authentication and network restrictions appropriately when using the launcher.
 
 This application can run privileged commands that change network software. Use it in a controlled pilot until it has been reviewed and validated for your environment. See [SECURITY.md](SECURITY.md) for a deployment baseline and [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for the engineering and operational gates that remain before fleet-wide production use.
+
+For an additional local image-integrity check, place the Cisco-published SHA-256 digest in a text file named `<image filename>.sha256` beside the `.bin` image (for example, `cat9k_iosxe.bin.sha256`). The first token must be the 64-character hexadecimal digest. If the sidecar exists, a malformed file or digest mismatch blocks the upgrade. This check is optional for compatibility; it does not authenticate a digest copied from an untrusted source.
 
 ## Project files
 
