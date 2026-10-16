@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-IOS-XE Upgrade Manager v5.6.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v5.6.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -95,7 +95,7 @@ from pathlib import Path
 from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
-APP_NAME = "IOS-XE Upgrade Manager"
+APP_NAME = "NetUpgrade"
 APP_VERSION = "5.6.1"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/Switch-Upgrade-Manager---Cisco-IOS-XE"   # shown in the footer
@@ -2646,7 +2646,7 @@ class EventLog:
 # --------------------------------------------------------------------------- #
 EMAIL_BATCH_SECONDS = 20          # events close together are combined into ONE e-mail
 EMAIL_MAX_RECIPIENTS = 20
-EMAIL_SUBJECT_PREFIX = "[IOS-XE Upgrade Manager]"
+EMAIL_SUBJECT_PREFIX = "[NetUpgrade]"
 _EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
 
 
@@ -3262,7 +3262,15 @@ PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$")
 
 
 def _profile_key_path():
-    base = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "IOSXEUpgradeManager"
+    root = Path(os.environ.get("LOCALAPPDATA") or Path.home())
+    legacy = root / "IOSXEUpgradeManager"
+    base = root / "NetUpgrade"
+    if legacy.is_dir() and not base.exists():
+        try:
+            import shutil
+            shutil.copytree(legacy, base)
+        except OSError:
+            base = legacy  # Preserve access to existing credentials if migration is blocked.
     base.mkdir(parents=True, exist_ok=True)
     return base / "profile.key"
 
@@ -5673,7 +5681,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IOS-XE Upgrade Manager</title>
+<title>NetUpgrade</title>
 <style>
   /* Cisco Cloud Control style. Light by default, dark follows the OS/browser or the toggle. */
   :root {
@@ -9034,7 +9042,7 @@ def apply_access_control(base_handler, access):
     def login_page(next_url, error=""):
         err = f"<div class='err'>{_html.escape(error)}</div>" if error else ""
         return page("Sign in", (
-            "<h1>IOS-XE Upgrade Manager</h1><p>Sign in to continue.</p>" + err +
+            "<h1>NetUpgrade</h1><p>Sign in to continue.</p>" + err +
             "<form method='post' action='/__guard/login'>"
             f"<input type='hidden' name='next' value='{_html.escape(next_url, quote=True)}'>"
             "<label>Username<input name='username' autocomplete='username' autofocus required></label>"
@@ -9051,7 +9059,7 @@ def apply_access_control(base_handler, access):
     def setup_page():
         return page("Setup needed", (
             "<h1>Setup needed</h1><p>The administrator account has not been created yet. "
-            "Open the IOS-XE Upgrade Manager window on the PC that runs this tool and create it first.</p>"))
+            "Open the NetUpgrade window on the PC that runs this tool and create it first.</p>"))
 
     SHELL_JS = r"""
 var f=document.getElementById('f'), last='', lastT=0;
@@ -9122,7 +9130,7 @@ setInterval(async function(){
         who = json.dumps({"name": user, "role": role}).replace("<", "\\u003c")
         return ("<!doctype html><html><head><meta charset='utf-8'>"
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<title>IOS-XE Upgrade Manager</title><style>"
+                "<title>NetUpgrade</title><style>"
                 "html,body{margin:0;height:100%;overflow:hidden}iframe{display:block;border:0;width:100%;height:100%}"
                 f"</style></head><body><iframe id='f' src='{src}'></iframe><script>var WHO={who};{SHELL_JS}</script></body></html>")
 
@@ -9432,7 +9440,7 @@ apply_access_control.version = 5      # the launcher checks this to detect an ou
 def gui_main(embedded=False, argv=None, access=None, tls=None):
     if getattr(sys, "frozen", False):
         sys.excepthook = _frozen_excepthook
-    p = argparse.ArgumentParser(description="IOS-XE Upgrade Manager - monitor, back up and upgrade "
+    p = argparse.ArgumentParser(description="NetUpgrade - monitor, back up and upgrade "
                                             "Cisco C9200 switches.")
     p.add_argument("--version", action="version", version=f"{APP_NAME} v{APP_VERSION}")
     p.add_argument("excel", nargs="?", default=None,

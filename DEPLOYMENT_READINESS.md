@@ -1,7 +1,7 @@
-# Production readiness plan
+# Deployment readiness plan
 
 This document describes the controls required before this application should
-be used to make fleet-wide changes to production network devices. The current
+be used to make fleet-wide changes to live network devices. The current
 application is a useful Windows desktop utility and should be treated as a
 controlled pilot until these gates are met.
 
@@ -88,10 +88,10 @@ partially upgraded.
    stop control, richer post-checks, and recovery drills.
 3. **Operational scale:** transactional storage, centralized audit/monitoring,
    measured capacity limits, signed releases, and disaster recovery.
-4. **Production acceptance:** pass security review, hardware matrix, failure
+4. **Deployment acceptance:** pass security review, hardware matrix, failure
    injection, load targets, and staged rollout criteria for the target
    environment.
 
-Production readiness is deployment-specific. Passing CI or completing this
+Readiness depends on the target deployment. Passing CI or completing this
 checklist does not guarantee safe operation without change-management
 procedures and validation on the actual device fleet.

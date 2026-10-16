@@ -1,6 +1,6 @@
-# IOS-XE Upgrade Manager
+# NetUpgrade
 
-IOS-XE Upgrade Manager is a Windows desktop application for monitoring Cisco Catalyst switches, managing device inventories, collecting configuration backups, and running or scheduling IOS-XE upgrades. The desktop launcher runs in the Windows notification area and opens a local web dashboard.
+NetUpgrade is a Windows desktop application for monitoring Cisco Catalyst switches, managing device inventories, collecting configuration backups, and running or scheduling IOS-XE upgrades. The desktop launcher runs in the Windows notification area and opens a local web dashboard.
 
 The current application version is **5.6.1**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
 
@@ -97,10 +97,10 @@ Install PyInstaller and the application dependencies, then build the launcher:
 
 ```powershell
 py -m pip install -r requirements.txt pyinstaller==6.22.3
-py -m PyInstaller --noconsole --onefile --name IOSXEUpgradeManager --icon app.ico --add-data "app.ico;." --hidden-import ios_xe_upgrade_manager --collect-all netmiko --collect-all cryptography launcher.py
+py -m PyInstaller --noconsole --onefile --name NetUpgrade --icon app.ico --add-data "app.ico;." --hidden-import ios_xe_upgrade_manager --collect-all netmiko --collect-all cryptography launcher.py
 ```
 
-The executable is created at `dist\IOSXEUpgradeManager.exe`. Keep `ios_xe_upgrade_manager.py` available to the build process; the launcher packages it as a hidden import and invokes its worker mode for device upgrades.
+The executable is created at `dist\NetUpgrade.exe`. Keep `ios_xe_upgrade_manager.py` available to the build process; the launcher packages it as a hidden import and invokes its worker mode for device upgrades.
 
 ## Security and local data
 
@@ -109,12 +109,12 @@ The desktop launcher supports administrator, operator, and viewer roles, an admi
 Application settings, audit logs, application logs, and TLS files are stored under:
 
 ```text
-%LOCALAPPDATA%\IOSXEUpgradeManager
+%LOCALAPPDATA%\NetUpgrade
 ```
 
 The direct manager defaults to loopback. Enabling remote access exposes switch-management capabilities to reachable clients, so configure authentication and network restrictions appropriately when using the launcher.
 
-This application can run privileged commands that change network software. Use it in a controlled pilot until it has been reviewed and validated for your environment. See [SECURITY.md](SECURITY.md) for a deployment baseline and [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for the engineering and operational gates that remain before fleet-wide production use.
+This application can run privileged commands that change network software. Use it in a controlled pilot until it has been reviewed and validated for your environment. See [SECURITY.md](SECURITY.md) for a deployment baseline and [DEPLOYMENT_READINESS.md](DEPLOYMENT_READINESS.md) for the engineering and operational gates that remain before broad deployment.
 
 Before starting or scheduling an upgrade, upload both the `.bin` image and the matching `.bin.sha256` manifest downloaded from Cisco's software download page. The manifest's first token must be the 64-character hexadecimal SHA-256 digest. The dashboard verifies the manifest and image bytes before saving it; a missing or mismatched manifest blocks upgrade and scheduling. Do not generate the expected digest from the local image or trust a checksum from an unverified source.
 

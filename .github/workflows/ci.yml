@@ -82,7 +82,7 @@ jobs:
       - name: Build .exe
         shell: pwsh
         run: |
-          $args = @("--noconsole","--onefile","--name","IOSXEUpgradeManager",
+          $args = @("--noconsole","--onefile","--name","NetUpgrade",
                     "--hidden-import","ios_xe_upgrade_manager",
                     "--collect-all","netmiko","--collect-all","cryptography")
           if (Test-Path app.ico) { $args += @("--icon","app.ico","--add-data","app.ico;.") }
@@ -90,10 +90,10 @@ jobs:
 
       - name: Confirm the .exe exists
         shell: pwsh
-        run: if (-not (Test-Path dist/IOSXEUpgradeManager.exe)) { throw "exe not built" }
+        run: if (-not (Test-Path dist/NetUpgrade.exe)) { throw "exe not built" }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: IOSXEUpgradeManager
-          path: dist/IOSXEUpgradeManager.exe
+          name: NetUpgrade
+          path: dist/NetUpgrade.exe
           retention-days: 7

@@ -3,7 +3,7 @@
 ## Scope
 
 This project can store network device credentials and run privileged IOS-XE
-commands that may interrupt production traffic. Treat the application host,
+commands that may interrupt live network traffic. Treat the application host,
 its local data, and its network path to switches as part of the network
 management security boundary.
 
@@ -35,7 +35,7 @@ management security boundary.
 
 This application has not undergone an independent security assessment. It is a
 single-host desktop application, not a hardened multi-tenant service. Before
-production use, review session handling, CSRF protections, rate limiting,
+broad deployment, review session handling, CSRF protections, rate limiting,
 secret storage and recovery, audit-log integrity, input validation, TLS
 configuration, and privilege boundaries. Run it only in a controlled pilot
 until those controls have been verified for the intended deployment.

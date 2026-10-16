@@ -1,5 +1,5 @@
 """
-Launcher for the IOS-XE Upgrade Manager.
+Launcher for the NetUpgrade.
 
 One small window with two tabs:
   General  - network interface, port, HTTPS, tool status (running / stopped),
@@ -19,6 +19,7 @@ import os
 import sys
 
 import subprocess
+import shutil
 
 
 # --- No console flashes ----------------------------------------------------
@@ -79,7 +80,7 @@ import psutil
 import pystray
 from PIL import Image, ImageTk
 
-APP_NAME = "IOS-XE Upgrade Manager"
+APP_NAME = "NetUpgrade"
 APP_VERSION = "5.6.1"          # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
 UI_FONT_SIZE = 8               # window size follows the font: 9 = the old, larger window; 8 = compact
 APP_AUTHOR = "Charitha Dasanayaka"
@@ -96,7 +97,14 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
-DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", "."), "IOSXEUpgradeManager")
+_DATA_ROOT = os.environ.get("LOCALAPPDATA", ".")
+_LEGACY_DATA_DIR = os.path.join(_DATA_ROOT, "IOSXEUpgradeManager")
+DATA_DIR = os.path.join(_DATA_ROOT, "NetUpgrade")
+if os.path.isdir(_LEGACY_DATA_DIR) and not os.path.exists(DATA_DIR):
+    try:
+        shutil.copytree(_LEGACY_DATA_DIR, DATA_DIR)
+    except OSError:
+        DATA_DIR = _LEGACY_DATA_DIR  # Keep existing settings usable if migration is blocked.
 os.makedirs(DATA_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
@@ -114,7 +122,7 @@ ICON_PATH = resource_path("app.ico")
 
 # Tell Windows this is its own app (not "python"), so the taskbar shows our icon.
 try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("IOSXEUpgradeManager.Launcher")
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NetUpgrade.Launcher")
 except Exception:
     pass
 
