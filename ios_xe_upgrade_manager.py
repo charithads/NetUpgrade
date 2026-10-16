@@ -6403,7 +6403,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="msg" id="msg-4" role="status" aria-live="polite"></div>
         <label for="image-file" style="margin-top:0">Upload IOS-XE image (.bin)<span class="tip" data-tip="The image is saved in the &quot;IOS Images&quot; folder."></span></label>
         <input type="file" id="image-file" accept=".bin">
-        <label for="image-sha512">Paste Cisco SHA-512 checksum</label>
+        <label for="image-sha512">Paste Cisco SHA-512 checksum<span class="tip" data-tip="Paste the 128-character SHA-512 value from Cisco. The upload is rejected if it does not match the image."></span></label>
         <input type="text" id="image-sha512" maxlength="128" spellcheck="false" autocomplete="off"
                autocapitalize="off" placeholder="128 hexadecimal characters">
         <div class="hint">Copy the SHA-512 checksum from the Cisco download page. The image is checked before it is saved.</div>
