@@ -22,8 +22,9 @@ What it does
                      finally shows the NEW software version. Any number of switches can upgrade
                      at the same time.
   * CLI upgrade    - "--cli" runs the original interactive, whole-list upgrade flow with no GUI
-                     (asks for credentials once, confirms, then upgrades switches sequentially
-                     to limit reload risk). This is independent of the GUI and mainly useful for scripting.
+                     (asks for credentials once, confirms, then upgrades switches one at a time by
+                     default; --parallel N upgrades N at once in waves, and the rollout stops after a
+                     wave with a failure unless --continue-on-failure is added). Independent of the GUI.
 
 This file is also the single source used to build the one-click Windows .exe (see
 build_exe.bat / BUILD.md) - "--job" is how the .exe re-launches itself as a per-switch worker,
@@ -1940,14 +1941,38 @@ def interactive_main():
     md5 = check_md5(image_path)                        # once, not once per device
     print('Local MD5: {}'.format(md5))
 
+    parallel, stop_on_failure = 1, True
+    argv = sys.argv[1:]
+    if '--parallel' in argv:
+        try:
+            parallel = max(1, min(MAX_PARALLEL_LIMIT, int(argv[argv.index('--parallel') + 1])))
+        except (IndexError, ValueError):
+            sys.exit('--parallel needs a number from 1 to {}'.format(MAX_PARALLEL_LIMIT))
+    if '--continue-on-failure' in argv:
+        stop_on_failure = False
+
     results = {}
-    print('\n---- Starting one switch at a time; stopping after the first failed upgrade ----\n')
-    for ipaddr, device in devices.items():
-        print('Starting sequential upgrade for: ', device)
-        command_worker(device, creds, image_path, image_name, md5, results)
-        status = results.get(ipaddr, 'UNKNOWN')
-        if status.startswith('FAILED'):
-            print('Stopping the rollout after {} failed: {}'.format(device['name'], status))
+    print('\n---- Upgrading {} switch(es) at a time; {} ----\n'.format(
+        parallel, 'stopping after a wave with a failed upgrade' if stop_on_failure
+        else 'continuing even if an upgrade fails'))
+    items = list(devices.items())
+    for start in range(0, len(items), parallel):
+        wave = items[start:start + parallel]
+        threads = []
+        for ipaddr, device in wave:
+            print('Starting upgrade for: ', device)
+            threads.append(threading.Thread(
+                target=command_worker, name=device['name'],
+                args=(device, creds, image_path, image_name, md5, results)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        failed = [device['name'] for ipaddr, device in wave
+                  if results.get(ipaddr, 'UNKNOWN').startswith('FAILED')]
+        if failed and stop_on_failure and start + parallel < len(items):
+            print('Stopping the rollout: {} failed. The remaining switches were not started.'.format(
+                ', '.join(failed)))
             break
 
     print('\n---- Summary --------------------------')
@@ -1963,7 +1988,9 @@ def interactive_main():
 
 MIN_DURATION_MIN = 10         # minimum monitoring time when --duration is used
 BACKUP_WORKERS = 10           # parallel backup connections
-MAX_CONCURRENT_RELOADS = 1    # a single switch can reload at a time; scheduled jobs wait for capacity
+MAX_CONCURRENT_RELOADS = 1    # DEFAULT number of switches upgraded (reloaded) at the same time; an Administrator
+                              # can change it in the GUI (saved per site); the rest of a batch waits in a queue
+MAX_PARALLEL_LIMIT = 10       # the most an Administrator can set
 STALE_SECONDS = 90            # no heartbeat from an upgrade worker for this long = lost
 SCHEDULE_POLL = 2             # seconds between checks of pending scheduled upgrades
 MIN_SCHEDULE_LEAD = 30        # a scheduled time must be at least this far in the future
@@ -2801,7 +2828,7 @@ EMAILER = EmailNotifier()
 ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER = "administrator", "operator", "viewer"
 ROLES = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER)
 ROLE_LABELS = {ROLE_ADMIN: "Administrator", ROLE_OPERATOR: "Operator", ROLE_VIEWER: "Viewer"}
-OPERATOR_DENIED_POSTS = ("/api/monitor/stop",)
+OPERATOR_DENIED_POSTS = ("/api/monitor/stop", "/api/upgrade-settings")
 VIEWER_PAGES = ("/", "/index.html", "/favicon.ico")
 VIEWER_GETS = ("/api/status", "/api/console", "/api/me", "/api/device", "/api/upgrade-report.csv",
                "/api/upgrade-report.xlsx", "/api/upgrade-report/print")
@@ -2831,7 +2858,7 @@ def role_allows(role, method, path):
         return True, ""
     if role == ROLE_OPERATOR:
         if method == "POST" and _canonical_path(raw) in OPERATOR_DENIED_POSTS:
-            return False, "Operators cannot stop monitoring. Ask an Administrator."
+            return False, "Operators cannot stop monitoring or change the upgrade settings. Ask an Administrator."
         return True, ""
     if role == ROLE_VIEWER:
         if method in ("GET", "HEAD") and (raw in VIEWER_GETS or raw in VIEWER_PAGES):
@@ -3307,6 +3334,10 @@ def site_schedule_path(name):
     return site_dir(name) / "schedules.json"
 
 
+def site_upgrade_settings_path(name):
+    return site_dir(name) / "upgrade_settings.json"
+
+
 def site_notes_path(name):
     return site_dir(name) / "notifications.json"
 
@@ -3714,7 +3745,11 @@ class Manager:
         self.term_lock = threading.Lock()
         self.ops = {}
         self.jobs = {}                      # host -> private upgrade job data (paths, process)
-        self.schedule = {}                  # host -> pending scheduled upgrade (kept in memory only)
+        self.schedule = {}                  # host -> pending scheduled / queued upgrade (saved with the site)
+        self.max_parallel = MAX_CONCURRENT_RELOADS   # switches upgraded at the same time (per site setting)
+        self.stop_on_failure = True         # stop starting queued switches once one in the rollout fails
+        self.rollouts = {}                  # rollout id -> {"hosts": set, "failed": bool, "by": str}
+        self.rollout_of = {}                # host -> rollout id
         self.profiles = {}                  # credential profiles of the active site (passwords encrypted)
         self.assign = {}                    # host -> credential profile name
         self.notes = []                     # upgrade notifications of the active site (oldest first)
@@ -3757,6 +3792,8 @@ class Manager:
                 save_site_devices(self.site_name, [self.info[h] for h in self.order])
             cancelled_schedules = len(self.schedule)
             self.schedule.clear()
+            self.rollouts.clear()
+            self.rollout_of.clear()
             self._save_schedule()                            # the outgoing site's file, still the active one here
 
             site_dir(name).mkdir(parents=True, exist_ok=True)  # so it's listed even with 0 devices
@@ -3794,7 +3831,11 @@ class Manager:
                     self.schedule[h] = {"run_at": e["run_at"], "image_path": e.get("image_path"),
                                         "created": e.get("created") or "", "backup_first": bool(e.get("backup_first")),
                                         "action": e.get("action") or "full",
-                                        "scheduled_by": e.get("scheduled_by") or "local"}
+                                        "scheduled_by": e.get("scheduled_by") or "local",
+                                        "queued": bool(e.get("queued")),
+                                        "rollout": e.get("rollout") if isinstance(e.get("rollout"), str) else None}
+            self._rebuild_rollouts()
+            self._load_upgrade_settings(name)
             known = load_known_versions()
             for h in self.order:
                 self._apply_known_version(h, known)
@@ -3939,6 +3980,7 @@ class Manager:
                 del self.info[h]
                 del self.ops[h]
                 self.schedule.pop(h, None)
+                self._rollout_forget(h)
                 self.jobs.pop(h, None)
                 self.assign.pop(h, None)
                 self.term_close_host(h)
@@ -4128,6 +4170,101 @@ class Manager:
 
     def _upgrade_active(self, host):
         return self.ops[host]["upgrade"]["state"] in ACTIVE
+
+    # ---- parallel upgrades: settings, queue and stop-on-failure ---------------- #
+    def upgrade_settings_view(self):
+        return {"max_parallel": self.max_parallel, "stop_on_failure": self.stop_on_failure,
+                "limit": MAX_PARALLEL_LIMIT}
+
+    def _load_upgrade_settings(self, name):
+        data = read_json_file(site_upgrade_settings_path(name))
+        data = data if isinstance(data, dict) else {}
+        try:
+            self.max_parallel = max(1, min(MAX_PARALLEL_LIMIT, int(data.get("max_parallel", MAX_CONCURRENT_RELOADS))))
+        except (TypeError, ValueError):
+            self.max_parallel = MAX_CONCURRENT_RELOADS
+        self.stop_on_failure = bool(data.get("stop_on_failure", True))
+
+    def _save_upgrade_settings(self):
+        if not self.site_name:
+            return
+        try:
+            path = site_upgrade_settings_path(self.site_name)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.upgrade_settings_view()), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            print(f"Could not save the upgrade settings: {exc}", flush=True)
+
+    def set_upgrade_settings(self, max_parallel, stop_on_failure, who=None):
+        self._require_site()
+        if isinstance(max_parallel, bool) or not isinstance(max_parallel, (int, str)):
+            raise ApiError("Enter a whole number of switches.")
+        try:
+            n = int(max_parallel)
+        except (TypeError, ValueError):
+            raise ApiError("Enter a whole number of switches.")
+        if not 1 <= n <= MAX_PARALLEL_LIMIT:
+            raise ApiError(f"Switches at the same time must be between 1 and {MAX_PARALLEL_LIMIT}.")
+        with self.lock:
+            self.max_parallel, self.stop_on_failure = n, bool(stop_on_failure)
+            self._save_upgrade_settings()
+        text = (f"Upgrade settings: {n} switch(es) at the same time; "
+                + ("the rollout stops if one fails" if self.stop_on_failure else "the rollout continues if one fails"))
+        self.events.add("-", "", f"{text} (set by {who or 'local'})", "info")
+        return {"message": text + ".", **self.upgrade_settings_view()}
+
+    def _rebuild_rollouts(self):
+        """Re-create the rollout records of schedule entries loaded from disk."""
+        self.rollouts.clear()
+        self.rollout_of.clear()
+        for h, e in self.schedule.items():
+            rid = e.get("rollout")
+            if rid:
+                self.rollouts.setdefault(rid, {"hosts": set(), "failed": False, "by": e.get("scheduled_by")})
+                self.rollouts[rid]["hosts"].add(h)
+                self.rollout_of[h] = rid
+
+    def _new_rollout(self, hosts, by):
+        """A group of switches started together; if one fails, the ones still waiting are not started."""
+        rid = secrets.token_hex(4)
+        for h in hosts:
+            self._rollout_forget(h)
+            self.rollout_of[h] = rid
+        self.rollouts[rid] = {"hosts": set(hosts), "failed": False, "by": by or "local"}
+        return rid
+
+    def _rollout_forget(self, host):
+        rid = self.rollout_of.pop(host, None)
+        if rid in self.rollouts:
+            self.rollouts[rid]["hosts"].discard(host)
+
+    def _check_rollouts(self):
+        """Called with self.lock held. If a switch of a rollout failed (or needs attention) and
+        'stop on failure' is on, the switches of that rollout that have not started yet are
+        removed from the queue. Switches already running are left to finish."""
+        for rid, ro in list(self.rollouts.items()):
+            hosts = [h for h in ro["hosts"] if h in self.ops]
+            waiting = [h for h in hosts if (self.schedule.get(h) or {}).get("rollout") == rid]
+            started = [h for h in hosts if h not in waiting]
+            if self.stop_on_failure and not ro["failed"] and waiting:
+                bad = [h for h in started if self.ops[h]["upgrade"]["state"] in ("failed", "attention")]
+                if bad:
+                    ro["failed"] = True
+                    for h in waiting:
+                        self.schedule.pop(h, None)
+                        self._rollout_forget(h)
+                        self.events.add(h, self.label(h), "Upgrade not started: "
+                                        f"{self.label(bad[0])} failed earlier in this rollout", "warn")
+                    self._save_schedule()
+                    self._notify(bad[0], "failed", "Rollout stopped",
+                                 f"{self.label(bad[0])} did not finish its upgrade, so {len(waiting)} "
+                                 "switch(es) that were still waiting were not started. Running ones continue.")
+                    waiting = []
+            if not waiting and not any(self._upgrade_active(h) for h in started):
+                for h in hosts:
+                    self.rollout_of.pop(h, None)
+                del self.rollouts[rid]
 
     def _active_reload_count(self):
         return sum(1 for host in self.order
@@ -4465,10 +4602,10 @@ class Manager:
         with self.lock:
             self._poll_all()
             self._check_upgradable(hosts)
-            reloads_requested = len(hosts) if action in ("full", "activate") else 0
-            if self._active_reload_count() + reloads_requested > MAX_CONCURRENT_RELOADS:
-                raise ApiError("Only one reload-capable switch upgrade may run at a time. "
-                               "Start one switch now or schedule the remaining switches.", 409)
+            run_hosts, queued_hosts = list(hosts), []
+            if action in ("full", "activate"):           # these reload the switch: respect the parallel limit
+                free = max(0, self.max_parallel - self._active_reload_count())
+                run_hosts, queued_hosts = list(hosts[:free]), list(hosts[free:])
             if not backup_first:                 # a backup-first run reads the platform itself
                 self._require_platform_known(hosts)
             if image:
@@ -4479,31 +4616,47 @@ class Manager:
                         raise ApiError(f"A backup is still running for {h} - wait for it to finish.", 409)
             for h in hosts:
                 self.schedule.pop(h, None)   # a manual start replaces any pending schedule
+                self._rollout_forget(h)
+            rid = self._new_rollout(hosts, started_by) if (action in ("full", "activate") and len(hosts) > 1) else None
+            for h in queued_hosts:               # waits for a free slot; started by the scheduler loop
+                self.schedule[h] = {"run_at": time.time(), "image_path": image, "created": now_str(),
+                                    "backup_first": bool(backup_first), "action": action,
+                                    "scheduled_by": started_by or "local", "queued": True, "rollout": rid}
             self._save_schedule()
+            queue_note = ""
+            if queued_hosts:
+                queue_note = (f" {len(queued_hosts)} more switch(es) are queued and start as running ones finish "
+                              f"({self.max_parallel} at a time"
+                              + ("; the queue stops if one fails)." if self.stop_on_failure else ")."))
+            if not run_hosts:
+                return {"message": f"All {self.max_parallel} upgrade slot(s) are busy - "
+                                   f"{len(queued_hosts)} switch(es) queued; each starts when a slot frees up."
+                                   + (" The queue stops if one fails." if self.stop_on_failure else "")}
 
             if backup_first:
                 # start_backup() itself refuses a host it sees as "already upgrading", so the
                 # backup must be kicked off BEFORE this placeholder state is set, not after.
-                backup_result = self.start_backup(hosts)
-                for h in hosts:
+                backup_result = self.start_backup(run_hosts)
+                for h in run_hosts:
                     self.ops[h]["upgrade"] = {**self._new_ops()["upgrade"], "state": "starting",
                                               "phase": "waiting_backup", "started": now_str(),
                                               "started_ts": time.time(), "action": action,
                                               "started_by": started_by or "local",
                                               "message": "Backing up before the upgrade starts ..."}
                 threading.Thread(target=self._launch_after_backup,
-                                 args=(list(hosts), cm, image, action, started_by or "local"),
+                                 args=(list(run_hosts), cm, image, action, started_by or "local"),
                                  daemon=True).start()
-                return {"message": f"Backing up {len(hosts)} switch(es) first ({backup_result['message']}) "
+                return {"message": f"Backing up {len(run_hosts)} switch(es) first ({backup_result['message']}) "
                                    f"- each switch's {verb.lower()} will start automatically once its "
-                                   "backup finishes, and will be skipped if the backup fails.",
+                                   "backup finishes, and will be skipped if the backup fails." + queue_note,
                        }
 
             self.runs_dir.mkdir(parents=True, exist_ok=True)
-            for h in hosts:
+            for h in run_hosts:
                 self._launch_job(h, *cm[h], image, action, started_by)
-        msg = f"{verb} started on {len(hosts)} switch(es)"
-        msg += f" with {Path(image).name} ({size / 1_048_576:.0f} MB). " if image else ". "
+        msg = f"{verb} started on {len(run_hosts)} switch(es)"
+        msg += f" with {Path(image).name} ({size / 1_048_576:.0f} MB)." if image else "."
+        msg += queue_note + " "
         msg += "A live web console opens at the bottom of this page for each switch."
         return {"message": msg}
 
@@ -4548,10 +4701,16 @@ class Manager:
                 self._require_platform_known(hosts)
             if image:
                 self._enforce_image_check(hosts, image, skip_image_check, started_by)
+            rid = None
+            if action in ("full", "activate") and len(hosts) > 1:
+                rid = self._new_rollout(hosts, started_by)
+            else:
+                for h in hosts:
+                    self._rollout_forget(h)
             for h in hosts:
                 self.schedule[h] = {"run_at": run_at, "image_path": image, "created": now_str(),
                                     "backup_first": bool(backup_first), "action": action,
-                                    "scheduled_by": started_by or "local"}
+                                    "scheduled_by": started_by or "local", "queued": False, "rollout": rid}
             self._save_schedule()
         when = datetime.fromtimestamp(run_at).strftime("%Y-%m-%d %H:%M")
         verb = self.ACTION_VERB.get(action, "Upgrade")
@@ -4566,6 +4725,8 @@ class Manager:
         hosts = self._validate_hosts(hosts)
         with self.lock:
             cancelled = [h for h in hosts if self.schedule.pop(h, None) is not None]
+            for h in cancelled:
+                self._rollout_forget(h)
             self._save_schedule()
         for h in cancelled:
             self.events.add(h, self.label(h), "Scheduled upgrade cancelled", "info")
@@ -4578,6 +4739,7 @@ class Manager:
             due = []
             with self.lock:
                 self._poll_all()
+                self._check_rollouts()
                 now = time.time()
                 mon_on = bool(self.monitor.running)       # nothing is started while monitoring is stopped
                 for h, entry in list(self.schedule.items()):
@@ -4589,7 +4751,7 @@ class Manager:
                         entry["run_at"] = now + SCHEDULE_POLL
                         continue
                     action = entry.get("action") or "full"
-                    if action in ("full", "activate") and self._active_reload_count() >= MAX_CONCURRENT_RELOADS:
+                    if action in ("full", "activate") and self._active_reload_count() >= self.max_parallel:
                         entry["run_at"] = now + SCHEDULE_POLL
                         continue
                     del self.schedule[h]
@@ -4873,7 +5035,8 @@ class Manager:
                          upgrade={**o["upgrade"], "job_id": (self.jobs.get(host) or {}).get("id")},
                          scheduled=None if sched is None else {
                              "run_at": sched["run_at"],
-                             "run_at_str": datetime.fromtimestamp(sched["run_at"]).strftime("%Y-%m-%d %H:%M")})
+                             "run_at_str": datetime.fromtimestamp(sched["run_at"]).strftime("%Y-%m-%d %H:%M"),
+                             "queued": bool(sched.get("queued"))})
                 hosts.append(m)
             active = sum(1 for h in self.order if self._upgrade_active(h))
             scheduled_count = len(self.schedule)
@@ -4890,7 +5053,7 @@ class Manager:
                 "keep_awake": self.keep_awake.active, "monitoring_on": bool(self.monitor.running),
                 "notifications": self._notes_view(),
                 "events": self.events.items(), "upgrade": {"active": active, "scheduled": scheduled_count,
-                            "completed": completed_count},
+                            "completed": completed_count, "settings": self.upgrade_settings_view()},
                 "backup_run": run_info}
 
     # ---- web terminal (device drawer > Console) ------------------------------ #
@@ -6150,6 +6313,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <option value="distribute">Distribute only</option>
           <option value="activate">Activate only</option>
         </select>
+        <label for="max-parallel">Switches upgraded at the same time<span class="tip" data-tip="How many switches reload together (1 to 10). A bigger batch starts this many and queues the rest; each queued switch starts when a running one finishes. Only an Administrator can change it. Saved per site."></span></label>
+        <input type="number" id="max-parallel" min="1" max="10" step="1" value="1">
+        <label class="chk"><input type="checkbox" id="stop-on-failure" checked><span>Stop starting more switches if one fails</span><span class="tip" data-tip="If a switch fails or needs attention, switches still waiting in the queue are not started. Switches already running finish normally."></span></label>
+        <div class="row"><button class="btn" id="btn-save-parallel">Save rollout settings</button></div>
         <div class="row"><button class="btn" id="btn-readiness" disabled
               title="Log in and check version, free flash space, CPU, memory and stack health - read-only, no upload or reload">Readiness check</button></div>
         <label class="chk"><input type="checkbox" id="backup-before-upgrade" checked><span>Back up configuration first</span></label>
@@ -6574,6 +6741,7 @@ function stagedWarning(action, image) {
 function upgradeCell(h) {
   const u = h.upgrade;
   if (h.scheduled && ["idle", "completed", "failed", "attention"].includes(u.state)) {
+    if (h.scheduled.queued) return pill("QUEUED", "PENDING") + '<span class="label clip">waiting for a free slot</span>';
     return pill("SCHEDULED", "PENDING") + '<span class="label clip">' + esc(h.scheduled.run_at_str) + "</span>";
   }
   const map = {starting: ["STARTING", "RUN"], running: ["RUNNING", "RUN"],
@@ -6700,9 +6868,29 @@ $("dev-reset").addEventListener("click", () => {
   devFilterChanged();
 });
 
+let ROLLOUT = {max_parallel: 1, stop_on_failure: true, limit: 10};
+function applyRolloutSettings(s) {
+  ROLLOUT = s;
+  const n = $("max-parallel"), c = $("stop-on-failure"), b = $("btn-save-parallel");
+  if (!n) return;
+  const canEdit = ME.role !== "operator" && ME.role !== "viewer";
+  n.max = s.limit; n.disabled = c.disabled = b.disabled = !canEdit;
+  if (document.activeElement !== n) n.value = s.max_parallel;
+  if (document.activeElement !== c) c.checked = !!s.stop_on_failure;
+}
+$("btn-save-parallel").addEventListener("click", async () => {
+  try {
+    const r = await post("/api/upgrade-settings", {max_parallel: parseInt($("max-parallel").value, 10),
+                                                   stop_on_failure: $("stop-on-failure").checked});
+    applyRolloutSettings({max_parallel: r.max_parallel, stop_on_failure: r.stop_on_failure, limit: r.limit});
+    sayIn(4, "ok", r.message);
+  } catch (e) { sayIn(4, "err", e.message); }
+});
+
 function render(d) {
   if (d.me && d.me.role !== ME.role) { location.reload(); return; }   // role changed in the launcher
   last = d;
+  if (d.upgrade && d.upgrade.settings) applyRolloutSettings(d.upgrade.settings);
   for (const h of [...selected]) if (!d.hosts.some(x => x.host === h)) selected.delete(h);
 
   const m = d.monitor;
@@ -6999,8 +7187,11 @@ $("btn-upgrade").addEventListener("click", async () => {
   const backupFirst = $("backup-before-upgrade").checked;
   const list = [...selected].join(", ");
   const reloadNote = action === "distribute" ? "" : "\n\nEach switch will reload and be offline for several minutes.";
+  const qNote = (action !== "distribute" && selected.size > ROLLOUT.max_parallel)
+    ? "\n\nOnly " + ROLLOUT.max_parallel + " switch(es) run at a time; the other " + (selected.size - ROLLOUT.max_parallel) +
+      " wait in a queue" + (ROLLOUT.stop_on_failure ? " and are not started if one fails." : ".") : "";
   if (!confirm("Start the " + ACTION_LABEL[action] + " now on " + selected.size + " switch(es)?\n\n" + list +
-               reloadNote + stagedWarning(action, image) + (backupFirst ? "\n\nEach switch's configuration will be backed up first." : ""))) return;
+               reloadNote + qNote + stagedWarning(action, image) + (backupFirst ? "\n\nEach switch's configuration will be backed up first." : ""))) return;
   try {
     const skipCheck = $("skip-image-check").checked; $("skip-image-check").checked = false;   // applies to this one action only
     const r = await post("/api/upgrade", Object.assign({hosts: [...selected], image_path: image || null, backup_first: backupFirst, skip_image_check: skipCheck, action}, c));
@@ -8018,7 +8209,7 @@ function drOverview(h, d) {
 
   // upgrade progress
   const pct = drProgress(h);
-  const text = h.scheduled && ["idle", "completed", "failed", "attention"].includes(u.state) ? "Scheduled for " + h.scheduled.run_at_str
+  const text = h.scheduled && ["idle", "completed", "failed", "attention"].includes(u.state) ? (h.scheduled.queued ? "Queued - waiting for a free upgrade slot" : "Scheduled for " + h.scheduled.run_at_str)
              : u.state === "idle" ? (d && d.missing === 0 ? "Ready to upgrade" : "Not started")
              : u.message;
   out += drSec("Upgrade Progress", u.job_id ? '<a href="#" class="clink" data-console="1">Open live console</a>' : "",
@@ -8611,6 +8802,9 @@ def make_handler(manager, allowed_hosts, any_host):
                                                       self._who(), bool(body.get("skip_image_check")))
                 elif path == "/api/schedule/cancel":
                     result = manager.cancel_schedule(body.get("hosts"))
+                elif path == "/api/upgrade-settings":
+                    result = manager.set_upgrade_settings(body.get("max_parallel"), body.get("stop_on_failure"),
+                                                          self._who())
                 else:
                     raise ApiError("Not found.", 404)
                 self._json(200, result)
