@@ -11,8 +11,8 @@ The application provides a local dashboard, user roles, optional HTTPS and
 client restrictions, device monitoring, configuration backups, readiness
 checks, an IOS-XE install workflow, scheduling, and post-upgrade checks. CI
 currently performs a static Python check, a startup smoke test, and a Windows
-packaging dry run. The application now requires and verifies a Cisco-published
-SHA-256 sidecar for every uploaded upgrade image, and CI includes unit and
+packaging dry run. The application now checks a Cisco-published SHA-512 digest during image
+upload, and CI includes unit and
 dependency-audit jobs. Dashboard reload concurrency is configurable per site
 (1–10), with queued switches and a stop-on-failure option; CLI upgrades support
 configurable parallel waves and stop-on-failure by default.

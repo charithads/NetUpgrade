@@ -18,6 +18,22 @@ class ImageIntegrityTests(unittest.TestCase):
         self.image.write_bytes(self.payload)
         self.sidecar = Path(str(self.image) + ".sha256")
         self.digest = hashlib.sha256(self.payload).hexdigest()
+        self.sha512_sidecar = Path(str(self.image) + ".sha512")
+        self.digest512 = hashlib.sha512(self.payload).hexdigest()
+
+    def test_sha512_digest_is_verified_in_chunks(self):
+        self.assertEqual(manager.verify_image_sha512(self.image, self.digest512, chunk_size=3), self.digest512)
+
+    def test_sha512_sidecar_is_accepted_for_upgrade_selection(self):
+        self.sha512_sidecar.write_text(self.digest512 + "\n", encoding="utf-8")
+        self.assertEqual(manager.verify_image_checksum_sidecar(self.image), self.digest512)
+        with patch.object(manager, "images_dir", return_value=self.root):
+            image, _ = manager.Manager._check_image(self.image.name)
+        self.assertEqual(Path(image), self.image.resolve())
+
+    def test_sha512_mismatch_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "SHA-512 mismatch"):
+            manager.verify_image_sha512(self.image, "0" * 128)
 
     def test_missing_sidecar_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "missing SHA-256 sidecar"):
@@ -57,7 +73,7 @@ class ImageIntegrityTests(unittest.TestCase):
 
     def test_image_selection_requires_a_manifest(self):
         with patch.object(manager, "images_dir", return_value=self.root):
-            with self.assertRaisesRegex(manager.ApiError, "missing SHA-256 sidecar"):
+            with self.assertRaisesRegex(manager.ApiError, "missing SHA-512 or SHA-256 checksum sidecar"):
                 manager.Manager._check_image(self.image.name)
 
     def test_non_bin_file_is_rejected(self):

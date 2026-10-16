@@ -790,6 +790,52 @@ def verify_image_sha256_sidecar(filename, chunk_size=1024 * 1024, sidecar_path=N
         raise ValueError('SHA-256 mismatch for {} (expected {}, got {})'.format(
             image_path.name, expected, actual))
     return actual
+
+def _verify_image_digest(filename, algorithm, expected_digest, chunk_size=1024 * 1024):
+    label = "SHA-512" if algorithm == "sha512" else "SHA-256"
+    size = 128 if algorithm == "sha512" else 64
+    expected = re.sub(r"\s+", "", str(expected_digest or "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{" + str(size) + r"}", expected):
+        raise ValueError("{} checksum must be a {}-character hexadecimal digest".format(label, size))
+    digest = hashlib.new(algorithm)
+    image_path = Path(filename)
+    try:
+        with image_path.open("rb") as image:
+            for chunk in iter(lambda: image.read(chunk_size), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ValueError("could not read image for {} verification: {}".format(label, exc)) from exc
+    actual = digest.hexdigest()
+    if not hmac.compare_digest(actual, expected):
+        raise ValueError("{} mismatch for {} (expected {}, got {})".format(
+            label, image_path.name, expected, actual))
+    return actual
+
+
+def verify_image_sha512(filename, expected_digest, chunk_size=1024 * 1024):
+    """Verify image bytes against a SHA-512 digest copied from Cisco's download page."""
+    return _verify_image_digest(filename, "sha512", expected_digest, chunk_size)
+
+
+def verify_image_checksum_sidecar(filename, chunk_size=1024 * 1024):
+    """Verify a saved Cisco checksum sidecar, preferring SHA-512 with legacy SHA-256 support."""
+    image_path = Path(filename)
+    for algorithm, label, size in (("sha512", "SHA-512", 128), ("sha256", "SHA-256", 64)):
+        sidecar = Path(str(image_path) + "." + algorithm)
+        if not sidecar.exists():
+            continue
+        try:
+            line = next((line.strip() for line in sidecar.read_text(encoding="utf-8").splitlines()
+                         if line.strip() and not line.lstrip().startswith("#")), "")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("could not read {} sidecar: {}".format(label, exc)) from exc
+        match = re.fullmatch(r"([0-9a-fA-F]{" + str(size) + r"})(?:\s+\*?.*)?", line)
+        if not match:
+            raise ValueError("{} sidecar must start with a {}-character hexadecimal digest".format(label, size))
+        return _verify_image_digest(image_path, algorithm, match.group(1), chunk_size)
+    raise ValueError("missing SHA-512 or SHA-256 checksum sidecar")
+
+
 #------------------------------------------------------------------------------
 def software_install(net_connect, image_name, device, timeout=None, mode='full'):
     """IOS-XE install mode. `mode` selects which install command is actually run:
@@ -1891,7 +1937,7 @@ def job_main(job_path):
             if not os.path.isfile(image_path):
                 raise RuntimeError('Image file not found: {}'.format(image_path))
             try:
-                verify_image_sha256_sidecar(image_path)
+                verify_image_checksum_sidecar(image_path)
             except ValueError as exc:
                 raise RuntimeError('Image integrity check failed before worker execution: {}'.format(exc)) from exc
             image_name = os.path.basename(image_path)      # name on the switch's flash
@@ -1965,7 +2011,7 @@ def interactive_main():
         sys.exit('Image file not found: {}'.format(image_path))
     image_name = os.path.basename(image_path)          # name on the switch's flash
     try:
-        verify_image_sha256_sidecar(image_path)
+        verify_image_checksum_sidecar(image_path)
     except ValueError as exc:
         sys.exit('Image integrity check failed: {}'.format(exc))
 
@@ -4220,7 +4266,7 @@ class Manager:
         if size == 0:
             raise ApiError("The image file is empty.")
         try:
-            verify_image_sha256_sidecar(p)
+            verify_image_checksum_sidecar(p)
         except ValueError as exc:
             raise ApiError(f"Image integrity check failed: {exc}") from exc
         return str(p.resolve()), size
@@ -6357,11 +6403,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="msg" id="msg-4" role="status" aria-live="polite"></div>
         <label for="image-file" style="margin-top:0">Upload IOS-XE image (.bin)<span class="tip" data-tip="The image is saved in the &quot;IOS Images&quot; folder."></span></label>
         <input type="file" id="image-file" accept=".bin">
+        <label for="image-sha512">Paste Cisco SHA-512 checksum</label>
+        <input type="text" id="image-sha512" maxlength="128" spellcheck="false" autocomplete="off"
+               autocapitalize="off" placeholder="128 hexadecimal characters">
+        <div class="hint">Copy the SHA-512 checksum from the Cisco download page. The image is checked before it is saved.</div>
         <div class="note" id="image-file-last"></div>
-        <div class="row"><button class="btn" id="btn-upload-image" disabled>Upload image</button></div>
-        <label for="image-checksum-file">Upload Cisco-published SHA-256 manifest (.bin.sha256)</label>
-        <input type="file" id="image-checksum-file" accept=".sha256">
-        <div class="row"><button class="btn" id="btn-upload-checksum" disabled>Upload and verify checksum</button></div>
+        <div class="row"><button class="btn" id="btn-upload-image" disabled>Upload and verify image</button></div>
         <div class="hint" id="image-upload-status"></div>
         <label for="image-select" id="image-select-label">Select image to install</label>
         <select id="image-select"><option value="">No images uploaded yet</option></select>
@@ -6732,11 +6779,11 @@ async function post(url, body) {
   return d;
 }
 
-async function postFile(url, file) {
+async function postFile(url, file, headers = {}) {
   // No Content-Type header here on purpose - the browser sets the multipart boundary itself.
   const fd = new FormData();
   fd.append("file", file, file.name);
-  const r = await fetch(url, {method: "POST", body: fd});
+  const r = await fetch(url, {method: "POST", headers, body: fd});
   let d = {}; try { d = await r.json(); } catch (e) {}
   if (!r.ok) throw new Error(d.error || ("Upload failed (HTTP " + r.status + ")"));
   return d;
@@ -7341,51 +7388,40 @@ $("btn-add-device").addEventListener("click", async () => {
   } catch (e) { sayIn(1, "err", e.message); }
 });
 
-$("image-file").addEventListener("change", () => {
-  $("btn-upload-image").disabled = !$("image-file").files.length;
-});
-$("image-checksum-file").addEventListener("change", () => {
-  $("btn-upload-checksum").disabled = !$("image-checksum-file").files.length;
-});
-$("btn-upload-checksum").addEventListener("click", async () => {
-  const file = $("image-checksum-file").files[0];
-  if (!file) return;
-  if (!file.name.toLowerCase().endsWith(".bin.sha256")) {
-    sayIn(4, "err", "Name the checksum file after its image, ending in .bin.sha256."); return;
-  }
-  const status = $("image-upload-status");
-  $("btn-upload-checksum").disabled = true;
-  status.textContent = "Uploading and verifying " + file.name + " ...";
-  status.className = "hint";
-  try {
-    const r = await postFile("/api/images/checksum-upload", file);
-    status.textContent = r.message;
-    sayIn(4, "ok", r.message);
-    $("image-checksum-file").value = "";
-  } catch (e) {
-    status.textContent = ""; sayIn(4, "err", e.message);
-  } finally { $("btn-upload-checksum").disabled = !$("image-checksum-file").files.length; }
-});
+function imageUploadChecksum() {
+  return $("image-sha512").value.replace(/\s+/g, "").toLowerCase();
+}
+function updateImageUploadButton() {
+  const digest = imageUploadChecksum();
+  $("btn-upload-image").disabled = !$("image-file").files.length || !/^[a-f0-9]{128}$/.test(digest);
+}
+$("image-file").addEventListener("change", updateImageUploadButton);
+$("image-sha512").addEventListener("input", updateImageUploadButton);
 $("btn-upload-image").addEventListener("click", async () => {
   const file = $("image-file").files[0];
+  const checksum = imageUploadChecksum();
   if (!file) return;
   if (!file.name.toLowerCase().endsWith(".bin")) { sayIn(4, "err", "Only .bin image files can be uploaded."); return; }
+  if (!/^[a-f0-9]{128}$/.test(checksum)) {
+    sayIn(4, "err", "Paste the 128-character SHA-512 checksum shown on Cisco's download page."); return;
+  }
   const status = $("image-upload-status");
   $("btn-upload-image").disabled = true;
-  status.textContent = "Uploading " + file.name + " ... this can take a while for a large image.";
+  status.textContent = "Uploading " + file.name + " and checking its Cisco SHA-512 checksum ... this can take a while.";
   status.className = "hint";
   try {
-    const r = await postFile("/api/images/upload", file);
+    const r = await postFile("/api/images/upload", file, {"X-Image-SHA512": checksum});
     status.textContent = r.message;
     sayIn(4, "ok", r.message);
-    $("image-file-last").textContent = "Last uploaded: " + file.name;
+    $("image-file-last").textContent = "Last uploaded and verified: " + file.name;
     $("image-file").value = "";
+    $("image-sha512").value = "";
     const sel = $("image-select");
     sel.innerHTML = r.images.map(name => '<option value="' + esc(name) + '">' + esc(name) + "</option>").join("");
     sel.value = r.filename;
   } catch (e) {
     status.textContent = ""; sayIn(4, "err", e.message);
-  } finally { $("btn-upload-image").disabled = !$("image-file").files.length; }
+  } finally { updateImageUploadButton(); }
 });
 
 // ---- Upgrade output: shown in the right-hand drawer (Upgrade tab) instead of separate windows ----
@@ -8878,19 +8914,69 @@ def make_handler(manager, allowed_hosts, any_host):
             ctype = self.headers.get("Content-Type", "")
             try:
                 if path == "/api/images/upload":
+                    expected_sha512 = (self.headers.get("X-Image-SHA512") or "").strip().lower()
                     chosen = {}
 
                     def dest_for_image(filename):
                         name = safe_upload_filename(filename)
                         if not name.lower().endswith(".bin"):
                             raise ValueError("Only .bin image files can be uploaded.")
-                        chosen["name"] = name
-                        return str(images_dir() / name)
+                        final_path = images_dir() / name
+                        temp_path = images_dir() / ("." + name + "." + secrets.token_hex(8) + ".upload")
+                        chosen.update(name=name, final_path=final_path, temp_path=temp_path)
+                        return str(temp_path)
 
-                    _, _, size, dest_path = read_multipart_file(
+                    _, _, size, temp_path = read_multipart_file(
                         self.rfile, length, ctype, MAX_IMAGE_UPLOAD_BYTES, dest_for_image)
+                    temp_path = Path(temp_path)
+                    checksum_temp = None
+                    backups = []
+                    installed = []
+                    try:
+                        if not re.fullmatch(r"[0-9a-f]{128}", expected_sha512):
+                            raise ValueError("Paste the 128-character SHA-512 checksum shown on Cisco's download page.")
+                        verify_image_sha512(temp_path, expected_sha512)
+                        sidecar_path = Path(str(chosen["final_path"]) + ".sha512")
+                        legacy_sidecar = Path(str(chosen["final_path"]) + ".sha256")
+                        checksum_temp = Path(str(sidecar_path) + "." + secrets.token_hex(8) + ".upload")
+                        checksum_temp.write_text(expected_sha512 + "\n", encoding="ascii")
+
+                        # Back up existing files so a failed replacement can be rolled back.
+                        for old_path in (chosen["final_path"], sidecar_path, legacy_sidecar):
+                            if old_path.exists():
+                                backup = Path(str(old_path) + "." + secrets.token_hex(8) + ".backup")
+                                os.replace(old_path, backup)
+                                backups.append((old_path, backup))
+                        os.replace(temp_path, chosen["final_path"])
+                        installed.append(chosen["final_path"])
+                        os.replace(checksum_temp, sidecar_path)
+                        installed.append(sidecar_path)
+                    except (OSError, ValueError) as exc:
+                        for installed_path in installed:
+                            try:
+                                installed_path.unlink()
+                            except OSError:
+                                pass
+                        for old_path, backup_path in reversed(backups):
+                            try:
+                                os.replace(backup_path, old_path)
+                            except OSError:
+                                pass
+                        for leftover in (temp_path, checksum_temp):
+                            if leftover is not None:
+                                try:
+                                    leftover.unlink()
+                                except OSError:
+                                    pass
+                        raise ApiError(f"Image rejected: {exc}") from exc
+                    for _, backup_path in backups:
+                        try:
+                            backup_path.unlink()
+                        except OSError:
+                            pass
                     self._json(200, {
-                        "message": f"Uploaded {chosen['name']} ({size / 1_048_576:.1f} MB).",
+                        "message": f"Uploaded and verified Cisco SHA-512 checksum for {chosen['name']} "
+                                   f"({size / 1_048_576:.1f} MB).",
                         "filename": chosen["name"], "images": list_images(),
                     })
 

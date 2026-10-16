@@ -22,6 +22,7 @@ class ChecksumUploadEndpointTests(unittest.TestCase):
         cls.payload = b"IOS-XE test image bytes"
         cls.image.write_bytes(cls.payload)
         cls.digest = hashlib.sha256(cls.payload).hexdigest()
+        cls.digest512 = hashlib.sha512(cls.payload).hexdigest()
         cls.images_patch = patch.object(manager, "images_dir", return_value=cls.root)
         cls.images_patch.start()
         sock = socket.socket()
@@ -36,6 +37,66 @@ class ChecksumUploadEndpointTests(unittest.TestCase):
         cls.shutdown()
         cls.images_patch.stop()
         cls.temp.cleanup()
+
+    def post_image(self, filename, payload, digest):
+        boundary = "codex-one-shot-boundary"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("ascii") + payload + f"\r\n--{boundary}--\r\n".encode("ascii")
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        if digest is not None:
+            headers["X-Image-SHA512"] = digest
+        req = urllib.request.Request(
+            self.url + "/api/images/upload", data=body,
+            headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    def test_image_and_pasted_sha512_are_verified_in_one_upload(self):
+        filename = "one_shot.bin"
+        status, response = self.post_image(filename, self.payload, self.digest512)
+        self.assertEqual(status, 200)
+        self.assertIn("SHA-512", response["message"])
+        image = self.root / filename
+        self.assertEqual(image.read_bytes(), self.payload)
+        self.assertEqual(Path(str(image) + ".sha512").read_text(encoding="ascii").strip(),
+                         self.digest512)
+        self.assertEqual(manager.verify_image_checksum_sidecar(image), self.digest512)
+
+    def test_one_shot_upload_rejects_mismatch_without_saving_image(self):
+        filename = "bad_checksum.bin"
+        status, response = self.post_image(filename, self.payload, "0" * 128)
+        self.assertEqual(status, 400)
+        self.assertIn("SHA-512 mismatch", response["error"])
+        self.assertFalse((self.root / filename).exists())
+        self.assertEqual(list(self.root.glob("*.upload")), [])
+
+    def test_one_shot_upload_requires_pasted_checksum(self):
+        filename = "missing_checksum.bin"
+        status, response = self.post_image(filename, self.payload, None)
+        self.assertEqual(status, 400)
+        self.assertIn("Paste the 128-character SHA-512 checksum", response["error"])
+        self.assertFalse((self.root / filename).exists())
+
+    def test_bad_checksum_does_not_replace_existing_verified_image(self):
+        filename = "existing.bin"
+        image = self.root / filename
+        image.write_bytes(b"previous verified image")
+        sidecar = Path(str(image) + ".sha512")
+        old_digest = hashlib.sha512(image.read_bytes()).hexdigest()
+        sidecar.write_text(old_digest + "\n", encoding="ascii")
+
+        status, response = self.post_image(filename, self.payload, "0" * 128)
+
+        self.assertEqual(status, 400)
+        self.assertIn("SHA-512 mismatch", response["error"])
+        self.assertEqual(image.read_bytes(), b"previous verified image")
+        self.assertEqual(manager.verify_image_checksum_sidecar(image), old_digest)
 
     def post_manifest(self, content):
         boundary = "codex-test-boundary"
