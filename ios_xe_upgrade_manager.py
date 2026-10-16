@@ -6406,7 +6406,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <label for="image-sha512">Paste Cisco SHA-512 checksum<span class="tip" data-tip="Paste the 128-character SHA-512 value from Cisco. The upload is rejected if it does not match the image."></span></label>
         <input type="text" id="image-sha512" maxlength="128" spellcheck="false" autocomplete="off"
                autocapitalize="off" placeholder="128 hexadecimal characters">
-        <div class="hint">Copy the SHA-512 checksum from the Cisco download page. The image is checked before it is saved.</div>
         <div class="note" id="image-file-last"></div>
         <div class="row"><button class="btn" id="btn-upload-image" disabled>Upload and verify image</button></div>
         <div class="hint" id="image-upload-status"></div>
