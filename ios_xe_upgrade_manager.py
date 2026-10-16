@@ -99,6 +99,55 @@ APP_NAME = "NetUpgrade"
 APP_VERSION = "5.6.1"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
+APP_ICON_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAA"
+    "DsMAAA7DAcdvqGQAAAxOSURBVGhD7ZcJUBVX2oZPd9+NxWCMSyaKgM6POol/4oYIAgqCKyKiBidBFgnKoqOJCqi4oMgmiyKi"
+    "IIssymXfBBXuBRVQo1ERFxyDMm5o3FCG9fZ3vqnLmJS2UzOZ0X9S9RdP1Vu3v/O+p/vr7urTfQnppZdeevn/RTUdztW2L2TP"
+    "tgQwF37aw9XdiRNfvR0ivXFjmUbjFSNyJUsinPLbk3xbxhbzbuzxrhOssq2LPY/IXkPkbqqQu92G4rvPUHrvPspuXkHNH8/d"
+    "1Gk6E6zTdMxAuJvfBDa1y5GVqxrYo4isApE9iciepsjWvES2uhnY7+/w3OUmFDfeRUlTI2o21eMHj+qwzy1lq85fjm0lWCkS"
+    "7vO/w+ZH2tx+SOMOI3JyRDYfkc1p/StT1JrHlrZ4iSqemZGqB6NI9b0RorM3J7EXGpaKLtcdll79/pnW3Quo3ViFfR/XYN+m"
+    "ktM6l+T/5buxuXUgF8WfEyUicgcQucT2bia1LYLIO/51I9d/+ER67dR2jasVnX0aK7DvveOo05h7r1/9wVHC6P8NobQPt42/"
+    "II5G5HYjstEdl0jMX8cKY2okF1SzZBeoiXBcjfhc2VjNq0eu9mkswz63C/CDG4dua11KHSjMvXfE67ryJDsQxSGIou1tCrL2"
+    "cR9hRo24il8krUeU1UO77Ey3mdBXo12Z0V/jUu5FrRsF2OdOAWpfSj4izLxXxCvbnSXrEcUbEbn1bZfJd81awowacT7vJDuJ"
+    "KKtGlJ1HlJ7j26RVHdbCnBqNyvghsh/kD7Xr5ah9Kwu1zscvEmbeD16oLVre9kD8LaJodXsXWfn0M2FEjTSF95AWI0pLEWVH"
+    "VSCr6OZlNYiSar5LUvZirjCvRlKVZq9Rl4Na9RmocWbfdVK5+f2vTCLXFm+xF6JoBSLn8Txa6KuRRHWvlKYiStMRJZkqkOar"
+    "QFasAumRLl5aASg53g3ivJZ/eIUlVSmVGhczUas+HTVrYmcL/XeGW/zTOZFbN3IuzzuJ07OhQl+0qdtXuhtREkNRsk8FkiQV"
+    "SNNVIJV3gySni5dkt/PivC4U5Xcje/CJs3C+5FiKvez7TNS8lIHSE7GpQv/dmPdoOLugmeecOpFd3Hz8Dc8ZZcyqrhhRKKI4"
+    "7O+SRHTzkj0qXrpfxUsSu3nxwU5enNLGc+kq5LLV7wtENqbZn2Qh98t+jqVqiY8mPZGdyUCpMvbPZPNm9o3jvAvs7NuO7IIX"
+    "yC5uR3bhfb83TO+2T7iVnXLu2840kX93MrdFVS8K4UEc1sWLo7t4cUwXL47r4EWJncDue1HN7Hl6gNnz9CAT/SCBhL+5CHBl"
+    "yVWS2iyUKvZ3yY7u1O0ZRGRez/xHMNMbtzDzXiBj/xTJvL/YCf3X4Xw7tnNBiKKtbSAKbufFYe28KKqNZxPU74zWr4V59ZXm"
+    "Dh3IYovS67mClKeio+kgKU+ishP7ftSo3nVJ82zYx8Ip/zbMtJuxjO1zZGybkcy9ZS70X4dZ2RLFrkfk/F4Ct/ElcFtbeXbH"
+    "S2BjENngFk9hXg2XlmjPluYiW3AIRUXpID6SDLIreSipio0hSN7DHZjaEMfMfIzM7IdIZjZZCv3XYb55vJtZBciseAbsmuc8"
+    "69/CswEtPBtCkWx67C3M/wyTtH83W5yLbHYKz5XLUVSWdJ1kva9Pb4srQYzNI2RmPUUy49ZbK8gbOD2IYZZ1IuP+CBjvn3hm"
+    "1ROe+fYJMJtUSHyfrBDGfyEiQoNJSbrJ5B5GtugwkpxkU2HkP8e0fglj9QCJzRMk1rf3C+03WHBnL7OkFRnn+zzj/oBnlj3k"
+    "Gc+HwKztRLLywWph/HW4pHhLtqwEmfTkWKH3bpjUjSCm14GY3ENi2viIkP1iYeQX7Br3ky+fIvNlE8843eWJy32eWXqfZ1a0"
+    "IVl+7zth/C0Sop1Jxt4PhcPvjKZ1w8lRvq23RmzpLphSSJ3n38Bp9teotf1laj3vIrWZc5XOtG2g/8vYNMQRu4fIzL3JMw63"
+    "eGZxE898fYcn7i+RuN5ZN6uEmlsX4kJLuWqBWlY5KgerHOpgLacLrPNwoWM5HSM89jvzVTOdveBY63W7hNNd0yIr26ZEnkHz"
+    "yB/QTK2d59E0/Dya7b6Kk0Mrc8nkhjgypwXJ7DtI7O4hs+ABMo6PkLh0I/lj02bTjaVnTLefx0mbT6HxplNoHHASJ26swokb"
+    "KtFovRKNAmrQaNej2rG59N0/J2Y+puMtj3cXm0bW4qeOYThsyir4vdUa+j82vmBo40tHTPelhtP9euqRswLwD9NXFxGLZ07E"
+    "+mkxsb5bQGbdLyRzmwvI/OZC4theRBY/dxhps/r7ETP80dBmHW9osw4MbdbA761Ww3DLP8HwqStgmIUXNZwXjJ9+dwo/i2ov"
+    "+zSH/vsPs9EZavB5aXfC6OAqargwCAeP/Qp1jZeCnpnnK3nz+uZeYGDhDfpqmXv1SM/Cp9PA3CN1uLl7pIGFR7SBhXu0gZl7"
+    "9HD1r7lblL65R46+uSfomS+neuaeoG/hBfoWnuq5vJ7ZMhhq5skPNVsGQya5gO4ERxw2ZzMO81Hg0OC2DL1Y+uv+sf2uUGWt"
+    "e4R/oZvxHAf5leDHfqXwuwAFHRxQQYcEKGHwRgUM3qAA3Y1K0N2gBF1/JQz1V4KevwL0/JRosLEGh22oRQP/Whymll8tDldr"
+    "XQ0OW1uN+qsUVH+FAvRXKEHP55W8FVTPWwF6XgoY6qUEXU9FjwZ/UwqD3QpxyJaHODCSb+8bSf/pV0APmrl8wQCPBNQa8yVw"
+    "E1xAZuIOkoluwI13AbGRK2hMcgfReBfgxjmDzHgpyIzd/+5NcAFNk29AMmEpcONcQTLBDTSNvwHRWJceaRq5g3S8G3BjXEDy"
+    "qhaNcQXuc2eQjXPrEff5EtA2XgYDp66Ej0x8oL+ZD3xk6gMfTVgC/edHo3ZwZ4Ww37dgMzoKpeYrcb6LLxQePQmxybk0RV5K"
+    "c0oqQV6ogF3xcpAXKUBdJ2QU032phTSv9ARkFSlh14FsyCxUQnZxJaRkldGYpFzIOVIFOSVVao8ezD4K2SWVkJFfAVHxcppZ"
+    "pOyp96cX0bi0QsgvOwFzXNeDVN+aHzTJDvp9YQsDje2g/5iZoGPqjbLA5+XCft+CSe/IJxOW4YG0Aqg6XQejpy2lc902QN21"
+    "RtgQngyGpl/TkL2Z9OzFBmqxcDU1svWh6lzYvixqONmJ+ock0svXb8F8jy30D5aukFdWTeUlJ+jIKS50kWcgPX/5z9RnUyw1"
+    "NHWioXsz4fSF62DmsAomzFpOL1z5ESLic4F8NBkmn1gKHzs5wPhDzqC/3gE0RnuhKPDFMWG/b8GkdOST8ctwb1IO2LlvoaSf"
+    "CSUfToRVW+OgzyhbSj6ZSj8Zv4i6rdlJyQdGQD6cRG3dNtHBRot7PO2RtvTbbfGU9J1IyYDJdJL9n6jRXB9KBppR0t8Elm+I"
+    "oYyeNSVDrOjH4xZSp9XhlOhMpERrPPUKiIWdCXmUDDCjg+bYg864OdDf2g76Gs8ATSMfZLf+mhNI7Mgn4zxwb3I+LSw/CwO/"
+    "cOhpQH2lPPx30X6jbOna4ERQ1tbByKluVN/kj7S44ixdG5zU43n476anLzZQ0/mr6IAvHGhidgXEZZTRfqPt6VTHtfTE2at0"
+    "kfeOnqxfWApU1NSB4RRXqm+8mFafvwah+/KA9Dejpgp3GPTVfPg89WsYsm4+lX3mg+yWX3ECJL6jRDTGFR1d1tCTJ89AxJ40"
+    "mphWQI9X1EBWfjkNjUyiuUUKelxRA3sTs2lMfCYtr6yFnCIFDY1KplkF5bSsohoSMwpp+J40eqS8GkqOnYLQmIM05XAxPaao"
+    "gYzcozQkKonmlSh76j2J2XR3gpxWnTxN7ZaspaKBxrS/tQ39YLQV/dB8GuiMNQetL9yQ2dhSJWz3bZIhUbamEtkZ25BM34ES"
+    "u0jkbMOR2OxAMiMUJXMjkNiEILEKQtHMMBTP2onEcgeSacEoUW9bBSOZGoSsdSiKZ4QjmRKEZMoOlMyIQHZaKBLz7UgsQ3pq"
+    "MiW4pxZZh6HIJhyJeRAyVmGoMXsXSi2jUDY9CqVWUSizCkWpaxkyWzszhe2+TSIdQLKpLzlEt5ODdBtJoYEk6ZUO0ECyjwaS"
+    "uFeKpYEk5pV20UASIVA4DSShr7SDbuvRNhpIgl7VwTTwF6nH1Pp5++fxELqNhNLtJBL9SBAdJGy3l1566aWXXnr5Lfkba0f5"
+    "o98C9T4AAAAASUVORK5CYII="
+)
 
 # ---- Third-party (pip install netmiko openpyxl) ----
 try:
@@ -2725,8 +2774,8 @@ def send_test_email(cfg):
     """Used by the launcher's 'Send test e-mail' button. Returns the number of recipients."""
     send_email_message(
         cfg, EMAIL_SUBJECT_PREFIX + " Test e-mail",
-        "This is a test message from Upgrade Control.\n\nIf you can read this, e-mail notifications are "
-        "set up correctly.\n\n--\nUpgrade Control\n")
+        "This is a test message from NetUpgrade.\n\nIf you can read this, e-mail notifications are "
+        "set up correctly.\n\n--\nNetUpgrade\n")
     return len(parse_recipients(cfg.get("to")))
 
 
@@ -2796,7 +2845,7 @@ class EmailNotifier(object):
             if ev["text"]:
                 lines.append("  {}".format(ev["text"]))
             lines.append("")
-        lines += ["--", "Upgrade Control", ""]
+        lines += ["--", "NetUpgrade", ""]
         error = None
         for attempt in range(2):                           # one retry for a passing network hiccup
             try:
@@ -5727,6 +5776,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .appver { font-size:11px; font-weight:600; opacity:.65; align-self:flex-end; margin-bottom:3px; }
   .brand { font-size:18px; font-weight:300; display:flex; align-items:center; gap:8px; padding-right:14px;
            border-right:1px solid var(--tbd); height:32px; white-space:nowrap; }
+  .brand img { width:26px; height:26px; object-fit:contain; flex:none; }
   .lost { color:var(--rd); font-weight:600; font-size:12px; }
   .ib { background:none; border:0; color:var(--tx); border-radius:8px; width:36px; height:36px; display:grid;
         place-items:center; cursor:pointer; }
@@ -6221,8 +6271,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <header>
   <div class="brand">
-    <svg width="30" height="18" viewBox="0 0 30 18"><g fill="var(--ac)"><rect x="1" y="7" width="2.4" height="5" rx="1"/><rect x="6" y="4" width="2.4" height="11" rx="1"/><rect x="11" y="1" width="2.4" height="16" rx="1"/><rect x="16" y="4" width="2.4" height="11" rx="1"/><rect x="21" y="7" width="2.4" height="5" rx="1"/></g></svg>
-    <span>Upgrade Control</span>
+    <img src="__APP_ICON__" alt="" aria-hidden="true">
+    <span>NetUpgrade</span>
     <span class="appver" title="Application version">v__APP_VERSION__</span>
   </div>
   <span class="sitemenu"><button type="button" id="site-badge" class="badge warn site-btn" aria-haspopup="true" aria-expanded="false" title="Select or create a site">Site: not assigned</button><div id="site-pop" class="site-pop" role="menu" hidden></div></span>
@@ -8695,6 +8745,7 @@ def make_handler(manager, allowed_hosts, any_host):
                 if path in ("/", "/index.html"):
                     self._send(200, DASHBOARD_HTML.replace("__APP_VERSION__", APP_VERSION)
                                               .replace("__APP_AUTHOR__", APP_AUTHOR)
+                                              .replace("__APP_ICON__", APP_ICON_DATA_URI)
                                               .replace("__APP_REPO_URL__", APP_REPO_URL)
                                               .replace("__ROLE__", self._me()["role"])
                                               .replace("__ME__", json.dumps(self._me()).replace("<", "\\u003c"))
