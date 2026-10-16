@@ -20,6 +20,7 @@ The dashboard shows switch availability, backup and upgrade state, events, and l
 - Back up running configuration, version, boot, inventory, and optional additional commands.
 - Run readiness checks before upgrading, distribute IOS-XE images, activate upgrades, and verify the version after reload.
 - Require a matching `.bin.sha256` manifest and verify its Cisco-published SHA-256 digest before scheduling or starting an upgrade.
+- Configure the maximum concurrent reloads per site (1–10); additional switches wait in a queue, with an administrator-selectable stop-on-failure policy.
 - Start upgrades immediately or schedule them for a later date and time; view each worker's live progress in the dashboard.
 - Review device events, backups, and per-device command history. Command logs record commands and results metadata, not switch command output.
 - Use role-based dashboard accounts, access controls, and optional HTTPS from the desktop launcher.
@@ -70,9 +71,11 @@ Run the interactive whole-inventory upgrade flow:
 py launcher.py --cli
 ```
 
-The CLI prompts for the inventory, credentials, and image, then upgrades eligible switches sequentially.
-Each reload-capable run requires a matching Cisco-published `.bin.sha256` checksum file. Only one
-reload-capable dashboard upgrade can run at a time; additional scheduled upgrades wait for capacity.
+The CLI prompts for the inventory, credentials, and image. It upgrades one switch at a time by default;
+pass `--parallel N` to process up to N switches in waves. By default, a failed wave stops later waves;
+add `--continue-on-failure` to continue. Dashboard rollout concurrency is configured per site by an
+Administrator, from 1 to 10. Queued devices start as slots become available, and the rollout can stop
+starting queued devices after a failure.
 
 ### Direct manager options
 

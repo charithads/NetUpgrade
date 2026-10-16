@@ -13,7 +13,9 @@ checks, an IOS-XE install workflow, scheduling, and post-upgrade checks. CI
 currently performs a static Python check, a startup smoke test, and a Windows
 packaging dry run. The application now requires and verifies a Cisco-published
 SHA-256 sidecar for every uploaded upgrade image, and CI includes unit and
-dependency-audit jobs.
+dependency-audit jobs. Dashboard reload concurrency is configurable per site
+(1–10), with queued switches and a stop-on-failure option; CLI upgrades support
+configurable parallel waves and stop-on-failure by default.
 
 These capabilities are valuable, but do not by themselves demonstrate safe
 operation at fleet scale. In particular, each supported platform and IOS-XE
@@ -40,8 +42,10 @@ partially upgraded.
 - Add cryptographic signature verification where Cisco publishes a verifiable
   signature, and retain the trusted-source checksum gate for each image.
 - Make pre-check results explicit and block upgrades on failed or stale checks.
-- Add configurable canary batches, concurrency limits, maintenance windows,
-  approval gates, and a fleet-wide stop control.
+- Add controlled canary batch sizing, maintenance windows, approval gates, and
+  a fleet-wide stop control. Per-site concurrency limits and stopping queued
+  switches after a failure are available, but must be load-tested at the
+  target fleet size.
 - Persist a per-device state machine so restart/crash recovery cannot
   accidentally repeat an unsafe step.
 - Define rollback and recovery actions for every supported model/release path;
