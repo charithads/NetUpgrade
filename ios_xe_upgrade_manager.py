@@ -98,7 +98,7 @@ from urllib.parse import urlsplit, urlparse, parse_qs, quote
 APP_NAME = "NetUpgrade"
 APP_VERSION = "5.6.1"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
-APP_REPO_URL = "https://github.com/charithads/Switch-Upgrade-Manager---Cisco-IOS-XE"   # shown in the footer
+APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # ---- Third-party (pip install netmiko openpyxl) ----
 try:
