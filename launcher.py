@@ -84,7 +84,7 @@ APP_NAME = "NetUpgrade"
 APP_VERSION = "5.6.1"          # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
 UI_FONT_SIZE = 8               # window size follows the font: 9 = the old, larger window; 8 = compact
 APP_AUTHOR = "Charitha Dasanayaka"
-APP_REPO_URL = "https://github.com/charithads/Switch-Upgrade-Manager---Cisco-IOS-XE"
+APP_REPO_URL = "https://github.com/charithads/NetUpgrade"
 DEFAULT_HTTPS_PORT, DEFAULT_HTTP_PORT = 443, 80
 MIN_PW = 10                                   # minimum password length
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
