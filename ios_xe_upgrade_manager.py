@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v5.6.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v5.10.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -96,7 +96,7 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.6.1"          # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "5.10.1"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 APP_ICON_DATA_URI = (
@@ -271,6 +271,7 @@ class RecordedSession(object):
 
 def ConnectHandler(*args, **kwargs):  # noqa: N802 - same name on purpose: every call site records its commands
     host = kwargs.get("host") or kwargs.get("ip") or ""
+    kwargs["conn_timeout"] = kwargs["auth_timeout"] = kwargs["banner_timeout"] = tmo("ssh_connect")
     started = time.time()
     try:
         conn = _netmiko_connect(*args, **kwargs)
@@ -316,17 +317,47 @@ def _frozen_excepthook(exc_type, exc, tb):
 # Errors that are EXPECTED when the switch drops the SSH session because it reloads.
 CONNECTION_LOST = (OSError, EOFError, paramiko.SSHException, NetmikoBaseException)
 
-INSTALL_TIMEOUT = 3600      # seconds to wait for the whole IOS-XE install (add + activate + reload)
+# Operator-tunable waits, in seconds. These are the DEFAULTS; the dashboard's Settings page changes them (saved
+# in settings.json) and hands the current values to every upgrade worker in its job file. tmo(key) is always the
+# value in force right now.
+TIMEOUT_DEFAULTS = {
+    'ssh_connect': 20,       # SSH connect / login / banner wait
+    'show_cmd': 60,          # show version, show boot, show switch, dir, show install summary
+    'show_run': 120,         # backup: show running-config
+    'backup_cmd': 60,        # backup: every other command
+    'snapshot_cmd': 45,      # pre/post-check snapshot commands
+    'health_cmd': 20,        # CPU / memory / stack health commands
+    'write_memory': 180,     # saving the configuration
+    'install_commit': 300,   # install commit after the reload
+    'md5_verify': 900,       # verify /md5 of the image on the switch
+    'install_total': 3600,   # the whole install add / activate / reload
+    'clean_total': 3600,     # package clean-up
+    'reboot_down': 600,      # wait for the switch to stop answering ping
+    'reboot_up': 2400,       # wait for it to answer ping again (stacks boot slowly)
+    'reboot_ssh': 900,       # wait for SSH to accept a login again
+}
+TIMEOUTS = dict(TIMEOUT_DEFAULTS)
+
+
+def tmo(key):
+    return TIMEOUTS.get(key, TIMEOUT_DEFAULTS[key])
+
+
+def apply_timeouts(values):
+    for key, default in TIMEOUT_DEFAULTS.items():
+        try:
+            n = int((values or {}).get(key, default))
+        except (TypeError, ValueError, AttributeError):
+            n = default
+        TIMEOUTS[key] = n if n > 0 else default
+
+
 INSTALL_POLL = 2            # seconds between reads while the install runs
 INSTALL_HEARTBEAT = 60      # print "still waiting" this often when the switch is quiet
 
-CLEAN_TIMEOUT = 3600   # seconds; the package clean-up can take a long time
 
 # Waiting for the switch to reload after 'install ... activate commit' (--job mode)
 REBOOT_POLL = 5             # seconds between pings
-REBOOT_DOWN_TIMEOUT = 600   # wait this long for the switch to stop answering ping
-REBOOT_UP_TIMEOUT = 2400    # ... and this long for it to answer again (stacks boot slowly)
-REBOOT_SSH_TIMEOUT = 900    # ... and this long for SSH to accept a login again
 REBOOT_SSH_RETRY = 15       # seconds between login attempts
 
 STATUS = None               # StatusFile, set in --job mode (progress shown in the web GUI)
@@ -390,10 +421,20 @@ class StatusFile(object):
                 self.update()
         threading.Thread(target=beat, daemon=True).start()
 #------------------------------------------------------------------------------
+PHASE_STATE = {'name': None, 'start': 0.0, 'done': []}     # how long each phase of THIS run took (per worker process)
+
+
 def report(phase, message, **extra):
-    """Publish progress to the web GUI (no-op when the script runs interactively)."""
+    """Publish progress to the web GUI (no-op when the script runs interactively). Also keeps the time spent in
+    every phase; the list goes to the GUI as phase_times, where the Command time test turns it into timeouts."""
     if STATUS is not None:
-        STATUS.update(phase=phase, message=message, **extra)
+        now = time.time()
+        if phase != PHASE_STATE['name']:
+            if PHASE_STATE['name']:
+                PHASE_STATE['done'].append({'phase': PHASE_STATE['name'],
+                                            'seconds': round(now - PHASE_STATE['start'], 1)})
+            PHASE_STATE['name'], PHASE_STATE['start'] = phase, now
+        STATUS.update(phase=phase, message=message, phase_times=list(PHASE_STATE['done']), **extra)
 #------------------------------------------------------------------------------
 def parse_version(show_version_output):
     """'Cisco IOS XE Software, Version 17.09.04a' -> '17.09.04a' (None if not found)."""
@@ -661,8 +702,8 @@ def boot_state(show_version_output, show_boot_output):
 def read_boot_state(net_connect, show_version_output=None):
     """-> (boot_state dict, raw 'show boot' output)."""
     if show_version_output is None:
-        show_version_output = net_connect.send_command('show version', read_timeout=60)
-    raw = net_connect.send_command('show boot', read_timeout=60)
+        show_version_output = net_connect.send_command('show version', read_timeout=tmo('show_cmd'))
+    raw = net_connect.send_command('show boot', read_timeout=tmo('show_cmd'))
     return boot_state(show_version_output, raw), raw
 
 
@@ -670,24 +711,63 @@ def set_boot_install_mode(net_connect, was=''):
     """Cisco steps 4-6: no boot system / boot system flash:packages.conf / no boot manual, write memory,
     then 'show boot' to confirm.  -> (boot_state dict, raw 'show boot' output)."""
     net_connect.send_config_set(BOOT_FIX_COMMANDS)
-    net_connect.send_command('write memory')
+    net_connect.send_command('write memory', read_timeout=tmo('write_memory'))
     state, raw = read_boot_state(net_connect)
     if state['boot_ok']:
         state['detail'] = 'set to {}{}'.format(BOOT_TARGET, ' (was: {})'.format(was) if was else '')
     return state, raw
 
 
-def remove_inactive(net_connect):
-    """Cisco step 1 for the 'install' command set: install remove inactive (answers the [y/n] question;
-    when there is nothing to remove the switch just returns to the prompt)."""
-    prompt = re.escape(net_connect.base_prompt) + r'#'
-    question = r'\[y/n\]'
-    output = net_connect.send_command('install remove inactive',
-                                      expect_string='{}|{}'.format(question, prompt), read_timeout=CLEAN_TIMEOUT)
-    if re.search(question, output):
-        output += net_connect.send_command('y', expect_string=prompt, read_timeout=CLEAN_TIMEOUT)
-        net_connect.clear_buffer()
-    return output
+def stream_command(net_connect, command, device, timeout, label='clean-up', on_output=None, should_stop=None):
+    """Send `command` and stream the output instead of waiting for one fixed prompt string.
+    - every output line is logged as it arrives (a slow command no longer looks stuck)
+    - any [y/n] question is answered with 'y'
+    - returns as soon as the CLI prompt is back
+    - raises ReadTimeout if nothing conclusive happens within `timeout` seconds (the output so far is on .output)
+    device=None: nothing is logged (the Command time test); on_output(text) is called with all output so far;
+    should_stop() returning True ends the wait (ReadTimeout with .stopped = True)"""
+    net_connect.clear_buffer()
+    net_connect.write_channel(command + '\n')
+    output, line_buf, answered_upto = '', '', 0
+    started = last_beat = time.time()
+    while time.time() - started < timeout:
+        time.sleep(INSTALL_POLL)
+        if should_stop and should_stop():              # the Stop button of the Command time test
+            err = ReadTimeout('{} stopped'.format(label))
+            err.output, err.stopped = output, True
+            raise err
+        chunk = net_connect.read_channel()
+        if chunk:
+            output += chunk
+            line_buf += chunk
+            *lines, line_buf = line_buf.split('\n')
+            for line in lines:
+                if line.strip() and device:
+                    log(device, '  {}> {}'.format(label, line.rstrip()))
+            if on_output:
+                on_output(output)
+            last_beat = time.time()
+        elif not net_connect.is_alive():
+            raise EOFError('SSH session closed by the switch')
+        elif time.time() - last_beat >= INSTALL_HEARTBEAT:
+            if device:
+                log(device, '  {}> still running, no new output ({}s elapsed) ...'.format(label, int(time.time() - started)))
+            last_beat = time.time()
+        pending = output[answered_upto:]
+        if re.search(r'\[y/n\]\s*$', pending):
+            net_connect.write_channel('y\n')
+            answered_upto = len(output)
+        elif answered_upto < len(output) and re.search(r'(?m)^\S+#\s*$', pending):
+            return output
+    err = ReadTimeout('{} did not finish within {}s'.format(label, timeout))
+    err.output = output
+    raise err
+
+
+def remove_inactive(net_connect, device=None):
+    """Cisco step 1 for the 'install' command set: install remove inactive (streamed; answers the
+    [y/n] question; when there is nothing to remove the switch just returns to the prompt)."""
+    return stream_command(net_connect, 'install remove inactive', device, tmo('clean_total'), 'remove-inactive')
 
 
 def parse_free_bytes(text):
@@ -698,7 +778,7 @@ def parse_free_bytes(text):
 def stack_members(net_connect):
     """-> (active member number, [all member numbers]) from 'show switch'; (1, [1]) if unreadable."""
     try:
-        out = net_connect.send_command('show switch', read_timeout=60)
+        out = net_connect.send_command('show switch', read_timeout=tmo('show_cmd'))
     except Exception:
         return 1, [1]
     rows = re.findall(r'(?m)^\s*\*?\s*(\d+)\s+(Active|Standby|Member|Master)\b', out, re.I)
@@ -719,7 +799,7 @@ def check_flash_space(net_connect, image_size=None, image_name=None):
     for n in numbers:
         try:
             out = net_connect.send_command('dir {}'.format('flash:' if n == active else 'flash-{}:'.format(n)),
-                                           read_timeout=60)
+                                           read_timeout=tmo('show_cmd'))
         except Exception:
             out = ''
         free[n] = parse_free_bytes(out)
@@ -792,8 +872,8 @@ def verify_image_sha256_sidecar(filename, chunk_size=1024 * 1024, sidecar_path=N
     return actual
 
 def _verify_image_digest(filename, algorithm, expected_digest, chunk_size=1024 * 1024):
-    label = "SHA-512" if algorithm == "sha512" else "SHA-256"
-    size = 128 if algorithm == "sha512" else 64
+    label = {"md5": "MD5", "sha512": "SHA-512"}.get(algorithm, "SHA-256")
+    size = {"md5": 32, "sha512": 128}.get(algorithm, 64)
     expected = re.sub(r"\s+", "", str(expected_digest or "")).lower()
     if not re.fullmatch(r"[0-9a-f]{" + str(size) + r"}", expected):
         raise ValueError("{} checksum must be a {}-character hexadecimal digest".format(label, size))
@@ -812,15 +892,20 @@ def _verify_image_digest(filename, algorithm, expected_digest, chunk_size=1024 *
     return actual
 
 
+def verify_image_md5(filename, expected_digest, chunk_size=1024 * 1024):
+    """Verify image bytes against the MD5 digest shown on Cisco's download page."""
+    return _verify_image_digest(filename, "md5", expected_digest, chunk_size)
+
+
 def verify_image_sha512(filename, expected_digest, chunk_size=1024 * 1024):
     """Verify image bytes against a SHA-512 digest copied from Cisco's download page."""
     return _verify_image_digest(filename, "sha512", expected_digest, chunk_size)
 
 
 def verify_image_checksum_sidecar(filename, chunk_size=1024 * 1024):
-    """Verify a saved Cisco checksum sidecar, preferring SHA-512 with legacy SHA-256 support."""
+    """Verify a saved checksum sidecar: MD5 (what the Storage page writes), else a legacy SHA-512 / SHA-256 one."""
     image_path = Path(filename)
-    for algorithm, label, size in (("sha512", "SHA-512", 128), ("sha256", "SHA-256", 64)):
+    for algorithm, label, size in (("md5", "MD5", 32), ("sha512", "SHA-512", 128), ("sha256", "SHA-256", 64)):
         sidecar = Path(str(image_path) + "." + algorithm)
         if not sidecar.exists():
             continue
@@ -833,7 +918,7 @@ def verify_image_checksum_sidecar(filename, chunk_size=1024 * 1024):
         if not match:
             raise ValueError("{} sidecar must start with a {}-character hexadecimal digest".format(label, size))
         return _verify_image_digest(image_path, algorithm, match.group(1), chunk_size)
-    raise ValueError("missing SHA-512 or SHA-256 checksum sidecar")
+    raise ValueError("missing MD5 checksum sidecar - upload the image again in Storage > IOS-XE images")
 
 
 #------------------------------------------------------------------------------
@@ -858,17 +943,17 @@ def software_install(net_connect, image_name, device, timeout=None, mode='full')
     - a dropped SSH session raises (= the switch is reloading)
     - ReadTimeout is raised if nothing conclusive happens within `timeout` seconds
     """
-    timeout = INSTALL_TIMEOUT if timeout is None else timeout
+    timeout = tmo('install_total') if timeout is None else timeout
     if mode == 'activate':
         command = 'install activate\n'
     elif mode == 'legacy':
-        net_connect.send_command('write memory')
+        net_connect.send_command('write memory', read_timeout=tmo('write_memory'))
         command = 'request platform software package install switch all file flash:{} auto-copy\n'.format(image_name)
     elif mode == 'distribute':
-        net_connect.send_command('write memory')
+        net_connect.send_command('write memory', read_timeout=tmo('write_memory'))
         command = 'install add file flash:{}\n'.format(image_name)
     else:
-        net_connect.send_command('write memory')
+        net_connect.send_command('write memory', read_timeout=tmo('write_memory'))
         command = 'install add file flash:{} activate commit\n'.format(image_name)
     net_connect.write_channel(command)
 
@@ -904,28 +989,15 @@ def software_install(net_connect, image_name, device, timeout=None, mode='full')
 
     raise ReadTimeout('install did not finish or drop the session within {}s'.format(timeout))
 #------------------------------------------------------------------------------
-def clean_packages(net_connect):
-    """IOS-XE: free flash with 'request platform software package clean switch all'.
-
-    The command scans first and can run for several minutes, then asks
-    "Do you want to proceed? [y/n]" - we wait for that question and answer 'y'.
-    If there is nothing to clean, the switch returns to the prompt without
-    asking, so the prompt is accepted as an end condition as well.
-    """
-    prompt = re.escape(net_connect.base_prompt) + r'#'
-    question = r'Do you want to proceed\? \[y/n\]'
-    output = net_connect.send_command(
-        'request platform software package clean switch all',
-        expect_string='{}|{}'.format(question, prompt), read_timeout=CLEAN_TIMEOUT)
-    if re.search(question, output):
-        # explicit expect_string: without it Netmiko would send a newline to find the prompt
-        output += net_connect.send_command('y', expect_string=prompt, read_timeout=CLEAN_TIMEOUT)
-        net_connect.clear_buffer()
-    return output
+def clean_packages(net_connect, device=None):
+    """IOS-XE legacy: free flash with 'request platform software package clean switch all' (streamed,
+    [y/n] answered with 'y')."""
+    return stream_command(net_connect, 'request platform software package clean switch all',
+                          device, tmo('clean_total'), 'clean')
 #------------------------------------------------------------------------------
 def verify_md5(net_connect, image_name, md5, member_fs='flash'):
     result = net_connect.send_command(
-        'verify /md5 {}:{} {}'.format(member_fs, image_name, md5), read_timeout=900)
+        'verify /md5 {}:{} {}'.format(member_fs, image_name, md5), read_timeout=tmo('md5_verify'))
     return re.search(r'Verified', result) is not None
 #------------------------------------------------------------------------------
 def probe_device_readiness(host, device_type, username, password, secret, image_local_path):
@@ -958,7 +1030,7 @@ def probe_device_readiness(host, device_type, username, password, secret, image_
         conn.send_command = _recording_send
         show_version = None
         try:
-            show_version = conn.send_command("show version", read_timeout=60)
+            show_version = conn.send_command("show version", read_timeout=tmo('show_cmd'))
         except Exception:  # noqa: BLE001 - a failed lookup is a finding, not a crash
             pass
         checks["version"] = parse_version(show_version) if show_version else None
@@ -1151,7 +1223,7 @@ def read_snapshot(conn):
     outputs = {}
     for key, cmd in SNAPSHOT_COMMANDS:
         try:
-            outputs[key] = conn.send_command(cmd, read_timeout=45)
+            outputs[key] = conn.send_command(cmd, read_timeout=tmo('snapshot_cmd'))
         except Exception as exc:  # noqa: BLE001 - one failing show command must not stop the others
             outputs[key] = ""
             outputs[key + "_error"] = type(exc).__name__
@@ -1191,14 +1263,14 @@ def read_health(conn):
     """CPU (1-min average), free memory and stack state - shared by the pre- and post-check."""
     out = {"cpu_pct": None, "mem_free_pct": None, "stack": None}
     try:
-        cpu_out = conn.send_command("show processes cpu", read_timeout=20)
+        cpu_out = conn.send_command("show processes cpu", read_timeout=tmo('health_cmd'))
         m = re.search(r"five seconds:\s*\d+%.*?one minute:\s*(\d+)%", cpu_out, re.S)
         if m:
             out["cpu_pct"] = int(m.group(1))
     except Exception:  # noqa: BLE001 - nice-to-have, never fatal
         pass
     try:
-        mem_out = conn.send_command("show processes memory", read_timeout=20)
+        mem_out = conn.send_command("show processes memory", read_timeout=tmo('health_cmd'))
         m = re.search(r"Processor Pool Total:\s*(\d+)\s*Used:\s*(\d+)\s*Free:\s*(\d+)", mem_out)
         if m:
             total, free = int(m.group(1)), int(m.group(3))
@@ -1207,7 +1279,7 @@ def read_health(conn):
     except Exception:  # noqa: BLE001
         pass
     try:
-        sw_out = conn.send_command("show switch", read_timeout=20)
+        sw_out = conn.send_command("show switch", read_timeout=tmo('health_cmd'))
         states = re.findall(r"^\*?\s*\d+\s+\S+\s+\S+\s+\S+\s+(\S+)\s*$", sw_out, re.M)
         if states:
             not_ready = [x for x in states if x.lower() != "ready"]
@@ -1346,13 +1418,54 @@ def run_postcheck(device, creds, expected_version, pre):
     return result
 
 
-def transfer_file(net_connect, local_path, image_name):
+SCP_STATE = {'added': False}      # True when THIS run switched 'ip scp server enable' on (the switch did not have it)
+SCP_LINE_RE = re.compile(r'(?m)^\s*ip scp server enable\s*$')
+SCP_SHOW = 'show running-config | include ip scp server enable'
+
+
+def transfer_file(net_connect, local_path, image_name, state=None):
+    state = SCP_STATE if state is None else state
+    try:                                   # remember whether the switch already had it: only what WE add is removed later
+        already = bool(SCP_LINE_RE.search(net_connect.send_command(SCP_SHOW, read_timeout=tmo('show_cmd')) or ''))
+    except Exception:  # noqa: BLE001 - cannot tell: treat as "was there", so nothing is removed afterwards
+        already = None
     net_connect.send_config_set(['ip scp server enable'])
+    if already is False:
+        state['added'] = True
     scp_conn = SCPConn(getattr(net_connect, '_conn', net_connect))     # the real session, not the recording wrapper
     try:
         scp_conn.scp_transfer_file(local_path, image_name)
     finally:
         scp_conn.close()
+def remove_scp_server(device, creds):
+    """The upgrade turned 'ip scp server enable' on only to upload the image. Once the upgrade has finished, turn it
+    off again (and save, so it does not come back after the next reload). -> (ok, note)."""
+    secret = creds[2] if len(creds) > 2 else None
+    session = None
+    try:
+        connect_args = dict(device_type='cisco_xe', ip=device['ipaddr'], username=creds[0], password=creds[1],
+                            conn_timeout=tmo('ssh_connect'))
+        if secret:
+            connect_args['secret'] = secret
+        session = ConnectHandler(**connect_args)
+        if secret:
+            session.enable()
+        session.send_config_set(['no ip scp server enable'])
+        session.send_command('write memory', read_timeout=tmo('write_memory'))
+        if SCP_LINE_RE.search(session.send_command(SCP_SHOW, read_timeout=tmo('show_cmd')) or ''):
+            return False, "'ip scp server enable' is still on - remove it on the switch (no ip scp server enable)"
+        return True, "'ip scp server enable' removed again (the switch did not have it before the upgrade)"
+    except Exception as exc:  # noqa: BLE001
+        return False, ("could not remove 'ip scp server enable' that the upgrade added ({}) - remove it on the "
+                       "switch: no ip scp server enable".format(type(exc).__name__))
+    finally:
+        if session is not None:
+            try:
+                session.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 #------------------------------------------------------------------------------
 def read_devices(xlsx_filename, sheet_name='Switches'):
     """Read the switch list from an .xlsx file. Only cisco-xe devices are returned."""
@@ -1420,7 +1533,7 @@ def report_boot(boot):
         STATUS.update(boot=boot)
 #------------------------------------------------------------------------------
 @activity('Upgrade')
-def command_worker(device, creds, local_path, image_name, md5, results, mode='full'):
+def command_worker(device, creds, local_path, image_name, md5, results, mode='full', ignore_space=False):
     """Returns nothing; outcome is stored in results[ipaddr].  IOS-XE INSTALL mode for the whole
     operation, following Cisco's "Upgrade Catalyst 9300 / 9200 Switches" guides:
       1. platform + version + boot mode are read ('show version', 'show boot')
@@ -1534,7 +1647,7 @@ def command_worker(device, creds, local_path, image_name, md5, results, mode='fu
             session.enable()
 
         # ---- Platform, version and boot mode (read fresh; the dashboard values are only a hint)
-        show_version = session.send_command('show version', read_timeout=60)
+        show_version = session.send_command('show version', read_timeout=tmo('show_cmd'))
         old_version, model = parse_version(show_version), parse_model(show_version)
         series, flavor = model_series(model), install_flavor(model, parse_version(show_version))
         log(device, 'Running software version: {}, platform: {}'.format(old_version or 'unknown', model or 'unknown'))
@@ -1587,7 +1700,8 @@ def command_worker(device, creds, local_path, image_name, md5, results, mode='fu
         log(device, 'Removing inactive packages ({}) - this can take several minutes ...'.format(
             'request platform software package clean switch all' if flavor == 'legacy' else 'install remove inactive'))
         try:
-            clean_output = clean_packages(session) if flavor == 'legacy' else remove_inactive(session)
+            clean_output = (clean_packages(session, device) if flavor == 'legacy'
+                            else remove_inactive(session, device))
         except ReadTimeout:
             log(device, 'TIMED OUT during package clean-up - stopping for this switch')
             status = 'FAILED (clean-up timeout)'
@@ -1602,19 +1716,23 @@ def command_worker(device, creds, local_path, image_name, md5, results, mode='fu
         skip_upload = False
         if space['exists']:
             log(device, 'File already uploaded on device ...')
-            if mode != 'distribute':
+            if mode == 'activate':
                 status = 'SKIPPED (image already on flash)'
                 return
             # A .bin on flash is NOT a distributed image: only 'install add' stages it (it then shows in
             # 'show install summary'). The file may be there from an interrupted run or a manual copy, so
-            # skip just the upload, verify the file, and still run 'install add'.
+            # skip just the upload, verify the file, and still run the install command for this mode.
             skip_upload = True
             log(device, 'The file is on flash but is not necessarily added (staged) yet - skipping the upload, '
-                        'checking the file and running install add ...')
+                        'checking the file and running the install ...')
         if space['level'] == 'fail':
-            log(device, 'Not enough free space on device ...')
-            status = 'FAILED (not enough space)'
-            return
+            if ignore_space:
+                log(device, 'WARNING: not enough free flash by Cisco\'s rule - the operator chose to IGNORE the flash '
+                            'space check, so the upgrade continues. The install may still fail if flash really runs out.')
+            else:
+                log(device, 'Not enough free space on device ...')
+                status = 'FAILED (not enough space)'
+                return
         if space['level'] == 'low':
             log(device, 'WARNING: free flash is below the 1.5 GB Cisco recommends - continuing, the install '
                         'may still succeed')
@@ -1672,7 +1790,7 @@ def command_worker(device, creds, local_path, image_name, md5, results, mode='fu
             if not add_image():
                 status = 'FAILED (install add)'
                 return
-            listing = session.send_command('dir {}'.format(BOOT_TARGET), read_timeout=60)
+            listing = session.send_command('dir {}'.format(BOOT_TARGET), read_timeout=tmo('show_cmd'))
             if not re.search(r'packages\.conf', listing) or re.search(r'%\s*Error|No such file', listing):
                 log(device, 'install add finished but {} is still missing on flash - NOT activating'.format(BOOT_TARGET))
                 status = 'FAILED (packages.conf missing after install add)'
@@ -1716,13 +1834,13 @@ def commit_install(device, creds):
         session = ConnectHandler(**args)
         if secret:
             session.enable()
-        out = session.send_command_timing('install commit', read_timeout=300)
+        out = session.send_command_timing('install commit', read_timeout=tmo('install_commit'))
         for line in out.splitlines():
             if line.strip():
                 log(device, '  install> {}'.format(line.rstrip()))
         if INSTALL_FAIL_RE.search(out):
             return False, 'install commit reported a failure'
-        summary = session.send_command('show install summary', read_timeout=60)
+        summary = session.send_command('show install summary', read_timeout=tmo('show_cmd'))
         if re.search(r'(?m)^\s*IMG\s+U\b', summary):
             return False, 'the image is still shown as activated but not committed'
         log(device, 'Commit OK - the new image is committed')
@@ -1753,7 +1871,7 @@ def wait_for_reboot(device, creds, old_version):
     started = time.time()
     misses = 0
     went_down = False
-    while time.time() - started < REBOOT_DOWN_TIMEOUT:
+    while time.time() - started < tmo('reboot_down'):
         if is_reachable(ip):
             misses = 0
         else:
@@ -1771,8 +1889,8 @@ def wait_for_reboot(device, creds, old_version):
         hits = 0
         last_note = time.time()
         while True:
-            if time.time() - down_at > REBOOT_UP_TIMEOUT:
-                msg = 'Switch did not answer ping again within {} minutes'.format(REBOOT_UP_TIMEOUT // 60)
+            if time.time() - down_at > tmo('reboot_up'):
+                msg = 'Switch did not answer ping again within {} minutes'.format(tmo('reboot_up') // 60)
                 log(device, msg)
                 return 'attention', msg, None
             if is_reachable(ip):
@@ -1792,7 +1910,7 @@ def wait_for_reboot(device, creds, old_version):
         log(device, 'Switch answers ping again after {}m {:02d}s'.format(elapsed // 60, elapsed % 60))
     else:
         log(device, 'WARNING: the switch never stopped answering ping within {} s - '
-                    'checking the software version anyway'.format(REBOOT_DOWN_TIMEOUT))
+                    'checking the software version anyway'.format(tmo('reboot_down')))
 
     # ---- 3. wait until SSH accepts a login, then read the version
     report('waiting_ssh', 'Switch answers ping - waiting for SSH login ...')
@@ -1802,7 +1920,7 @@ def wait_for_reboot(device, creds, old_version):
     new_version = None
     new_boot = None
     last_error = ''
-    while time.time() - started < REBOOT_SSH_TIMEOUT:
+    while time.time() - started < tmo('reboot_ssh'):
         session = None
         try:
             connect_args = dict(device_type='cisco_xe', ip=ip, username=username, password=password)
@@ -1814,7 +1932,7 @@ def wait_for_reboot(device, creds, old_version):
             connected = True
             show_version = None
             try:
-                show_version = session.send_command('show version', read_timeout=60)
+                show_version = session.send_command('show version', read_timeout=tmo('show_cmd'))
             except Exception:                          # a version lookup must never stop the check
                 pass
             new_version = parse_version(show_version) if show_version else None
@@ -1837,7 +1955,7 @@ def wait_for_reboot(device, creds, old_version):
 
     if not connected:
         msg = 'Switch is back but SSH login failed within {} minutes ({})'.format(
-            REBOOT_SSH_TIMEOUT // 60, last_error or 'no answer')
+            tmo('reboot_ssh') // 60, last_error or 'no answer')
         log(device, msg)
         return 'attention', msg, None
     if not new_version:
@@ -1862,6 +1980,96 @@ def wait_for_reboot(device, creds, old_version):
                                                   ' ({} mode)'.format(mode_txt) if mode_txt else '')
     log(device, msg)
     return 'completed', msg, new_version
+
+
+def watch_reload_timed(ip, username, password, secret, limits, emit=None, should_stop=None, extra=None):
+    """The Command time test's version of wait_for_reboot: the same waits (ping stops, ping answers again, SSH login),
+    but every one is TIMED and reported through emit(text). limits: seconds for 'down', 'up' and 'ssh'.
+    -> {down, up, ssh (seconds or None), version, boot, stopped, error}"""
+    emit = emit or (lambda text: None)
+    stop = should_stop or (lambda: False)
+    res = {"down": None, "up": None, "ssh": None, "version": None, "boot": None, "stopped": False, "error": "",
+           "extra": {}}
+    started, misses, went_down = time.time(), 0, False
+    emit("Waiting for the switch to stop answering ping ...")
+    while time.time() - started < limits["down"]:
+        if stop():
+            res["stopped"] = True
+            return res
+        misses = 0 if is_reachable(ip) else misses + 1
+        if misses >= 2:
+            went_down = True
+            break
+        time.sleep(REBOOT_POLL)
+    if went_down:
+        res["down"] = round(time.time() - started, 1)
+        down_at, hits, last_note = time.time(), 0, time.time()
+        emit("Ping stopped after {} s - the switch is reloading. Waiting for it to answer again ...".format(res["down"]))
+        while True:
+            if stop():
+                res["stopped"] = True
+                return res
+            if time.time() - down_at > limits["up"]:
+                res["error"] = "The switch did not answer ping again within {} s.".format(limits["up"])
+                emit(res["error"])
+                return res
+            hits = hits + 1 if is_reachable(ip) else 0
+            if hits >= 2:
+                break
+            if time.time() - last_note >= 30:
+                emit("Still down ({} s) ...".format(int(time.time() - down_at)))
+                last_note = time.time()
+            time.sleep(REBOOT_POLL)
+        res["up"] = round(time.time() - down_at, 1)
+        emit("Ping answers again after {} s.".format(res["up"]))
+    else:
+        emit("The switch never stopped answering ping within {} s - checking the version anyway.".format(limits["down"]))
+    emit("Waiting for SSH login ...")
+    ssh_started, last_error = time.time(), ""
+    while time.time() - ssh_started < limits["ssh"]:
+        if stop():
+            res["stopped"] = True
+            return res
+        session = None
+        try:
+            args = dict(device_type='cisco_xe', ip=ip, username=username, password=password)
+            if secret:
+                args['secret'] = secret
+            session = ConnectHandler(**args)
+            if secret:
+                session.enable()
+            res["ssh"] = round(time.time() - ssh_started, 1)
+            show_version = None
+            try:
+                show_version = session.send_command('show version', read_timeout=tmo('show_cmd'))
+            except Exception:  # noqa: BLE001
+                pass
+            res["version"] = parse_version(show_version) if show_version else None
+            if show_version:
+                try:
+                    res["boot"], _raw = read_boot_state(session, show_version)
+                except Exception:  # noqa: BLE001
+                    pass
+            emit("SSH login works after {} s. Software version: {}".format(res["ssh"], res["version"] or "unknown"))
+            for command in (extra or []):                   # for example show install summary
+                try:
+                    res["extra"][command] = session.send_command(command, read_timeout=tmo('show_cmd')) or ""
+                    emit("{}# {}\n{}".format(ip, command, res["extra"][command].rstrip()))
+                except Exception:  # noqa: BLE001
+                    pass
+            return res
+        except Exception as exc:  # noqa: BLE001 - SSH/AAA are often not ready right after boot
+            last_error = type(exc).__name__
+            time.sleep(REBOOT_SSH_RETRY)
+        finally:
+            if session is not None:
+                try:
+                    session.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+    res["error"] = "SSH login did not work within {} s ({}).".format(limits["ssh"], last_error or "no answer")
+    emit(res["error"])
+    return res
 #------------------------------------------------------------------------------
 def set_console_title(title):
     if os.environ.get('IOSXE_BACKGROUND_WORKER') or not sys.stdout.isatty():   # background worker: no window to title
@@ -1913,6 +2121,7 @@ def job_main(job_path):
         return 2
 
     LOG_FILE = job.get('log_path')
+    apply_timeouts(job.get('timeouts'))             # the waits chosen on the dashboard's Settings page
     device = {'ipaddr': job['ip'], 'type': 'cisco-xe', 'name': job.get('name') or job['ip']}
     STATUS = StatusFile(job['status_path'])
     STATUS.update(state='running', phase='starting', message='Starting ...')
@@ -1922,6 +2131,7 @@ def job_main(job_path):
     del job['password']
 
     action = job.get('action') or 'full'          # 'full' (default) | 'distribute' | 'activate'
+    ignore_space = bool(job.get('ignore_space'))  # operator chose to bypass the flash space check
     log(device, 'Worker started - action: {}'.format(action))
     state, message, new_version = 'failed', 'Unknown error', None
     reloaded = False                              # True only when a real reload + new version was verified
@@ -1948,7 +2158,7 @@ def job_main(job_path):
             log(device, 'Local MD5: {}'.format(md5))
 
             results = {}
-            command_worker(device, creds, image_path, image_name, md5, results, mode=action)
+            command_worker(device, creds, image_path, image_name, md5, results, mode=action, ignore_space=ignore_space)
             status = results.get(device['ipaddr'], 'UNKNOWN')
 
         if status in ('OK (reloading)', 'CHECK MANUALLY'):
@@ -1994,8 +2204,16 @@ def job_main(job_path):
             STATUS.update(postcheck={'state': 'failed', 'checks': {}, 'time': now_str(),
                                      'detail': 'Post-check could not run ({})'.format(type(exc).__name__)})
 
-    STATUS.update(state=state, phase='done', message=message, result=message,
-                  new_version=new_version)
+    if SCP_STATE['added']:                         # undo the one configuration change the upgrade made
+        ok, note = remove_scp_server(device, creds)
+        log(device, ('SCP clean-up: ' if ok else 'WARNING: SCP clean-up: ') + note)
+        if ok:
+            message += ' - ip scp server setting removed again'
+        else:
+            message += ' - WARNING: ' + note
+            if state == 'completed':
+                state = 'attention'
+    report('done', message, state=state, result=message, new_version=new_version)
     print('\n---- Result -----------------------------')
     print('{:<16} {:<20} {}'.format(device['ipaddr'], device['name'], message))
     pause_before_exit()
@@ -2172,6 +2390,285 @@ SITES_ROOT_DIRNAME = "Switch Configuration Backups"
 SITE_BACKUPS_SUBDIR = "Switch Backups"
 SITE_REPORTS_SUBDIR = "Reports"
 SITE_RUNS_SUBDIR = "Runs"
+
+
+# --------------------------------------------------------------------------- #
+# Global settings (the gear icon page). One settings.json next to the program, shared by every site.
+# --------------------------------------------------------------------------- #
+SETTINGS_FILENAME = "settings.json"
+# Every launch starts with a clean device list: the status columns (software version, boot mode, backup,
+# readiness, image stage, upgrade, post-check) begin empty. The devices, the saved backups and the credential
+# profiles of the site are always kept. This used to be a switch on the Settings page; it is now fixed.
+FRESH_START = True
+SETTINGS_GROUPS = [
+    {"id": "rollout", "title": "Upgrade rollout",
+     "intro": "How a batch of switches is upgraded. These apply to the whole dashboard, not to one site."},
+    {"id": "timeouts", "title": "Command timeouts",
+     "intro": "How long the tool waits for a switch before it gives up. Raise a value when a production switch is slow "
+              "to return a command's output or to save its configuration. The default is shown next to each value "
+              "(click it to put the default back). A change applies to everything that starts after you save; an "
+              "upgrade that is already running keeps the values it started with. Command duration profiles "
+              "keep named sets of these values, and the Command time test can measure a switch to build one."},
+]
+
+
+def _t_item(key, section, label, help_text, lo, hi):
+    return {"key": key, "group": "timeouts", "section": section, "label": label, "help": help_text,
+            "type": "int", "unit": "s", "default": TIMEOUT_DEFAULTS[key], "min": lo, "max": hi}
+
+
+SETTINGS_ITEMS = [
+    {"key": "max_parallel", "group": "rollout", "section": "", "label": "Switches upgraded at the same time",
+     "help": "How many switches reload together (1 to 10). A bigger batch starts this many and queues the rest; each "
+             "queued switch starts when a running one finishes.",
+     "type": "int", "unit": "switches", "default": MAX_CONCURRENT_RELOADS, "min": 1, "max": MAX_PARALLEL_LIMIT},
+    {"key": "stop_on_failure", "group": "rollout", "section": "",
+     "label": "Stop starting more switches if one fails",
+     "help": "If a switch fails or needs attention, switches still waiting in the queue are not started. Switches "
+             "already running finish normally.",
+     "type": "bool", "unit": "", "default": True},
+    _t_item("ssh_connect", "Connection", "SSH connect and login",
+            "Waiting for the TCP connection, the login prompt and the banner when the tool connects to a switch.", 5, 300),
+    _t_item("show_cmd", "Command output", "Show commands",
+            "show version, show boot, show switch, dir flash: and show install summary.", 10, 1800),
+    _t_item("show_run", "Command output", "Backup: show running-config",
+            "Large configurations on a busy switch can take minutes to print.", 30, 1800),
+    _t_item("backup_cmd", "Command output", "Backup: other commands",
+            "Every other command saved by a backup, including the additional commands you list.", 10, 1800),
+    _t_item("snapshot_cmd", "Command output", "Pre-check and post-check snapshot commands",
+            "The commands that capture the switch state before and after an upgrade.", 10, 1800),
+    _t_item("health_cmd", "Command output", "Health checks (CPU, memory, stack)",
+            "show processes cpu, show processes memory and show switch during the readiness check.", 5, 600),
+    _t_item("write_memory", "Saving and installing", "Saving the configuration (write memory)",
+            "Used before and after the install steps. A switch with a large configuration can need several minutes.", 30, 1800),
+    _t_item("install_commit", "Saving and installing", "Install commit after the reload",
+            "The install commit command that finishes the upgrade once the switch is back.", 30, 3600),
+    _t_item("md5_verify", "Saving and installing", "Image MD5 check on the switch (verify /md5)",
+            "Calculating the MD5 of the copied image on the switch's flash. Big images on slow flash take a while.", 60, 7200),
+    _t_item("install_total", "Saving and installing", "Whole install (add, activate, reload)",
+            "How long the install may run before the tool reports a failure.", 600, 14400),
+    _t_item("clean_total", "Saving and installing", "Package clean-up (install remove inactive)",
+            "How long removing inactive packages may take.", 300, 14400),
+    _t_item("reboot_down", "Reload and recovery", "Switch to stop answering ping",
+            "After the install command, how long to wait for the switch to go down.", 60, 3600),
+    _t_item("reboot_up", "Reload and recovery", "Switch to answer ping again",
+            "How long to wait for the switch to come back. Stacks boot slowly.", 300, 7200),
+    _t_item("reboot_ssh", "Reload and recovery", "SSH to accept a login again",
+            "After it answers ping, how long to keep trying to log in.", 60, 3600),
+]
+
+
+def settings_defaults():
+    return {i["key"]: i["default"] for i in SETTINGS_ITEMS}
+
+
+def settings_path():
+    return this_program_path().parent / SETTINGS_FILENAME
+
+
+def clean_settings(data, strict=False):
+    """Every known setting, valid. strict=True (a save from the page) raises ApiError for a bad value; otherwise
+    (a damaged or old file) a bad or missing value silently becomes its default."""
+    data = data if isinstance(data, dict) else {}
+    out = {}
+    for item in SETTINGS_ITEMS:
+        key, default = item["key"], item["default"]
+        if key not in data:
+            out[key] = default
+            continue
+        value = data[key]
+        if item["type"] == "bool":
+            if not isinstance(value, bool):
+                if strict:
+                    raise ApiError(f"{item['label']} must be on or off.")
+                value = default
+            out[key] = value
+            continue
+        n = None
+        if not isinstance(value, bool) and isinstance(value, (int, str)):
+            try:
+                n = int(value)
+            except ValueError:
+                n = None
+        if n is None or not item["min"] <= n <= item["max"]:
+            if strict:
+                raise ApiError(f"{item['label']} must be a whole number from {item['min']} to {item['max']}.")
+            n = default
+        out[key] = n
+    return out
+
+
+def load_global_settings():
+    return clean_settings(read_json_file(settings_path()))
+
+
+def save_global_settings(values):
+    path = settings_path()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(values, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+# --------------------------------------------------------------------------- #
+# Command duration profiles (Settings > Command timeouts). A profile is a named set of the command timeouts above.
+# "Default" is built in and always there; the others are kept in command_profiles.json next to the program.
+# Applying a profile copies its values into the settings (and saves them), so it works like typing them in.
+# The Command time test on the same page runs the preset commands below on one switch, times each of them and
+# can turn the measured times into a new profile.
+# --------------------------------------------------------------------------- #
+TIMEOUT_PROFILES_FILENAME = "command_profiles.json"
+DEFAULT_TIMEOUT_PROFILE = "Default"
+TIMEOUT_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$")
+_TIMEOUT_PROFILES_LOCK = threading.Lock()
+TIMEOUT_ITEMS = {i["key"]: i for i in SETTINGS_ITEMS if i["group"] == "timeouts"}
+
+# The steps of the Command time test, in the order a manual upgrade of ONE switch runs them (the browser sends only
+# the step id, never a command line). "keys" are the timeout settings a step's duration tells something about.
+# kind: "command" (one command), "stream" (streamed and answered like the real upgrade does, can be stopped),
+# "bundle" (several commands in one login, timed one by one and in total) or a special step (upload, md5, boot,
+# activate). "warn" marks the steps that change the switch; the GUI asks for confirmation first.
+_PRECHECK_STEPS = ([("show version", "show_cmd"), ("show boot", "show_cmd")]
+                   + [(cmd, "snapshot_cmd") for _key, cmd in SNAPSHOT_COMMANDS]
+                   + [("show processes cpu", "health_cmd"), ("show processes memory", "health_cmd"),
+                      ("show switch", "health_cmd")])
+_POSTCHECK_STEPS = ([("show version", "show_cmd"), ("show processes cpu", "health_cmd"),
+                     ("show processes memory", "health_cmd"), ("show switch", "health_cmd")]
+                    + [(cmd, "snapshot_cmd") for _key, cmd in SNAPSHOT_COMMANDS])
+G_PRE, G_PREP, G_INST, G_POST = "1. Pre-check", "2. Prepare the switch", "3. Install", "4. Post-check"
+COMMAND_TEST_PRESETS = [
+    {"id": "precheck_bundle", "title": "Pre-check bundle", "command": "show version, show boot, snapshot and health commands",
+     "group": G_PRE, "kind": "bundle", "steps": _PRECHECK_STEPS,
+     "desc": "Everything the upgrade reads before it changes anything. Each command and the total are timed."},
+    {"id": "dir_flash", "title": "Check free space", "command": "dir flash:", "group": G_PREP, "kind": "command",
+     "keys": ("show_cmd",), "desc": "The flash needs room for the image plus about 1.5 GB for the expansion."},
+    {"id": "install_remove_inactive", "title": "Remove inactive packages", "command": "install remove inactive",
+     "group": G_PREP, "kind": "stream", "keys": ("clean_total",),
+     "warn": "removes the inactive software packages from the flash of {host} (the upgrade does this as its first step).",
+     "desc": "Frees the flash. This is the step that can stay silent for a long time - the live output shows what the "
+             "switch prints; use Stop if nothing happens."},
+    {"id": "upload_image", "title": "Copy the image to the flash", "command": "SCP upload of the image", "group": G_PREP,
+     "kind": "upload", "keys": (), "needs_image": True,
+     "warn": "copies the selected image to the flash of {host}. 'ip scp server enable' is switched on for the copy and "
+             "removed again afterwards if the switch did not have it.",
+     "desc": "Needs the image chosen above. Not a timeout setting - the time is for your information."},
+    {"id": "verify_md5", "title": "Check the image MD5", "command": "verify /md5 flash:<image> <md5>", "group": G_PREP,
+     "kind": "md5", "keys": ("md5_verify",), "needs_image": True,
+     "desc": "Compares the file on the flash with the checksum of the image on this PC."},
+    {"id": "boot_variable", "title": "Set the boot variable", "command": " / ".join(BOOT_FIX_COMMANDS),
+     "group": G_PREP, "kind": "boot", "keys": (),
+     "warn": "changes the boot variable of {host} to " + BOOT_TARGET + " (install mode); it is not saved until write memory.",
+     "desc": "Configuration commands, then show boot to confirm."},
+    {"id": "write_memory", "title": "Save the configuration", "command": "write memory", "group": G_PREP, "kind": "command",
+     "keys": ("write_memory",), "warn": "saves the running configuration of {host} to its startup configuration.",
+     "desc": "Slow on some switches - this is the one that broke an upgrade before."},
+    {"id": "install_add", "title": "Add the image", "command": "install add file flash:<image>", "group": G_INST,
+     "kind": "stream", "keys": ("install_total",), "needs_image": True, "fail_re": "INSTALL_FAIL_RE",
+     "warn": "adds (expands) the selected image on {host}. Nothing is activated and the switch does not reload.",
+     "desc": "Expands the packages. Together with the activation it makes up 'Whole install'."},
+    {"id": "install_activate", "title": "Activate (the switch reloads)", "command": "install activate", "group": G_INST,
+     "kind": "activate", "keys": ("install_total", "reboot_down", "reboot_up", "reboot_ssh"),
+     "warn": "ACTIVATES the added image and RELOADS {host}. The switch is offline for several minutes and everything "
+             "connected to it loses connectivity.",
+     "desc": "The switch reloads. The test then times how long ping stays down, how long until ping and SSH work again "
+             "and checks the software version it came back with."},
+    {"id": "install_commit", "title": "Commit", "command": "install commit", "group": G_INST, "kind": "stream",
+     "keys": ("install_commit",), "fail_re": "INSTALL_FAIL_RE",
+     "warn": "commits the activated image on {host}. Without it the switch rolls the activation back.",
+     "desc": "Run it once the switch is back after the activation."},
+    {"id": "install_full", "title": "Add, activate and commit (one command)",
+     "command": "install add file flash:<image> activate commit", "group": G_INST, "kind": "activate",
+     "keys": ("install_total", "reboot_down", "reboot_up", "reboot_ssh"), "needs_image": True,
+     "warn": "ADDS, ACTIVATES and COMMITS the selected image on {host} with ONE command and RELOADS it. The switch is "
+             "offline for several minutes and everything connected to it loses connectivity.",
+     "desc": "The one-command path the upgrade normally uses. Use it INSTEAD of the three steps above (Add, Activate, "
+             "Commit) - running both would upgrade the switch twice. After the reload the test checks the version and "
+             "whether the image is committed."},
+    {"id": "postcheck_bundle", "title": "Post-check bundle", "command": "version, health and snapshot commands",
+     "group": G_POST, "kind": "bundle", "steps": _POSTCHECK_STEPS,
+     "desc": "What the upgrade checks after the reload. Each command and the total are timed."},
+]
+for _p in COMMAND_TEST_PRESETS:
+    _p.setdefault("keys", ())
+    if _p["kind"] == "bundle":
+        _p["keys"] = tuple(dict.fromkeys(k for _c, k in _p["steps"]))
+# upgrade phase (as the worker reports it) -> the timeout setting it tells something about
+PHASE_TIMEOUT_KEYS = {"cleaning": "clean_total", "md5": "md5_verify", "installing": "install_total",
+                      "reloading": "install_total", "committing": "install_commit", "waiting_down": "reboot_down",
+                      "waiting_up": "reboot_up", "waiting_ssh": "reboot_ssh"}
+COMMAND_TEST_OUTPUT_LIMIT = 20000      # characters of a command's output sent back to the browser
+COMMAND_TEST_BAD_OUTPUT = re.compile(r"(?m)^\s*% ?(Invalid input|Ambiguous command|Incomplete command|Unknown command)")
+
+
+def clean_timeout_values(values, strict=False):
+    """Every command timeout, valid. strict=True raises ApiError for a bad value; otherwise a bad or missing
+    value becomes its default (a damaged or old file)."""
+    values = values if isinstance(values, dict) else {}
+    out = {}
+    for key, item in TIMEOUT_ITEMS.items():
+        raw, n = values.get(key, item["default"]), None
+        if isinstance(raw, float) and raw.is_integer():
+            raw = int(raw)
+        if not isinstance(raw, bool) and isinstance(raw, (int, str)):
+            try:
+                n = int(raw)
+            except ValueError:
+                n = None
+        if n is None or not item["min"] <= n <= item["max"]:
+            if strict:
+                raise ApiError(f"{item['label']} must be a whole number from {item['min']} to {item['max']}.")
+            n = item["default"]
+        out[key] = n
+    return out
+
+
+def timeout_profiles_path():
+    return this_program_path().parent / TIMEOUT_PROFILES_FILENAME
+
+
+def load_timeout_profiles():
+    """{"profiles": {name: record}, "last_applied": name}. The built-in Default is not stored here."""
+    data = read_json_file(timeout_profiles_path())
+    data = data if isinstance(data, dict) else {}
+    raw = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
+    profiles = {}
+    for name, rec in raw.items():
+        if (not isinstance(name, str) or not TIMEOUT_PROFILE_NAME_RE.match(name)
+                or name.lower() == DEFAULT_TIMEOUT_PROFILE.lower() or not isinstance(rec, dict)):
+            continue
+        profiles[name] = {"values": clean_timeout_values(rec.get("values")),
+                          "note": str(rec.get("note") or "")[:300], "saved_at": str(rec.get("saved_at") or "")[:30],
+                          "saved_by": str(rec.get("saved_by") or "")[:60], "site": str(rec.get("site") or "")[:80],
+                          "source": "command test" if rec.get("source") == "command test" else "manual",
+                          "switch": str(rec.get("switch") or "")[:80]}
+    last = data.get("last_applied")
+    return {"profiles": profiles, "last_applied": last if isinstance(last, str) else ""}
+
+
+def save_timeout_profiles(store):
+    path = timeout_profiles_path()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"profiles": store["profiles"], "last_applied": store.get("last_applied", "")}, indent=2),
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def image_checksum_kind(image_path):
+    for ext, label in ((".md5", "MD5"), (".sha512", "SHA-512"), (".sha256", "SHA-256")):
+        if Path(str(image_path) + ext).exists():
+            return label
+    return ""
+
+
+def list_image_details():
+    """[{name, size, checksum}] for the Storage page's image list, newest first."""
+    out = []
+    for name in list_images():
+        p = images_dir() / name
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        out.append({"name": name, "size": size, "checksum": image_checksum_kind(p)})
+    return out
 
 
 class SiteContext:
@@ -2923,7 +3420,8 @@ EMAILER = EmailNotifier()
 ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER = "administrator", "operator", "viewer"
 ROLES = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER)
 ROLE_LABELS = {ROLE_ADMIN: "Administrator", ROLE_OPERATOR: "Operator", ROLE_VIEWER: "Viewer"}
-OPERATOR_DENIED_POSTS = ("/api/monitor/stop", "/api/upgrade-settings")
+OPERATOR_DENIED_POSTS = ("/api/monitor/stop", "/api/settings", "/api/timeout-profiles/save",
+                         "/api/timeout-profiles/delete", "/api/timeout-profiles/apply")
 VIEWER_PAGES = ("/", "/index.html", "/favicon.ico")
 VIEWER_GETS = ("/api/status", "/api/console", "/api/me", "/api/device", "/api/upgrade-report.csv",
                "/api/upgrade-report.xlsx", "/api/upgrade-report/print")
@@ -2953,7 +3451,7 @@ def role_allows(role, method, path):
         return True, ""
     if role == ROLE_OPERATOR:
         if method == "POST" and _canonical_path(raw) in OPERATOR_DENIED_POSTS:
-            return False, "Operators cannot stop monitoring or change the upgrade settings. Ask an Administrator."
+            return False, "Operators cannot stop monitoring or change the settings. Ask an Administrator."
         return True, ""
     if role == ROLE_VIEWER:
         if method in ("GET", "HEAD") and (raw in VIEWER_GETS or raw in VIEWER_PAGES):
@@ -3280,9 +3778,9 @@ def do_backup(host, device_type, username, password, secret, device_dir, run_sta
     warnings, commands_run, sections = [], [], []
     device_dir = Path(device_dir)
 
-    def run_command(command, timeout=60):
+    def run_command(command, timeout=None):
         try:
-            output = conn.send_command(command, read_timeout=timeout)
+            output = conn.send_command(command, read_timeout=timeout or tmo("backup_cmd"))
             if not output or "Invalid input" in output[:200]:
                 raise ValueError("empty or invalid output")
             sections.append((command, output))
@@ -3300,7 +3798,7 @@ def do_backup(host, device_type, username, password, secret, device_dir, run_sta
         hostname = conn.find_prompt().rstrip("#>").strip()
         device_dir.mkdir(parents=True, exist_ok=True)
 
-        config = run_command("show running-config", timeout=120)
+        config = run_command("show running-config", timeout=tmo("show_run"))
         if config is None:
             raise ValueError("Unexpected/empty output from 'show running-config'")
 
@@ -3846,11 +4344,17 @@ class Manager:
         self.lock = threading.RLock()
         self.terms = {}                     # session id -> TerminalSession (the drawer's web console)
         self.term_lock = threading.Lock()
+        self._cmdtest_busy = set()          # switches a Command time test is running on right now
+        self._cmdtest_jobs = {}             # Command time test runs: job id -> state, live output, result
+        self._img_md5 = {}                  # (path, mtime, size) -> MD5 of an image on this PC
         self.ops = {}
         self.jobs = {}                      # host -> private upgrade job data (paths, process)
         self.schedule = {}                  # host -> pending scheduled / queued upgrade (saved with the site)
-        self.max_parallel = MAX_CONCURRENT_RELOADS   # switches upgraded at the same time (per site setting)
+        self.max_parallel = MAX_CONCURRENT_RELOADS   # switches upgraded at the same time (global setting)
         self.stop_on_failure = True         # stop starting queued switches once one in the rollout fails
+        self.settings = load_global_settings()          # the Settings page (gear icon); one file for every site
+        self.session_started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # "fresh start" = nothing older than this
+        self._apply_settings()
         self.rollouts = {}                  # rollout id -> {"hosts": set, "failed": bool, "by": str}
         self.rollout_of = {}                # host -> rollout id
         self.profiles = {}                  # credential profiles of the active site (passwords encrypted)
@@ -3936,9 +4440,9 @@ class Manager:
                                         "action": e.get("action") or "full",
                                         "scheduled_by": e.get("scheduled_by") or "local",
                                         "queued": bool(e.get("queued")),
+                                        "ignore_space": bool(e.get("ignore_space")),
                                         "rollout": e.get("rollout") if isinstance(e.get("rollout"), str) else None}
             self._rebuild_rollouts()
-            self._load_upgrade_settings(name)
             known = load_known_versions()
             for h in self.order:
                 self._apply_known_version(h, known)
@@ -3994,6 +4498,8 @@ class Manager:
         """Pre-fill a device's version from the on-disk store (survives a restart), so there's
         something to compare a future upgrade's result against even before the first backup or
         version check in this run."""
+        if FRESH_START:
+            return                          # every launch starts with empty status columns
         known = known_versions if known_versions is not None else load_known_versions()
         entry = known.get(host)
         if entry and entry.get("version"):
@@ -4016,7 +4522,7 @@ class Manager:
             "upgrade": {"state": "idle", "phase": "", "message": "", "old_version": None,
                         "new_version": None, "started": None, "finished": None,
                         "started_ts": None, "finished_ts": None, "image": None, "action": None,
-                        "started_by": None},
+                        "started_by": None, "phase_times": []},
         }
 
     def label(self, host):
@@ -4274,48 +4780,499 @@ class Manager:
     def _upgrade_active(self, host):
         return self.ops[host]["upgrade"]["state"] in ACTIVE
 
-    # ---- parallel upgrades: settings, queue and stop-on-failure ---------------- #
+    # ---- global settings (gear icon page), rollout queue and stop-on-failure ---------------- #
     def upgrade_settings_view(self):
         return {"max_parallel": self.max_parallel, "stop_on_failure": self.stop_on_failure,
                 "limit": MAX_PARALLEL_LIMIT}
 
-    def _load_upgrade_settings(self, name):
-        data = read_json_file(site_upgrade_settings_path(name))
-        data = data if isinstance(data, dict) else {}
-        try:
-            self.max_parallel = max(1, min(MAX_PARALLEL_LIMIT, int(data.get("max_parallel", MAX_CONCURRENT_RELOADS))))
-        except (TypeError, ValueError):
-            self.max_parallel = MAX_CONCURRENT_RELOADS
-        self.stop_on_failure = bool(data.get("stop_on_failure", True))
+    def _apply_settings(self):
+        st = self.settings
+        self.max_parallel = st["max_parallel"]
+        self.stop_on_failure = st["stop_on_failure"]
+        apply_timeouts(st)                  # in-process commands (backup, readiness, ...) use these at once
 
-    def _save_upgrade_settings(self):
-        if not self.site_name:
-            return
-        try:
-            path = site_upgrade_settings_path(self.site_name)
-            tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.upgrade_settings_view()), encoding="utf-8")
-            tmp.replace(path)
-        except OSError as exc:
-            print(f"Could not save the upgrade settings: {exc}", flush=True)
+    def settings_view(self):
+        return {"values": dict(self.settings), "defaults": settings_defaults(), "groups": SETTINGS_GROUPS,
+                "items": SETTINGS_ITEMS, "limit": MAX_PARALLEL_LIMIT}
 
-    def set_upgrade_settings(self, max_parallel, stop_on_failure, who=None):
-        self._require_site()
-        if isinstance(max_parallel, bool) or not isinstance(max_parallel, (int, str)):
-            raise ApiError("Enter a whole number of switches.")
-        try:
-            n = int(max_parallel)
-        except (TypeError, ValueError):
-            raise ApiError("Enter a whole number of switches.")
-        if not 1 <= n <= MAX_PARALLEL_LIMIT:
-            raise ApiError(f"Switches at the same time must be between 1 and {MAX_PARALLEL_LIMIT}.")
+    def update_settings(self, values, who=None):
+        if not isinstance(values, dict):
+            raise ApiError("Send the settings as a JSON object.")
         with self.lock:
-            self.max_parallel, self.stop_on_failure = n, bool(stop_on_failure)
-            self._save_upgrade_settings()
-        text = (f"Upgrade settings: {n} switch(es) at the same time; "
-                + ("the rollout stops if one fails" if self.stop_on_failure else "the rollout continues if one fails"))
-        self.events.add("-", "", f"{text} (set by {who or 'local'})", "info")
-        return {"message": text + ".", **self.upgrade_settings_view()}
+            merged = clean_settings({**self.settings, **values}, strict=True)
+            changed = [i["label"] for i in SETTINGS_ITEMS if merged[i["key"]] != self.settings.get(i["key"])]
+            if changed:
+                try:
+                    save_global_settings(merged)
+                except OSError as exc:
+                    raise ApiError(f"Could not save the settings file ({type(exc).__name__}).", 500)
+                self.settings = merged
+                self._apply_settings()
+        if not changed:
+            return {"message": "No changes to save.", **self.settings_view()}
+        self.events.add("-", "", f"Settings changed by {who or 'local'}: " + "; ".join(changed[:4])
+                        + (f" and {len(changed) - 4} more" if len(changed) > 4 else ""), "info")
+        return {"message": "Settings saved. They apply to everything that starts from now on; upgrades already "
+                           "running keep the values they started with.", **self.settings_view()}
+
+    # ---- command duration profiles + command time test (Settings > Command timeouts) ------------ #
+    def _current_timeouts(self):
+        return {k: self.settings[k] for k in TIMEOUT_ITEMS}
+
+    def timeout_profiles_view(self):
+        with _TIMEOUT_PROFILES_LOCK:
+            store = load_timeout_profiles()
+        profiles = [{"name": DEFAULT_TIMEOUT_PROFILE, "builtin": True,
+                     "values": {k: i["default"] for k, i in TIMEOUT_ITEMS.items()},
+                     "note": "The timeouts the tool ships with.", "saved_at": "", "saved_by": "", "site": "",
+                     "source": "", "switch": ""}]
+        for name in sorted(store["profiles"], key=str.lower):
+            profiles.append({"name": name, "builtin": False, **store["profiles"][name]})
+        by_name = {p["name"]: p for p in profiles}
+        current = self._current_timeouts()
+        order = ([store["last_applied"]] if store["last_applied"] in by_name else []) + list(by_name)
+        active = next((n for n in order if by_name[n]["values"] == current), None)
+        presets = [{"id": p["id"], "title": p["title"], "command": p["command"], "group": p["group"],
+                    "kind": p["kind"], "keys": list(p["keys"]), "warn": p.get("warn", ""), "desc": p.get("desc", ""),
+                    "needs_image": bool(p.get("needs_image")),
+                    "steps": [{"command": c, "key": k} for c, k in p.get("steps", ())]}
+                   for p in COMMAND_TEST_PRESETS]
+        return {"profiles": profiles, "active": active, "presets": presets, "phase_map": PHASE_TIMEOUT_KEYS,
+                "images": list_images()}
+
+    @staticmethod
+    def _find_timeout_profile(store, name):
+        name = str(name or "").strip()
+        if name.lower() == DEFAULT_TIMEOUT_PROFILE.lower():
+            return DEFAULT_TIMEOUT_PROFILE
+        return next((n for n in store["profiles"] if n.lower() == name.lower()), None)
+
+    def timeout_profile_save(self, name, values, note="", source="manual", site="", switch="", overwrite=False,
+                             who=None):
+        name = str(name or "").strip()
+        if not TIMEOUT_PROFILE_NAME_RE.match(name):
+            raise ApiError("Give the profile a name of 1 to 40 characters: letters, digits, spaces, dot, dash or "
+                           "underscore, starting with a letter or digit.")
+        if name.lower() == DEFAULT_TIMEOUT_PROFILE.lower():
+            raise ApiError("'Default' is the built-in profile and cannot be changed. Choose another name.")
+        clean = clean_timeout_values(values, strict=True)
+        with _TIMEOUT_PROFILES_LOCK:
+            store = load_timeout_profiles()
+            existing = self._find_timeout_profile(store, name)
+            if existing and not overwrite:
+                raise ApiError(f"A profile named '{existing}' already exists.", 409)
+            name = existing or name
+            store["profiles"][name] = {
+                "values": clean, "note": str(note or "")[:300], "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "saved_by": str(who or "local")[:60], "site": str(site or "")[:80],
+                "source": "command test" if source == "command test" else "manual", "switch": str(switch or "")[:80]}
+            try:
+                save_timeout_profiles(store)
+            except OSError as exc:
+                raise ApiError(f"Could not save the profile file ({type(exc).__name__}).", 500)
+        self.events.add("-", "", f"Command duration profile '{name}' {'updated' if existing else 'created'} by "
+                                 f"{who or 'local'}", "info")
+        return {"message": f"Profile '{name}' {'updated' if existing else 'saved'}. Pick it in the list and click "
+                           "Apply to use it.", "saved": name, **self.timeout_profiles_view()}
+
+    def timeout_profile_delete(self, name, who=None):
+        if str(name or "").strip().lower() == DEFAULT_TIMEOUT_PROFILE.lower():
+            raise ApiError("The built-in Default profile cannot be deleted.")
+        with _TIMEOUT_PROFILES_LOCK:
+            store = load_timeout_profiles()
+            match = self._find_timeout_profile(store, name)
+            if not match:
+                raise ApiError("That profile does not exist.", 404)
+            del store["profiles"][match]
+            if store["last_applied"] == match:
+                store["last_applied"] = ""
+            try:
+                save_timeout_profiles(store)
+            except OSError as exc:
+                raise ApiError(f"Could not save the profile file ({type(exc).__name__}).", 500)
+        self.events.add("-", "", f"Command duration profile '{match}' deleted by {who or 'local'}", "info")
+        return {"message": f"Profile '{match}' deleted. The timeouts in use did not change.",
+                **self.timeout_profiles_view()}
+
+    def timeout_profile_apply(self, name, who=None):
+        with _TIMEOUT_PROFILES_LOCK:
+            store = load_timeout_profiles()
+            match = self._find_timeout_profile(store, name)
+            if not match:
+                raise ApiError("That profile does not exist.", 404)
+            values = ({k: i["default"] for k, i in TIMEOUT_ITEMS.items()} if match == DEFAULT_TIMEOUT_PROFILE
+                      else dict(store["profiles"][match]["values"]))
+        self.update_settings(values, who)               # validates, saves settings.json, applies, logs the change
+        with _TIMEOUT_PROFILES_LOCK:
+            store = load_timeout_profiles()
+            store["last_applied"] = match
+            try:
+                save_timeout_profiles(store)
+            except OSError:
+                pass                                    # the values are applied; only the 'last used' hint is lost
+        self.events.add("-", "", f"Command duration profile '{match}' applied by {who or 'local'}", "info")
+        return {"message": f"Profile '{match}' applied and saved. Everything that starts from now on uses it; "
+                           "upgrades already running keep the values they started with.",
+                "settings": self.settings_view(), **self.timeout_profiles_view()}
+
+    def command_test_start(self, host, cmd_id, who=None, image=""):
+        """Command time test: start ONE step on ONE switch in the background and return a job id. The browser polls
+        command_test_poll for the elapsed time, the live output and finally the result (a step such as install add
+        or the reload can take many minutes, which must not hold one HTTP request open)."""
+        preset = next((p for p in COMMAND_TEST_PRESETS if p["id"] == cmd_id), None)
+        if preset is None:
+            raise ApiError("Unknown test step.", 404)
+        host = self._validate_hosts([host])[0]
+        image = str(image or "").strip()
+        image_path = ""
+        if image:
+            if image not in list_images():
+                raise ApiError(f"Image not found: {image} - upload it first (Storage > IOS-XE images).")
+            image_path = str(images_dir() / image)
+        elif preset.get("needs_image"):
+            raise ApiError("Choose the IOS-XE image for this step first.")
+        username, password, secret = self._creds_map([host])[host]
+        with self.lock:
+            self._poll_all()
+            if self._upgrade_active(host):
+                raise ApiError(f"{host} is being upgraded right now - wait for it to finish.", 409)
+            if host in self._cmdtest_busy:
+                raise ApiError(f"A test step is already running on {host}.", 409)
+            self._cmdtest_busy.add(host)
+            dtype = BACKUP_DEVICE_TYPES.get(self.info[host]["type"], "cisco_xe")
+            now = time.time()                              # forget old finished jobs
+            for jid in [j for j, v in self._cmdtest_jobs.items() if v["state"] == "done" and now - v["ended"] > 900]:
+                del self._cmdtest_jobs[jid]
+            job = {"job": secrets.token_hex(6), "host": host, "id": cmd_id, "state": "running", "started": now,
+                   "ended": None, "output": "", "log": "", "result": None, "stop": False}
+            self._cmdtest_jobs[job["job"]] = job
+        device = {"device_type": dtype, "host": host, "username": username, "password": password,
+                  "secret": secret or "", "conn_timeout": 60, "auth_timeout": 60, "banner_timeout": 60,
+                  "keepalive": 30}
+        threading.Thread(target=self._command_test_worker, args=(job, preset, device, image_path, image),
+                         daemon=True, name=f"cmdtest-{host}").start()
+        return {"job": job["job"], "host": host, "id": cmd_id}
+
+    def command_test_poll(self, job_id, offset=0):
+        """state, the elapsed time and the console text written since `offset` (the Console panel shows it live)."""
+        job = self._cmdtest_jobs.get(str(job_id or ""))
+        if job is None:
+            raise ApiError("That test run is no longer known (the program was restarted?).", 404)
+        try:
+            offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            offset = 0
+        log = job["log"]
+        base = {"text": log[offset:], "offset": len(log)}
+        if job["state"] == "running":
+            return {"state": "running", "elapsed": round(time.time() - job["started"], 1),
+                    "output": job["output"][-8000:], "stopping": bool(job["stop"]), **base}
+        return {"state": "done", "result": job["result"], **base}
+
+    @staticmethod
+    def _cmdtest_emit(job, text):
+        """Append text to the job's console log (capped; the Command time test never needs more than this)."""
+        if len(job["log"]) < 2_000_000:
+            job["log"] += text.replace("\r\n", "\n").replace("\r", "")
+            if len(job["log"]) >= 2_000_000:
+                job["log"] += "\n[console output truncated]\n"
+
+    def command_test_stop(self, job_id):
+        job = self._cmdtest_jobs.get(str(job_id or ""))
+        if job is None:
+            raise ApiError("That test run is no longer known.", 404)
+        if job["state"] == "running":
+            job["stop"] = True
+        return {"stopping": job["state"] == "running"}
+
+    def _image_md5(self, path):
+        stat = os.stat(path)
+        key = (path, stat.st_mtime_ns, stat.st_size)
+        if key not in self._img_md5:
+            self._img_md5[key] = check_md5(path)
+        return self._img_md5[key]
+
+    def _command_test_worker(self, job, preset, device, image_path="", image_name=""):
+        host = device["host"]
+        self._cmdtest_emit(job, f"\n=== {now_str()}  {preset['title']} ===\n")
+        try:
+            result = self._command_test_exec(job, preset, device, image_path, image_name)
+        except Exception as exc:  # noqa: BLE001 - never leave a job running forever
+            result = {"id": preset["id"], "command": preset["title"], "host": host, "kind": preset["kind"],
+                      "status": "error", "detail": f"{type(exc).__name__}: {exc}", "connect_seconds": None,
+                      "seconds": None, "lines": 0, "chars": 0, "output": job["output"], "truncated": False,
+                      "parts": [], "time": now_str()}
+        took = f"{result['seconds']:.2f} s" if result.get("seconds") is not None else "no time"
+        self._cmdtest_emit(job, f"--- {preset['title']}: {result['status']}, {took}"
+                                + (f" - {result['detail']}" if result.get("detail") else "") + " ---\n")
+        with self.lock:
+            self._cmdtest_busy.discard(host)
+            job["result"], job["ended"], job["state"] = result, time.time(), "done"
+        if host in self.info:
+            name = preset["title"]
+            if result["status"] in ("ok", "warning", "timeout") and result["seconds"] is not None:
+                self.events.add(host, self.label(host), f"Command time test: '{name}' took {result['seconds']:.2f} s"
+                                + (f" - {result['detail']}" if result["detail"] else ""),
+                                "info" if result["status"] == "ok" else "warn")
+            else:
+                self.events.add(host, self.label(host), f"Command time test: '{name}' - {result['detail'] or result['status']}",
+                                "warn" if result["status"] in ("stopped", "skipped") else "bad")
+
+    def _command_test_exec(self, job, preset, device, image_path="", image_name=""):
+        kind, host = preset["kind"], device["host"]
+        result = {"id": preset["id"], "command": preset["title"], "host": host, "kind": kind, "status": "ok",
+                  "detail": "", "connect_seconds": None, "seconds": None, "lines": 0, "chars": 0, "output": "",
+                  "truncated": False, "parts": [], "time": now_str()}
+
+        def stop():
+            return bool(job.get("stop"))
+
+        lab = self.label(host)
+        sent = [0]
+
+        def emit(text):
+            self._cmdtest_emit(job, text)
+
+        def keep(out):                                       # cumulative output of a streamed command -> live console
+            emit(out[sent[0]:])
+            sent[0] = len(out)
+            job["output"] = out[-20000:]
+        keep.reset = lambda: sent.__setitem__(0, 0)
+
+        def note(line):
+            emit(line + "\n")
+            job["output"] = (job["output"] + line + "\n")[-20000:]
+
+        def set_output(text):
+            result["output"], result["lines"], result["chars"] = text[:COMMAND_TEST_OUTPUT_LIMIT], len(text.splitlines()), len(text)
+            result["truncated"] = len(text) > COMMAND_TEST_OUTPUT_LIMIT
+
+        def run_one(conn, command, limit):
+            """One command -> (status, seconds, output, detail). The ceiling is the largest value the timeout can be
+            set to, so a slow command is measured, not cut short."""
+            began = time.perf_counter()
+            emit(f"{lab}# {command}\n")
+            try:
+                out = conn.send_command(command, read_timeout=limit) or ""
+                emit(out.rstrip("\n")[:40000] + ("\n" if out.strip() else ""))
+                status, detail = "ok", ""
+                if COMMAND_TEST_BAD_OUTPUT.search(out[:400]):
+                    status, detail = "unsupported", "The switch did not accept this command (not supported here)."
+                return status, round(time.perf_counter() - began, 2), out, detail
+            except ReadTimeout:
+                return "timeout", round(time.perf_counter() - began, 2), "", f"No complete output within {limit} s."
+            except CONNECTION_LOST as exc:
+                return "error", None, "", f"The session ended while the command ran ({type(exc).__name__})."
+
+        def run_stream(conn, command, limit, fail_re=None):
+            """A streamed command (answers [y/n], returns when the prompt is back, can be stopped)."""
+            began = time.perf_counter()
+            keep.reset()
+            emit(f"{lab}# {command}\n")
+            try:
+                out = stream_command(conn, command, None, limit, "test", on_output=keep, should_stop=stop)
+            except ReadTimeout as exc:
+                out = getattr(exc, "output", "") or ""
+                set_output(out)
+                result["seconds"] = round(time.perf_counter() - began, 2)
+                if getattr(exc, "stopped", False):
+                    result["status"], result["detail"] = "stopped", "Stopped by you after " + f"{result['seconds']:.0f} s. The output received so far is shown."
+                else:
+                    result["status"], result["detail"] = "timeout", f"No prompt back within {limit} s. The output received so far is shown."
+                return None
+            except EOFError as exc:
+                result["status"], result["detail"] = "error", str(exc)
+                return None
+            result["seconds"] = round(time.perf_counter() - began, 2)
+            set_output(out)
+            if fail_re is not None and fail_re.search(out):
+                if re.search(r"already\s+(been\s+)?added|nothing to commit|already committed", out, re.I):
+                    result["status"], result["detail"] = "skipped", "Nothing to do - the switch says it is already done."
+                else:
+                    result["status"], result["detail"] = "error", "The switch reported a failure - see the output."
+            return out
+
+        try:
+            started = time.perf_counter()
+            try:
+                with ConnectHandler(**device) as conn:
+                    if device["secret"]:
+                        conn.enable()
+                    conn.find_prompt()
+                    result["connect_seconds"] = round(time.perf_counter() - started, 2)
+                    began = time.perf_counter()
+                    if kind == "bundle":
+                        lines = []
+                        for command, key in preset["steps"]:
+                            st, sec, out, det = run_one(conn, command, TIMEOUT_ITEMS[key]["max"])
+                            result["parts"].append({"command": command, "key": key, "status": st, "seconds": sec,
+                                                    "detail": det})
+                            lines.append(f"{command:<28} {('%.2f s' % sec) if sec is not None else '-':>10}   {st}")
+                            job["output"] = "\n".join(lines)
+                        result["seconds"] = round(time.perf_counter() - began, 2)
+                        result["output"] = "\n".join(lines)
+                        bad = [p for p in result["parts"] if p["status"] in ("error", "timeout")]
+                        if bad:
+                            result["status"] = bad[0]["status"]
+                            result["detail"] = f"'{bad[0]['command']}': {bad[0]['detail']}"
+                    elif kind == "stream":
+                        cmd = preset["command"].replace("<image>", image_name)
+                        fail = {"INSTALL_FAIL_RE": INSTALL_FAIL_RE}.get(preset.get("fail_re"))
+                        if preset["id"] == "install_add":
+                            cmd = f"install add file flash:{image_name}"
+                        run_stream(conn, cmd, TIMEOUT_ITEMS[preset["keys"][0]]["max"], fail)
+                    elif kind == "upload":
+                        try:
+                            verify_image_checksum_sidecar(Path(image_path))
+                        except ValueError as exc:
+                            raise ApiError(f"Image integrity check failed: {exc}")
+                        listing = conn.send_command(f"dir flash:{image_name}", read_timeout=tmo("show_cmd")) or ""
+                        existed = image_name in listing and not re.search(r"No such file|%\s*Error", listing)
+                        note(f"Copying {image_name} ({fmt_bytes(os.path.getsize(image_path))}) ...")
+                        state = {"added": False}
+                        began = time.perf_counter()
+                        transfer_file(conn, image_path, image_name, state=state)
+                        result["seconds"] = round(time.perf_counter() - began, 2)
+                        lines = [f"Copied {image_name} in {result['seconds']:.1f} s"]
+                        if state["added"]:
+                            conn.send_config_set(["no ip scp server enable"])
+                            lines.append("'ip scp server enable' was switched on for the copy and is removed again.")
+                        if existed:
+                            result["status"] = "warning"
+                            result["detail"] = "The image was already on the flash, so the copy was skipped or very short - not a real upload time."
+                        lines.append(conn.send_command(f"dir flash:{image_name}", read_timeout=tmo("show_cmd")) or "")
+                        emit(f"{lab}# dir flash:{image_name}\n{lines[-1].rstrip()}\n")
+                        set_output("\n".join(lines))
+                    elif kind == "md5":
+                        note("Calculating the MD5 of the image on this PC ...")
+                        expected = self._image_md5(image_path)
+                        note(f"Local MD5: {expected}\nAsking the switch (verify /md5) ...")
+                        out = run_stream(conn, f"verify /md5 flash:{image_name} {expected}", TIMEOUT_ITEMS["md5_verify"]["max"])
+                        if out is not None and not re.search(r"Verified", out):
+                            result["status"] = "error"
+                            result["detail"] = "The switch did not report 'Verified' - MD5 mismatch, or the image is not on the flash."
+                    elif kind == "boot":
+                        emit(f"{lab}# configure terminal\n")
+                        began = time.perf_counter()
+                        out = conn.send_config_set(BOOT_FIX_COMMANDS)
+                        result["seconds"] = round(time.perf_counter() - began, 2)
+                        emit((out or "").rstrip("\n") + "\n")
+                        state, raw = read_boot_state(conn)
+                        emit(f"{lab}# show boot\n{(raw or '').rstrip()}\n")
+                        set_output((out or "") + "\n" + (raw or ""))
+                        if not state.get("boot_ok"):
+                            result["status"], result["detail"] = "warning", "show boot does not confirm the change: " + state["detail"]
+                        else:
+                            result["detail"] = state["detail"]
+                    elif kind == "activate":
+                        self._test_activate(job, preset, device, conn, result, image_name, note, keep, stop)
+                    else:
+                        ceiling = max(TIMEOUT_ITEMS[k]["max"] for k in preset["keys"]) if preset["keys"] else 120
+                        st, sec, out, det = run_one(conn, preset["command"], ceiling)
+                        result["status"], result["seconds"], result["detail"] = st, sec, det
+                        set_output(out)
+            except NetmikoAuthenticationException:
+                result["status"], result["detail"] = "connect_failed", "Authentication failed (bad username/password or enable secret)."
+            except NetmikoTimeoutException:
+                result["status"], result["detail"] = "connect_failed", "Connection timed out."
+            except ApiError as exc:
+                result["status"], result["detail"] = "error", str(exc)
+            except Exception as exc:  # noqa: BLE001
+                result["status"], result["detail"] = ("connect_failed" if result["connect_seconds"] is None else "error"), f"{type(exc).__name__}: {exc}"
+        finally:
+            pass
+        return result
+
+    def _test_activate(self, job, preset, device, conn, result, image_name, note, keep, stop):
+        """install activate, then watch the reload: times the activation itself and then how long ping stays down, how
+        long until ping and SSH answer again, and what version the switch came back with."""
+        host = device["host"]
+        full = preset["id"] == "install_full"
+        command = f"install add file flash:{image_name} activate commit" if full else "install activate"
+        fail_re = INSTALL_FAIL_RE if full else ACTIVATE_FAIL_RE
+        show_version = conn.send_command("show version", read_timeout=tmo("show_cmd")) or ""
+        old_version, model = parse_version(show_version), parse_model(show_version)
+        if install_flavor(model, old_version) == "legacy":
+            result["status"] = "error"
+            result["detail"] = ("This release (Catalyst 9300 before 16.6.2) has no 'install activate'; it uses the one-step "
+                                "'request platform software package install'. Use the normal Upgrade for it.")
+            return
+        expected = guess_version_from_filename(image_name) if image_name else None
+        note(f"Running {old_version or 'unknown'}" + (f", image {image_name} (version {expected})" if expected else ""))
+        keep.reset()
+        note(f"{device['host']}# {command}")
+        began = time.perf_counter()
+        activate_s, dropped = None, False
+        try:
+            out = stream_command(conn, command, None, TIMEOUT_ITEMS["install_total"]["max"], "test",
+                                 on_output=keep, should_stop=stop)
+            activate_s = round(time.perf_counter() - began, 2)
+            if fail_re.search(out):
+                result["seconds"], result["status"] = activate_s, "error"
+                result["detail"] = ("The switch reported a failure - see the output." if full else
+                                    "The switch reported a failure - nothing to activate? Run 'Add the image' first. See the output.")
+                result["output"] = out[:COMMAND_TEST_OUTPUT_LIMIT]
+                return
+            note("The prompt came back; the switch normally reloads a few seconds later.")
+        except CONNECTION_LOST:
+            activate_s, dropped = round(time.perf_counter() - began, 2), True
+            note(f"The session dropped after {activate_s} s - the switch is reloading.")
+        except ReadTimeout as exc:
+            result["seconds"] = round(time.perf_counter() - began, 2)
+            result["output"] = (getattr(exc, "output", "") or job["output"])[:COMMAND_TEST_OUTPUT_LIMIT]
+            if getattr(exc, "stopped", False):
+                result["status"], result["detail"] = "stopped", "Stopped by you before the switch reloaded."
+            else:
+                result["status"], result["detail"] = "timeout", "The activation neither finished nor dropped the session."
+            return
+        username, password, secret = device["username"], device["password"], device["secret"] or None
+        limits = {"down": tmo("reboot_down"), "up": TIMEOUT_ITEMS["reboot_up"]["max"], "ssh": TIMEOUT_ITEMS["reboot_ssh"]["max"]}
+        w = watch_reload_timed(host, username, password, secret, limits, emit=note, should_stop=stop,
+                               extra=["show install summary"])
+        result["seconds"] = round(time.perf_counter() - began, 2)
+        parts = [{"command": ("add + activate + commit" if full else "install activate") + " (until the session dropped)",
+                  "key": "install_total", "status": "ok",
+                  "seconds": activate_s, "detail": "" if dropped else "the prompt came back before the drop"}]
+        parts.append({"command": "Ping stops answering", "key": "reboot_down",
+                      "status": "ok" if w["down"] is not None else "timeout", "seconds": w["down"],
+                      "detail": "" if w["down"] is not None else f"never stopped answering within {limits['down']} s"})
+        if w["down"] is not None:
+            parts.append({"command": "Ping answers again", "key": "reboot_up", "status": "ok" if w["up"] is not None else "timeout",
+                          "seconds": w["up"], "detail": "" if w["up"] is not None else w["error"]})
+        if w["up"] is not None or w["down"] is None:
+            parts.append({"command": "SSH login works", "key": "reboot_ssh", "status": "ok" if w["ssh"] is not None else "timeout",
+                          "seconds": w["ssh"], "detail": "" if w["ssh"] is not None else w["error"]})
+        result["parts"] = parts
+        result["output"] = job["output"][-COMMAND_TEST_OUTPUT_LIMIT:]
+        if w["stopped"]:
+            result["status"], result["detail"] = "stopped", "Stopped by you while waiting for the switch. The times so far are shown."
+            return
+        problems = []
+        if w["error"]:
+            result["status"] = "timeout"
+            problems.append(w["error"])
+        elif w["version"]:
+            if old_version and w["version"] == old_version:
+                problems.append(f"the switch came back on the SAME version ({w['version']}) - the new image is not running")
+            elif expected and w["version"] != expected:
+                problems.append(f"the switch runs {w['version']}, the image file name suggests {expected}")
+            boot = w.get("boot") or {}
+            if boot and (boot.get("mode") != "INSTALL" or boot.get("boot_ok") is False):
+                problems.append(f"boot mode {boot.get('mode') or 'unknown'}: {boot.get('detail', '')}")
+        elif w["ssh"] is not None:
+            problems.append("the software version could not be read after the reload")
+        summary = w["extra"].get("show install summary", "")
+        uncommitted = bool(re.search(r"(?m)^\s*IMG\s+U\b", summary))
+        if full and uncommitted:
+            problems.append("the image is activated but NOT committed - run 'install commit' (or look at show install summary)")
+        if problems:
+            if result["status"] == "ok":
+                result["status"] = "warning"
+            result["detail"] = "; ".join(problems)
+        elif full:
+            result["detail"] = f"back on {w['version']}" + (", committed" if re.search(r"(?m)^\s*IMG\s+C\b", summary) else "")
+        else:
+            result["detail"] = f"back on {w['version']} - now run Commit"
 
     def _rebuild_rollouts(self):
         """Re-create the rollout records of schedule entries loaded from disk."""
@@ -4510,10 +5467,10 @@ class Manager:
             with ConnectHandler(**device) as conn:
                 if secret:
                     conn.enable()
-                sv = conn.send_command("show version", read_timeout=60)
+                sv = conn.send_command("show version", read_timeout=tmo('show_cmd'))
                 version, model = parse_version(sv), parse_model(sv)
                 try:
-                    sb = conn.send_command("show boot", read_timeout=60)
+                    sb = conn.send_command("show boot", read_timeout=tmo('show_cmd'))
                     boot = boot_state(sv, sb) if sb else None
                 except Exception:  # noqa: BLE001 - the version is still worth having
                     boot = None
@@ -4685,7 +5642,7 @@ class Manager:
                 raise ApiError(f"{h} is already upgrading right now.", 409)
 
     def start_upgrade(self, hosts, image_path, backup_first=False, action="full",
-                      started_by=None, skip_image_check=False):
+                      started_by=None, skip_image_check=False, ignore_space=False):
         """action: 'full' (upload+activate+reload, default) | 'distribute' (upload+add to flash
         only, no reload - stage it ahead of time) | 'activate' (activate an image already
         distributed to flash and reload - no image_path needed)."""
@@ -4724,7 +5681,8 @@ class Manager:
             for h in queued_hosts:               # waits for a free slot; started by the scheduler loop
                 self.schedule[h] = {"run_at": time.time(), "image_path": image, "created": now_str(),
                                     "backup_first": bool(backup_first), "action": action,
-                                    "scheduled_by": started_by or "local", "queued": True, "rollout": rid}
+                                    "scheduled_by": started_by or "local", "queued": True, "rollout": rid,
+                                    "ignore_space": bool(ignore_space)}
             self._save_schedule()
             queue_note = ""
             if queued_hosts:
@@ -4747,7 +5705,7 @@ class Manager:
                                               "started_by": started_by or "local",
                                               "message": "Backing up before the upgrade starts ..."}
                 threading.Thread(target=self._launch_after_backup,
-                                 args=(list(run_hosts), cm, image, action, started_by or "local"),
+                                 args=(list(run_hosts), cm, image, action, started_by or "local", ignore_space),
                                  daemon=True).start()
                 return {"message": f"Backing up {len(run_hosts)} switch(es) first ({backup_result['message']}) "
                                    f"- each switch's {verb.lower()} will start automatically once its "
@@ -4756,14 +5714,14 @@ class Manager:
 
             self.runs_dir.mkdir(parents=True, exist_ok=True)
             for h in run_hosts:
-                self._launch_job(h, *cm[h], image, action, started_by)
+                self._launch_job(h, *cm[h], image, action, started_by, ignore_space)
         msg = f"{verb} started on {len(run_hosts)} switch(es)"
         msg += f" with {Path(image).name} ({size / 1_048_576:.0f} MB)." if image else "."
         msg += queue_note + " "
         msg += "A live web console opens at the bottom of this page for each switch."
         return {"message": msg}
 
-    def _launch_after_backup(self, hosts, cm, image, action="full", started_by=None):
+    def _launch_after_backup(self, hosts, cm, image, action="full", started_by=None, ignore_space=False):
         """Background watcher for backup_first upgrades: launches each device's action the
         moment its own backup finishes, or marks it failed (skipped) if the backup failed."""
         pending = set(hosts)
@@ -4776,14 +5734,14 @@ class Manager:
                     pending.discard(h)
                     if self.ops[h]["backup"]["state"] == "completed":
                         self.runs_dir.mkdir(parents=True, exist_ok=True)
-                        self._launch_job(h, *cm[h], image, action, started_by)
+                        self._launch_job(h, *cm[h], image, action, started_by, ignore_space)
                     else:
                         self.ops[h]["upgrade"] = {**self._new_ops()["upgrade"], "started_by": started_by}
                         self._finish(h, "failed", "Upgrade skipped: the pre-upgrade backup failed")
 
     # ---- scheduled upgrade --------------------------------------------------- #
     def schedule_upgrade(self, hosts, image_path, run_at, backup_first=False, action="full",
-                         started_by=None, skip_image_check=False):
+                         started_by=None, skip_image_check=False, ignore_space=False):
         self._require_site()
         hosts = self._validate_hosts(hosts)
         self._creds_map(hosts)          # every device needs a profile now; read again when the run starts
@@ -4813,7 +5771,8 @@ class Manager:
             for h in hosts:
                 self.schedule[h] = {"run_at": run_at, "image_path": image, "created": now_str(),
                                     "backup_first": bool(backup_first), "action": action,
-                                    "scheduled_by": started_by or "local", "queued": False, "rollout": rid}
+                                    "scheduled_by": started_by or "local", "queued": False, "rollout": rid,
+                                    "ignore_space": bool(ignore_space)}
             self._save_schedule()
         when = datetime.fromtimestamp(run_at).strftime("%Y-%m-%d %H:%M")
         verb = self.ACTION_VERB.get(action, "Upgrade")
@@ -4887,18 +5846,18 @@ class Manager:
                                                   "started_by": by,
                                                   "message": "Backing up before the upgrade starts ..."}
                         threading.Thread(target=self._launch_after_backup,
-                                         args=([h], cm, entry["image_path"], action, by),
+                                         args=([h], cm, entry["image_path"], action, by, bool(entry.get("ignore_space"))),
                                          daemon=True).start()
                     else:
                         self.runs_dir.mkdir(parents=True, exist_ok=True)
-                        self._launch_job(h, *cm[h], entry["image_path"], action, by)
+                        self._launch_job(h, *cm[h], entry["image_path"], action, by, bool(entry.get("ignore_space")))
                     entry.clear()
             self._stop.wait(SCHEDULE_POLL)
 
     ACTION_VERB = {"full": "Firmware upgrade", "distribute": "Image distribution",
                   "activate": "Image activation"}
 
-    def _launch_job(self, host, username, password, secret, image, action="full", started_by=None):
+    def _launch_job(self, host, username, password, secret, image, action="full", started_by=None, ignore_space=False):
         """Start the upgrade worker for one switch (output goes to its web console).
         Called with self.lock held.
         action: 'full' (upload+activate+reload, default) | 'distribute' (upload+add only,
@@ -4916,14 +5875,19 @@ class Manager:
             "old_version": None, "new_version": None, "started": now_str(), "finished": None,
             "started_ts": time.time(), "finished_ts": None,
             "image": Path(image).name if image else None, "action": action,
-            "started_by": started_by or "local"}
+            "started_by": started_by or "local", "phase_times": []}
         self._notify(host, "started", f"{verb} started",
                      (f"with {Path(image).name}" if image else "") or "Worker launched")
         payload = {"ip": host, "name": self.label(host) or host, "action": action,
                    "username": username, "password": password, "secret": secret,
-                   "status_path": job["status_path"], "log_path": job["log_path"]}
+                   "status_path": job["status_path"], "log_path": job["log_path"],
+                   "timeouts": dict(TIMEOUTS)}
         if image:
             payload["image_path"] = image
+        if ignore_space:
+            payload["ignore_space"] = True
+            self.events.add(host, self.label(host), "Flash space check will be ignored for this run "
+                            f"(chosen by {started_by or 'local'})", "warn")
         try:
             fd = os.open(job["job_path"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -5013,6 +5977,10 @@ class Manager:
         job["beat"] = data.get("updated") or job["beat"]
         up["phase"] = data.get("phase") or up["phase"]
         up["message"] = data.get("message") or up["message"]
+        if isinstance(data.get("phase_times"), list):      # how long each phase took (Command time test uses it)
+            up["phase_times"] = [{"phase": str(p.get("phase") or "")[:30], "seconds": float(p.get("seconds") or 0)}
+                                 for p in data["phase_times"][:60]
+                                 if isinstance(p, dict) and isinstance(p.get("seconds"), (int, float))]
         if data.get("old_version"):
             up["old_version"] = data["old_version"]
             if not o["version"]:
@@ -5111,9 +6079,13 @@ class Manager:
             stamp = os.path.getmtime(site_history_path(self.site_name))
         except OSError:
             stamp = None
-        key = (self.site_name, stamp)
+        fresh = FRESH_START
+        key = (self.site_name, stamp, fresh)
         if getattr(self, "_stage_key", None) != key:
-            self._stage_cache = compute_image_stage(load_history(self.site_name))
+            history = load_history(self.site_name)
+            if fresh:                       # only what this tool did since it was launched
+                history = [r for r in history if str(r.get("finished") or "") >= self.session_started]
+            self._stage_cache = compute_image_stage(history)
             self._stage_key = key
         return self._stage_cache
 
@@ -6311,6 +7283,165 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                     text-decoration:none; }
   footer.credit a:hover, footer.credit a:focus-visible { text-decoration:underline; }
   footer.credit svg { width:14px; height:14px; fill:currentColor; }
+
+  /* ---- v-next: settings page, events collapse, image list, hover tips ---- */
+  .ib[hidden], .card[hidden] { display:none; }
+  .ib.on { background:var(--acs); color:var(--ac); }
+  input[type=number] { background:var(--pn); border:1px solid var(--bd); color:var(--tx); border-radius:6px; padding:6px 8px; font:inherit; }
+  .set-nav { display:flex; flex-direction:column; gap:2px; padding:4px 8px 12px; }
+  .set-nav button { text-align:left; background:none; border:0; border-radius:8px; padding:10px 12px; font:inherit;
+                    font-size:14px; color:var(--mu); cursor:pointer; }
+  .set-nav button:hover { background:var(--acs); color:var(--tx); }
+  .set-nav button.on { background:var(--sel); color:var(--tx); font-weight:600; box-shadow:3px 0 0 var(--ac) inset; }
+  .set-card { flex:none; }
+  .set-body { padding:2px 18px 16px; }
+  .set-intro { color:var(--mu); font-size:12.5px; margin:12px 0 2px; max-width:780px; line-height:1.5; }
+  .set-sec { margin:20px 0 2px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--mu); font-weight:700; }
+  .set-row { display:flex; gap:24px; align-items:center; justify-content:space-between; padding:11px 0; border-top:1px solid var(--bd); }
+  .set-sec + .set-row { margin-top:4px; }
+  .set-info { flex:1; min-width:0; }
+  .set-label { font-weight:600; font-size:13px; }
+  .set-row.chg .set-label::after { content:"  \2022 changed"; color:var(--am); font-size:11px; font-weight:600; }
+  .set-help { color:var(--mu); font-size:12px; margin-top:2px; max-width:600px; line-height:1.45; }
+  .set-ctl { flex:none; display:flex; align-items:center; gap:8px; width:360px; justify-content:flex-end; }
+  .set-ctl input[type=number] { width:92px; text-align:right; }
+  .set-unit { color:var(--mu); font-size:12px; min-width:18px; }
+  .set-hint { color:var(--mu); font-size:11px; width:64px; white-space:nowrap; }
+  .set-def { background:none; border:1px dashed var(--bd); color:var(--mu); border-radius:6px; font:inherit; font-size:11px;
+             padding:3px 8px; cursor:pointer; white-space:nowrap; }
+  .set-def:hover:not(:disabled) { border-color:var(--ac); color:var(--ac); }
+  .set-def:disabled { cursor:default; }
+  .set-chk { margin:0; }
+  .set-note { padding:8px 18px 0; color:var(--mu); font-size:12px; }
+  .card.e { cursor:default; }
+  .card.e > h4 { cursor:pointer; user-select:none; flex-wrap:nowrap; }
+  .card.e.collapsed { height:auto; }
+  .card.e.collapsed > h4 { border-bottom:0; }
+  .card.e.collapsed .ev { display:none; }
+  .evn { font-size:11px; font-weight:600; color:var(--mu); background:var(--pn2); border:1px solid var(--bd); border-radius:999px; padding:0 8px; }
+  .evn:empty { display:none; }
+  .evlast { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:400; color:var(--mu); }
+  .card.e:not(.collapsed) .evlast { display:none; }
+  .img-card { flex:none; }
+  .img-body { padding:10px 14px 12px; max-height:300px; overflow:auto; }
+  .img-form { display:grid; grid-template-columns:minmax(200px,1fr) minmax(260px,1.2fr) auto; gap:12px; align-items:end; }
+  .img-form label { margin-top:0; }
+  .img-table { min-width:0; margin-top:10px; }
+  .img-table td, .img-table th { padding:7px 8px; }
+
+  /* ---- command duration profiles + command time test (Settings > Command timeouts) ---- */
+  .tp-bar, .ct-card { border:1px solid var(--bd); border-radius:10px; background:var(--pn2); margin:14px 0 4px; padding:12px 14px; max-width:1280px; }
+  .tp-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .tp-row + .tp-row { margin-top:10px; }
+  .tp-row > label, .ct-row > label { font-weight:600; font-size:13px; }
+  .tp-bar select, .ct-card select, .tp-bar input[type=text], .ct-card input[type=text], .ct-card input[type=number] {
+    background:var(--pn); border:1px solid var(--bd); color:var(--tx); border-radius:6px; padding:6px 8px; font:inherit; font-size:13px; max-width:100%; }
+  .tp-bar select { width:auto; min-width:260px; flex:0 1 380px; }
+  .tp-row input[type=text] { width:auto; flex:1 1 200px; max-width:380px; }
+  .tp-row input[type=text] + input[type=text] { margin-top:0; }
+  .ct-actions input[type=text] { width:auto; flex:1 1 220px; max-width:360px; }
+  .tp-state { font-size:12px; color:var(--mu); }
+  .tp-state b { color:var(--tx); }
+  .tp-info { font-size:12px; color:var(--mu); margin-top:8px; line-height:1.5; }
+  .tp-vals { margin-top:6px; font-size:12px; color:var(--mu); }
+  .tp-vals summary { cursor:pointer; }
+  .tp-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(290px, 1fr)); gap:2px 18px; margin-top:6px; }
+  .tp-grid span:nth-child(odd) { color:var(--tx); }
+  /* ---- command time test: step list | step detail + console | results ---- */
+  .ct-toggle { display:flex; align-items:center; gap:8px; width:100%; background:none; border:0; color:var(--tx); font:inherit; font-weight:600; font-size:14px; cursor:pointer; padding:0; text-align:left; }
+  .ct-toggle .sub { font-weight:400; font-size:12px; color:var(--mu); }
+  .ct-toggle .car { margin-left:auto; transition:transform .15s; display:inline-grid; }
+  .ct-card.open .ct-toggle .car { transform:rotate(180deg); }
+  .ct-bar { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:flex-end; margin-top:14px; }
+  .ct-f { flex:1 1 260px; min-width:0; }
+  .ct-f > label { display:block; font-weight:600; font-size:12px; color:var(--mu); margin-bottom:4px; }
+  .ct-f select { width:100%; }
+  .ct-bar-r { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-left:auto; }
+  .ct-wb { display:grid; grid-template-columns:292px minmax(0,1fr); gap:16px; margin-top:14px; align-items:start; }
+  .ct-rail { border:1px solid var(--bd); border-radius:10px; background:var(--pn); padding:6px; }
+  .ct-rs + .ct-rs { margin-top:4px; border-top:1px solid var(--bd); padding-top:4px; }
+  .ct-rs-h { display:flex; align-items:center; gap:7px; width:100%; background:none; border:0; color:var(--mu); font:inherit; font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; padding:8px 8px 5px; cursor:pointer; text-align:left; }
+  .ct-rs-h:hover { color:var(--tx); }
+  .ct-rs-c { margin-left:auto; font-weight:600; letter-spacing:0; }
+  .ct-car { display:inline-grid; transition:transform .15s; transform:rotate(-90deg); }
+  .ct-rs.open .ct-car { transform:none; }
+  .ct-r { display:flex; align-items:center; gap:9px; width:100%; background:none; border:0; border-radius:7px; padding:7px 8px; font:inherit; font-size:13px; color:var(--tx); cursor:pointer; text-align:left; }
+  .ct-r:hover { background:var(--pn2); }
+  .ct-r.sel { background:var(--acs); box-shadow:inset 3px 0 0 var(--ac); font-weight:600; }
+  .ct-r-t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ct-r-v { font-size:11.5px; font-weight:400; color:var(--mu); font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .ct-n { flex:none; width:22px; height:22px; border-radius:50%; background:var(--pn2); border:1px solid var(--bd); display:grid; place-items:center; font-size:11px; font-weight:700; color:var(--mu); }
+  .ct-r.done .ct-n { background:var(--gr); border-color:var(--gr); color:#fff; }
+  .ct-r.bad .ct-n { background:var(--rd); border-color:var(--rd); color:#fff; }
+  .ct-r.run .ct-n { background:var(--ac); border-color:var(--ac); color:#fff; }
+  .ct-main { min-width:0; display:flex; flex-direction:column; gap:14px; }
+  .ct-d { border:1px solid var(--bd); border-radius:10px; background:var(--pn); padding:14px 16px; }
+  .ct-d-h { display:flex; flex-wrap:wrap; gap:12px 16px; align-items:flex-start; }
+  .ct-d-id { flex:1 1 280px; min-width:0; }
+  .ct-d-k { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--mu); }
+  .ct-d-t { font-size:17px; font-weight:700; display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:2px; }
+  .ct-cmd { display:block; margin-top:5px; font-size:12.5px; color:var(--mu); overflow-wrap:anywhere; }
+  .ct-d-a { display:flex; flex-wrap:wrap; gap:8px; margin-left:auto; }
+  .ct-d-a .btn { padding:8px 18px; font-size:13px; }
+  .ct-d-desc { margin:10px 0 0; font-size:13px; line-height:1.55; }
+  .ct-chips { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:10px; font-size:12px; color:var(--mu); }
+  .ct-chip { padding:2px 9px; border-radius:999px; background:var(--pn2); border:1px solid var(--bd); color:var(--tx); font-size:11.5px; }
+  .ct-tiles { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:12px; }
+  .ct-tile { border:1px solid var(--bd); border-radius:8px; padding:8px 11px; background:var(--pn2); }
+  .ct-tile span { display:block; font-size:10.5px; letter-spacing:.05em; text-transform:uppercase; color:var(--mu); }
+  .ct-tile b { font-size:18px; font-variant-numeric:tabular-nums; }
+  .ct-status { margin-top:10px; font-size:12.5px; color:var(--mu); }
+  .ct-status .dot { margin-right:5px; }
+  .ct-badge { font-size:10.5px; font-weight:600; padding:1px 8px; border-radius:999px; background:var(--t-a); color:var(--c-a); }
+  .ct-badge.d { background:var(--t-r); color:var(--c-r); }
+  .ct-badge.n { background:var(--t-g); color:var(--mu); }
+  .ct-panel { margin-top:12px; border:1px solid var(--bd); border-radius:8px; background:var(--pn2); }
+  .ct-panel-h { padding:7px 10px; font-size:12px; border-bottom:1px solid var(--bd); }
+  .ct-panel pre { margin:0; padding:8px 10px; max-height:240px; overflow:auto; font-size:11.5px; line-height:1.4; white-space:pre; }
+  .ct-panel table { width:100%; border-collapse:collapse; font-size:12.5px; min-width:0; }
+  .ct-panel th { text-align:left; font-size:11px; letter-spacing:.04em; text-transform:uppercase; color:var(--mu); padding:5px 10px; }
+  .ct-panel td { padding:5px 10px; border-top:1px solid var(--bd); }
+  .ct-panel td.n, .ct-panel th.n, .ct-table td.n, .ct-table th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  .ct-empty { margin-top:12px; padding:14px; border:1px dashed var(--bd); border-radius:8px; font-size:12.5px; color:var(--mu); text-align:center; }
+  .ct-result { margin-top:16px; border-top:1px solid var(--bd); padding-top:14px; }
+  .ct-result-t { font-weight:700; font-size:14px; }
+  .ct-result-g { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr); gap:18px; align-items:start; margin-top:8px; }
+  .ct-result-g > * { min-width:0; }
+  #ct-sugg-t { overflow-x:auto; }
+  .ct-sg-h label { font-size:13px; font-weight:600; color:var(--tx); display:inline-flex; align-items:center; gap:6px; }
+  .ct-side { border:1px solid var(--bd); border-radius:10px; background:var(--pn); padding:12px 14px; }
+  .ct-sg-h { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
+  .ct-sg-h input[type=number] { width:72px; }
+  .ct-table { width:100%; border-collapse:collapse; font-size:12.5px; min-width:0; }
+  .ct-table td, .ct-table th, .ct-panel td, .ct-panel th { white-space:normal; }
+  .ct-table th { text-align:left; font-size:11px; letter-spacing:.04em; text-transform:uppercase; color:var(--mu); padding:5px 8px; border-bottom:1px solid var(--bd); }
+  .ct-table td { padding:6px 8px; border-bottom:1px solid var(--bd); }
+  .ct-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; }
+  .ct-note { font-size:12px; color:var(--mu); margin-top:8px; line-height:1.5; }
+  .btn.dg { border-color:var(--rd); color:var(--rd); }
+  /* console under the step detail */
+  .cc { height:340px; min-height:220px; max-height:85vh; resize:vertical; display:flex; flex-direction:column; background:#0b1020; color:#d6e2ff; border:1px solid #2a3558; border-radius:10px; overflow:hidden; }
+  .cc-h { display:flex; align-items:center; gap:6px; padding:6px 8px 6px 11px; background:#151c33; flex:none; flex-wrap:wrap; }
+  .cc-t { font-weight:600; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+  .cc-st { font-size:11px; padding:1px 8px; border-radius:999px; background:#2a3558; color:#d6e2ff; white-space:nowrap; }
+  .cc-st.on { background:#17382a; color:#4ade80; }
+  .cc-st.busy { background:#3b3320; color:#f4c542; }
+  .cc-sp { flex:1; }
+  .cc-b { background:transparent; border:1px solid #3b4a7a; color:#d6e2ff; border-radius:6px; padding:3px 9px; font:inherit; font-size:11.5px; cursor:pointer; }
+  .cc-b:hover:not(:disabled) { background:rgba(255,255,255,.12); }
+  .cc-b:disabled { opacity:.4; cursor:not-allowed; }
+  .cc-b.go { background:#2f6fe4; border-color:#2f6fe4; color:#fff; font-weight:600; }
+  .cc-out { flex:1; min-height:0; margin:0; padding:8px 11px; overflow:auto; white-space:pre-wrap; word-break:break-word; font:12px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
+  .cc-in { display:flex; align-items:center; gap:7px; padding:6px 11px; border-top:1px solid #2a3558; background:#0e1429; flex:none; }
+  .cc-in span { color:#4ade80; font:12px ui-monospace,Consolas,monospace; }
+  .cc-in input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:#f3f6ff; caret-color:#4ade80; font:12.5px ui-monospace,Consolas,"Courier New",monospace; padding:3px 0; }
+  .cc-in input:disabled { opacity:.45; }
+  .cc-n { padding:5px 11px; font-size:10.5px; color:#93a1c0; border-top:1px solid #2a3558; flex:none; }
+  .cc.max { position:fixed; inset:28px; margin:0; z-index:1150; height:auto; max-height:none; resize:none; box-shadow:0 14px 60px rgba(0,0,0,.55); }
+  .cc.max .cc-out { font-size:13.5px; }
+  @media (max-width:1000px) { .ct-wb, .ct-result-g { grid-template-columns:minmax(0,1fr); } .ct-tiles { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .pill[data-rtip] { cursor:help; }
+  [data-rtip] { cursor:help; }
 </style>
 </head>
 <body class="role-__ROLE__">
@@ -6331,6 +7462,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <span id="state" class="mstate">Monitor starting</span>
   <button class="btn p" id="btn-mon" style="padding:7px 14px">Start monitoring</button>
   <span class="notemenu"><button class="ib" id="btn-bell" title="Notifications - upgrades started and completed" aria-haspopup="true" aria-expanded="false" style="position:relative"><span data-i="bell"></span><span class="nbadge" id="bell-count" hidden>0</span></button><div class="note-pop" id="note-pop" role="dialog" aria-label="Notifications" hidden><div class="nh"><span>Notifications</span><span><button type="button" id="note-sound" title="Play a sound for new alerts (not for logins)">Sound: on</button> <button type="button" id="note-clear">Clear all</button></span></div><div class="nl" id="note-list"></div></div></span>
+  <button class="ib" id="btn-settings" title="Settings" aria-label="Settings"><span data-i="gear"></span></button>
   <button class="ib" id="btn-theme" title="Switch between light and dark mode"></button>
   <span class="usermenu"><button type="button" class="userbtn" id="btn-user" aria-haspopup="true" aria-expanded="false" title="Signed-in user"><span data-i="user"></span><span class="uname" id="uname"></span></button><div class="user-pop" id="user-pop" role="dialog" aria-label="Signed-in user" hidden><div class="uh"><b id="uname2"></b><span id="urole2"></span></div><a id="btn-logout" href="/__guard/logout" target="_top">Sign out</a></div></span>
 </header>
@@ -6401,15 +7533,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <h3 tabindex="0" role="button" title="Firmware upgrade"><span data-i="4"></span><span class="lbl">Firmware upgrade</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
         <div class="msg" id="msg-4" role="status" aria-live="polite"></div>
-        <label for="image-file" style="margin-top:0">Upload IOS-XE image (.bin)<span class="tip" data-tip="The image is saved in the &quot;IOS Images&quot; folder."></span></label>
-        <input type="file" id="image-file" accept=".bin">
-        <label for="image-sha512">Paste Cisco SHA-512 checksum<span class="tip" data-tip="Paste the 128-character SHA-512 value from Cisco. The upload is rejected if it does not match the image."></span></label>
-        <input type="text" id="image-sha512" maxlength="128" spellcheck="false" autocomplete="off"
-               autocapitalize="off" placeholder="128 hexadecimal characters">
-        <div class="note" id="image-file-last"></div>
-        <div class="row"><button class="btn" id="btn-upload-image" disabled>Upload and verify image</button></div>
-        <div class="hint" id="image-upload-status"></div>
-        <label for="image-select" id="image-select-label">Select image to install</label>
+        <label for="image-select" id="image-select-label" style="margin-top:0">Select image to install<span class="tip" data-tip="To add an image, open Storage and use IOS-XE images (upload + MD5 check). Rollout options (switches at the same time, stop on failure) and command timeouts are in Settings (gear icon)."></span></label>
         <select id="image-select"><option value="">No images uploaded yet</option></select>
         <label for="upgrade-action">Action<span class="tip" id="action-tip" data-tip="Full upgrade: uploads the image, activates it and reloads the switch in one step."></span></label>
         <select id="upgrade-action">
@@ -6417,14 +7541,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <option value="distribute">Distribute only</option>
           <option value="activate">Activate only</option>
         </select>
-        <label for="max-parallel">Switches upgraded at the same time<span class="tip" data-tip="How many switches reload together (1 to 10). A bigger batch starts this many and queues the rest; each queued switch starts when a running one finishes. Only an Administrator can change it. Saved per site."></span></label>
-        <input type="number" id="max-parallel" min="1" max="10" step="1" value="1">
-        <label class="chk"><input type="checkbox" id="stop-on-failure" checked><span>Stop starting more switches if one fails</span><span class="tip" data-tip="If a switch fails or needs attention, switches still waiting in the queue are not started. Switches already running finish normally."></span></label>
-        <div class="row"><button class="btn" id="btn-save-parallel">Save rollout settings</button></div>
         <div class="row"><button class="btn" id="btn-readiness" disabled
               title="Log in and check version, free flash space, CPU, memory and stack health - read-only, no upload or reload">Readiness check</button></div>
         <label class="chk"><input type="checkbox" id="backup-before-upgrade" checked><span>Back up configuration first</span></label>
         <label class="chk"><input type="checkbox" id="skip-image-check"><span>Ignore image check warnings</span><span class="tip w" data-tip="Tick only if you are sure: the image does not match the switch model, or it is older than the running version."></span></label>
+        <label class="chk"><input type="checkbox" id="ignore-space"><span>Ignore flash space check</span><span class="tip w" data-tip="Tick only if you are sure: continues even when free flash is below the image size + 1 GB that Cisco asks for. Free some flash first if you can (delete old .bin / .pkg files). If flash really runs out, the install can fail part-way."></span></label>
         <label for="sched-time">Schedule for (optional)<span class="tip" id="slot-tip" data-tip="A live web console opens at the bottom of this page for every switch, immediately or at its scheduled time. The switch reloads by itself; the table shows the new version once it is back."></span></label>
         <input type="datetime-local" id="sched-time">
         <div class="row">
@@ -6517,7 +7638,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </table>
         </div>
       </div>
-      <div class="card e"><h4>Events<button type="button" class="ib mx" data-max="Events" aria-pressed="false"><span data-i="expand"></span></button></h4><div class="ev" id="events"><span class="muted">Nothing yet.</span></div></div>
+      <div class="card e collapsed" id="ev-card"><h4 id="ev-head"><span>Events</span><span class="evn" id="ev-count"></span><span class="evlast" id="ev-last"></span><button type="button" class="ib mx" id="ev-toggle" data-max="Events" aria-pressed="false" aria-expanded="false" aria-controls="events"><span data-i="expand"></span></button></h4><div class="ev" id="events"><span class="muted">Nothing yet.</span></div></div>
     </div>
   </main>
 </div>
@@ -6528,6 +7649,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="st-sites" id="st-sites"></div>
   </aside>
   <main>
+    <div class="card img-card" id="img-card">
+      <h4>IOS-XE images<span class="tip" data-tip="Images are saved in the IOS Images folder next to the program and used by Firmware upgrade. Paste the MD5 checksum from Cisco's download page: the upload is rejected if the file does not match it."></span>
+        <span class="a"><button type="button" class="btn sm" id="img-refresh">Refresh</button></span></h4>
+      <div class="img-body">
+        <div class="img-form">
+          <div><label for="image-file">Image file (.bin)</label><input type="file" id="image-file" accept=".bin"></div>
+          <div><label for="image-md5">Cisco MD5 checksum</label>
+            <input type="text" id="image-md5" maxlength="32" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="32 hexadecimal characters"></div>
+          <div><button class="btn p" id="btn-upload-image" disabled>Upload and verify</button></div>
+        </div>
+        <div class="hint" id="image-upload-status"></div>
+        <div class="msg" id="img-msg" role="status" aria-live="polite"></div>
+        <table class="st-table img-table">
+          <thead><tr><th>Image</th><th>Size</th><th>Checksum</th><th></th></tr></thead>
+          <tbody id="img-rows"></tbody>
+        </table>
+      </div>
+    </div>
     <div class="card st-card">
       <div class="st-bar">
         <nav class="crumbs" id="st-crumbs" aria-label="Folder path"></nav>
@@ -6549,6 +7688,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="st-none" id="st-none" hidden></div>
       </div>
       <div class="st-foot" id="st-foot"></div>
+    </div>
+  </main>
+</div>
+
+<div class="app" id="settings" hidden>
+  <aside class="side st-side" aria-label="Settings menu">
+    <div class="sh"><span data-i="gear"></span><span class="shl">Settings</span></div>
+    <div class="set-nav" id="set-nav" role="tablist" aria-orientation="vertical"></div>
+  </aside>
+  <main>
+    <div class="card set-card">
+      <h4><span id="set-title">Settings</span>
+        <span class="a"><span id="set-dirty"></span>
+          <button type="button" class="btn sm" id="set-reset" title="Put every value on this tab back to its default (not saved until you click Save)">Restore defaults</button>
+          <button type="button" class="btn p sm" id="set-save">Save settings</button></span></h4>
+      <div class="msg" id="set-msg" role="status" aria-live="polite" style="margin:8px 18px 0"></div>
+      <div class="set-note" id="set-note" hidden>Only an Administrator can change these settings.</div>
+      <div class="set-body" id="set-body"></div>
     </div>
   </main>
 </div>
@@ -6644,7 +7801,8 @@ const IC = {
   shrink: I('<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>'),
   user: I('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'),
   bell: I('<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/>'),
-  site: I('<path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11z"/><circle cx="12" cy="10" r="2.5"/>')
+  site: I('<path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11z"/><circle cx="12" cy="10" r="2.5"/>'),
+  gear: I('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>')
 };
 document.querySelectorAll("[data-i]").forEach(el => { el.innerHTML = IC[el.dataset.i]; });
 
@@ -6788,6 +7946,35 @@ async function postFile(url, file, headers = {}) {
   return d;
 }
 
+// ---- Hover details for the result tags of the device list (the long grey texts used to sit under every tag) ----
+const RT = {el: null, key: ""};
+const rtAttr = text => text ? ' data-rtip="' + esc(text) + '"' : "";
+function pillT(text, cls, tip) { return '<span class="pill ' + cls + '"' + rtAttr(tip) + ">" + esc(text) + "</span>"; }
+function rtipPlace(el) {
+  tipPop.textContent = el.dataset.rtip; tipPop.className = ""; tipPop.hidden = false;
+  const r = el.getBoundingClientRect(), pw = tipPop.offsetWidth, ph = tipPop.offsetHeight, m = 8;
+  let x = Math.min(Math.max(m, r.left + r.width / 2 - pw / 2), Math.max(m, innerWidth - pw - m)), y = r.bottom + 6;
+  if (y + ph > innerHeight - m) y = Math.max(m, r.top - ph - 6);
+  tipPop.style.left = x + "px"; tipPop.style.top = y + "px";
+}
+function rtipShow(el) { RT.el = el; RT.key = el.dataset.rk || ""; rtipPlace(el); }
+function rtipHide() { RT.el = null; RT.key = ""; if (!tipEl) tipPop.hidden = true; }
+// The table is rebuilt on every poll: give each tag a stable key and move an open tip onto its new copy.
+function rtipIndex() {
+  document.querySelectorAll("#rows tr[data-host]").forEach(tr => {
+    tr.querySelectorAll("[data-rtip]").forEach((el, i) => { el.dataset.rk = tr.dataset.host + "|" + i; });
+  });
+  if (!RT.el) return;
+  const el = RT.key ? document.querySelector('#rows [data-rk="' + RT.key.replace(/"/g, "") + '"]') : null;
+  if (el) { RT.el = el; rtipPlace(el); } else rtipHide();
+}
+$("rows").addEventListener("mouseover", e => {
+  const el = e.target.closest("[data-rtip]");
+  if (el && el !== RT.el) rtipShow(el); else if (!el && RT.el) rtipHide();
+});
+$("rows").addEventListener("mouseleave", rtipHide);
+window.addEventListener("scroll", rtipHide, true);
+
 function pill(text, cls) { return '<span class="pill ' + cls + '">' + esc(text) + "</span>"; }
 
 function backupCell(b) {
@@ -6795,8 +7982,8 @@ function backupCell(b) {
                completed: ["COMPLETED", "OK"], failed: ["FAILED", "DOWN"]};
   const m = map[b.state];
   if (!m) return '<span class="muted">-</span>';
-  const sub = b.state === "completed" ? (b.time || "") : (b.detail || "");
-  return pill(m[0], m[1]) + '<span class="label clip" title="' + esc(b.detail) + '">' + esc(sub) + "</span>";
+  const tip = [m[0] + (b.time ? " " + b.time : ""), b.detail].filter(Boolean).join("\n");
+  return pillT(m[0], m[1], tip) + (b.state === "completed" && b.time ? '<span class="label clip">' + esc(b.time) + "</span>" : "");
 }
 
 // Where the firmware image is on a switch: [pill text, pill class, image name, detail] or null.
@@ -6823,8 +8010,7 @@ function stageInfo(h) {
 function stageCell(h) {
   const s = stageInfo(h);
   if (!s) return '<span class="muted">-</span>';
-  return pill(s[0], s[1]) + (s[2] ? '<span class="label clip" title="' + esc(s[2]) + '" style="display:block">' + esc(s[2]) + "</span>" : "") +
-    (s[3] ? '<span class="label clip" title="' + esc(s[3]) + '" style="display:block">' + esc(s[3]) + "</span>" : "");
+  return pillT(s[0], s[1], [s[2], s[3]].filter(Boolean).join("\n"));
 }
 // Warn (never block) when an image was already distributed to a selected switch.
 function stagedWarning(action, image) {
@@ -6845,8 +8031,8 @@ function stagedWarning(action, image) {
 function upgradeCell(h) {
   const u = h.upgrade;
   if (h.scheduled && ["idle", "completed", "failed", "attention"].includes(u.state)) {
-    if (h.scheduled.queued) return pill("QUEUED", "PENDING") + '<span class="label clip">waiting for a free slot</span>';
-    return pill("SCHEDULED", "PENDING") + '<span class="label clip">' + esc(h.scheduled.run_at_str) + "</span>";
+    if (h.scheduled.queued) return pillT("QUEUED", "PENDING", "Waiting for a free upgrade slot");
+    return pillT("SCHEDULED", "PENDING", "Scheduled for " + h.scheduled.run_at_str) + '<span class="label clip">' + esc(h.scheduled.run_at_str) + "</span>";
   }
   const map = {starting: ["STARTING", "RUN"], running: ["RUNNING", "RUN"],
                completed: [u.action === "distribute" ? "DISTRIBUTED" : "UPGRADED", "OK"],
@@ -6856,9 +8042,8 @@ function upgradeCell(h) {
   const link = u.job_id ? ' <a href="#" class="clink" data-console="' + esc(h.host) + '">console</a>' : "";
   const upgraded = u.state === "completed" && u.action !== "distribute";
   const nv = u.new_version || h.version;
-  const sub = upgraded && nv ? "Now on " + nv : u.message;
-  return pill(m[0], m[1]) + link + '<span class="label ' + (upgraded && nv ? "" : "clip") + '" style="display:block" title="' + esc(u.message) + '">' +
-    (upgraded && nv ? "Now on <b>" + esc(nv) + "</b>" : esc(sub)) + "</span>";
+  return pillT(m[0], m[1], [u.message, u.finished ? "Finished " + u.finished : ""].filter(Boolean).join("\n")) + link +
+    (upgraded && nv ? '<span class="label" style="display:block">Now on <b>' + esc(nv) + "</b></span>" : "");
 }
 
 function credsCell(c, profile) {
@@ -6867,8 +8052,7 @@ function credsCell(c, profile) {
   const who = profile ? '<div class="label" title="Credential profile"><b>' + esc(profile) + "</b></div>"
                       : '<div class="label bad">No profile</div>';
   if (!m) return who + '<span class="muted">Not tested</span>';
-  const sub = c.state === "ok" ? (c.time || "") : (c.detail || "");
-  return who + pill(m[0], m[1]) + '<span class="label clip" title="' + esc(c.detail) + '">' + esc(sub) + "</span>";
+  return who + pillT(m[0], m[1], [m[0] + (c.time ? " " + c.time : ""), c.detail].filter(Boolean).join("\n"));
 }
 
 function readinessCell(r) {
@@ -6876,8 +8060,8 @@ function readinessCell(r) {
                warning: ["WARNING", "CHECK"], not_ready: ["NOT READY", "DOWN"]};
   const m = map[r.state];
   if (!m) return '<span class="muted">Not checked</span>';
-  const sub = r.state === "ready" ? (r.time || "") : (r.detail || "");
-  return pill(m[0], m[1]) + '<span class="label clip" title="' + esc(r.detail) + '">' + esc(sub) + "</span>";
+  return pillT(m[0], m[1], [m[0] + (r.time ? " " + r.time : ""), r.detail].filter(Boolean).join("\n")) +
+    (r.state === "ready" && r.time ? '<span class="label clip">' + esc(r.time) + "</span>" : "");
 }
 
 function postcheckCell(p) {
@@ -6885,20 +8069,19 @@ function postcheckCell(p) {
                warning: ["DIFFERENCES", "CHECK"], failed: ["FAILED", "DOWN"]};
   const m = map[p && p.state];
   if (!m) return '<span class="muted">-</span>';
-  const sub = p.state === "passed" ? (p.time || "") : (p.detail || "");
-  return pill(m[0], m[1]) + '<span class="label clip" title="' + esc(p.detail) + '">' + esc(sub) + "</span>";
+  return pillT(m[0], m[1], [m[0] + (p.time ? " " + p.time : ""), p.detail].filter(Boolean).join("\n")) +
+    (p.state === "passed" && p.time ? '<span class="label clip">' + esc(p.time) + "</span>" : "");
 }
 
 function versionCell(h) {
   const u = h.upgrade;
   if (u.state === "completed" && u.action !== "distribute" && u.old_version) {
     // upgrade finished: this column keeps the version from BEFORE the upgrade; the new one is in Firmware upgrade
-    return "<b>" + esc(u.old_version) + '</b><span class="label clip">before upgrade</span>';
+    return "<b" + rtAttr("Version before the upgrade") + ">" + esc(u.old_version) + "</b>";
   }
   if (!h.version) return '<span class="muted">-</span>';
-  return "<b>" + esc(h.version) + "</b>" +
-    (h.prev_version ? '<span class="label clip">was ' + esc(h.prev_version) + "</span>" : "") +
-    (h.version_note ? '<span class="label clip">' + esc(h.version_note) + "</span>" : "");
+  const tip = [h.prev_version ? "Was " + h.prev_version : "", h.version_note].filter(Boolean).join("\n");
+  return "<b" + rtAttr(tip) + ">" + esc(h.version) + "</b>";
 }
 
 function bootCell(b) {
@@ -6907,10 +8090,8 @@ function bootCell(b) {
   if (!b || (!b.mode && b.boot_ok == null))
     return '<span class="muted" title="Run a backup or click Refresh version to read it">-</span>';
   const good = b.mode === "INSTALL" && b.boot_ok === true;
-  const tip = (b.detail || "") + (b.time ? " (read " + b.time + ")" : "");
-  return pill(b.mode || "UNKNOWN", good ? "OK" : "CHECK") +
-    '<span class="label clip" title="' + esc(tip) + '">' + esc(b.detail || "") + "</span>" +
-    (b.prev ? '<span class="label clip" title="Before the change">was ' + esc(b.prev) + "</span>" : "");
+  const tip = [b.detail, b.prev ? "Was " + b.prev : "", b.time ? "Read " + b.time : ""].filter(Boolean).join("\n");
+  return pillT(b.mode || "UNKNOWN", good ? "OK" : "CHECK", tip);
 }
 
 // Search box + filters above the device list. All of them combine with the Up/Down buttons.
@@ -6972,24 +8153,8 @@ $("dev-reset").addEventListener("click", () => {
   devFilterChanged();
 });
 
-let ROLLOUT = {max_parallel: 1, stop_on_failure: true, limit: 10};
-function applyRolloutSettings(s) {
-  ROLLOUT = s;
-  const n = $("max-parallel"), c = $("stop-on-failure"), b = $("btn-save-parallel");
-  if (!n) return;
-  const canEdit = ME.role !== "operator" && ME.role !== "viewer";
-  n.max = s.limit; n.disabled = c.disabled = b.disabled = !canEdit;
-  if (document.activeElement !== n) n.value = s.max_parallel;
-  if (document.activeElement !== c) c.checked = !!s.stop_on_failure;
-}
-$("btn-save-parallel").addEventListener("click", async () => {
-  try {
-    const r = await post("/api/upgrade-settings", {max_parallel: parseInt($("max-parallel").value, 10),
-                                                   stop_on_failure: $("stop-on-failure").checked});
-    applyRolloutSettings({max_parallel: r.max_parallel, stop_on_failure: r.stop_on_failure, limit: r.limit});
-    sayIn(4, "ok", r.message);
-  } catch (e) { sayIn(4, "err", e.message); }
-});
+let ROLLOUT = {max_parallel: 1, stop_on_failure: true, limit: 10};   // kept up to date from the status poll; edited on the Settings page
+function applyRolloutSettings(s) { ROLLOUT = s; }
 
 function render(d) {
   if (d.me && d.me.role !== ME.role) { location.reload(); return; }   // role changed in the launcher
@@ -7043,7 +8208,7 @@ function render(d) {
                 (h.last_rtt != null ? " (latest " + fmtMs(h.last_rtt) + ")" : "") : "No checks yet";
     const hist = '<i class="e"></i>'.repeat(HN - recent.length) +
                  recent.map(v => '<i class="' + (v ? "" : "f") + '"></i>').join("");
-    return '<tr class="' + (selected.has(h.host) ? "sel" : "") + (h.host === DR.host ? " dopen" : "") + '">' +
+    return '<tr class="' + (selected.has(h.host) ? "sel" : "") + (h.host === DR.host ? " dopen" : "") + '" data-host="' + esc(h.host) + '">' +
       '<td class="ck"><input type="checkbox" data-host="' + esc(h.host) + '"' + (selected.has(h.host) ? " checked" : "") + "></td>" +
       '<td><a href="#" class="devlink" data-detail="' + esc(h.host) + '" title="Show details of this switch"><div class="host">' + esc(h.host) + "</div>" +
         (h.label ? '<div class="label">' + esc(h.label) + "</div>" : "") + "</a></td>" +
@@ -7062,6 +8227,7 @@ function render(d) {
   $("rows").innerHTML = rows.join("") || '<tr><td colspan="' + (COLS.length + 2) + '" class="muted">' +
     (d.hosts.length ? "No switches match the search or filters." : "No devices loaded yet. Open Device list to upload or add switches.") + "</td></tr>";
 
+  rtipIndex();
   syncDevFilters(d);
   const vis = visibleHosts();
   $("sel-all").checked = vis.length > 0 && vis.every(h => selected.has(h.host));
@@ -7075,6 +8241,9 @@ function render(d) {
     bs.className = "hint " + (b.failed ? "bad" : "");
   }
 
+  $("ev-count").textContent = d.events.length ? String(d.events.length) : "";
+  { const le = d.events[0];
+    $("ev-last").textContent = le ? le.time + "   " + (le.host && le.host !== "-" ? le.host + "   " : "") + le.text : "No events yet"; }
   $("events").innerHTML = d.events.length
     ? d.events.map(e => '<div><span class="muted">' + esc(e.time) + '</span> &nbsp;<span class="dot ' + esc(e.level) + '"></span><b>' +
         esc(e.host) + "</b>" + (e.label ? " (" + esc(e.label) + ")" : "") + " &nbsp;" + esc(e.text) + "</div>").join("")
@@ -7298,7 +8467,8 @@ $("btn-upgrade").addEventListener("click", async () => {
                reloadNote + qNote + stagedWarning(action, image) + (backupFirst ? "\n\nEach switch's configuration will be backed up first." : ""))) return;
   try {
     const skipCheck = $("skip-image-check").checked; $("skip-image-check").checked = false;   // applies to this one action only
-    const r = await post("/api/upgrade", Object.assign({hosts: [...selected], image_path: image || null, backup_first: backupFirst, skip_image_check: skipCheck, action}, c));
+    const ignoreSpace = $("ignore-space").checked; $("ignore-space").checked = false;
+    const r = await post("/api/upgrade", Object.assign({hosts: [...selected], image_path: image || null, backup_first: backupFirst, skip_image_check: skipCheck, ignore_space: ignoreSpace, action}, c));
     sayIn(4, "ok", r.message); refresh();
   } catch (e) { sayIn(4, "err", e.message); }
 });
@@ -7319,7 +8489,8 @@ $("btn-schedule").addEventListener("click", async () => {
                (backupFirst ? "\n\nEach switch's configuration will be backed up first." : ""))) return;
   try {
     const skipCheck = $("skip-image-check").checked; $("skip-image-check").checked = false;
-    const r = await post("/api/schedule", Object.assign({hosts: [...selected], image_path: image || null, run_at: runAt, backup_first: backupFirst, skip_image_check: skipCheck, action}, c));
+    const ignoreSpace = $("ignore-space").checked; $("ignore-space").checked = false;
+    const r = await post("/api/schedule", Object.assign({hosts: [...selected], image_path: image || null, run_at: runAt, backup_first: backupFirst, skip_image_check: skipCheck, ignore_space: ignoreSpace, action}, c));
     sayIn(4, "ok", r.message); refresh();
   } catch (e) { sayIn(4, "err", e.message); }
 });
@@ -7387,40 +8558,66 @@ $("btn-add-device").addEventListener("click", async () => {
   } catch (e) { sayIn(1, "err", e.message); }
 });
 
-function imageUploadChecksum() {
-  return $("image-sha512").value.replace(/\s+/g, "").toLowerCase();
-}
+// ---- IOS-XE images (Storage page): upload with its Cisco MD5, list, re-verify ----
+const IMG = {list: []};
+function imgSay(kind, text) { const m = $("img-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
+const imageMd5 = () => $("image-md5").value.replace(/\s+/g, "").toLowerCase();
 function updateImageUploadButton() {
-  const digest = imageUploadChecksum();
-  $("btn-upload-image").disabled = !$("image-file").files.length || !/^[a-f0-9]{128}$/.test(digest);
+  $("btn-upload-image").disabled = !$("image-file").files.length || !/^[a-f0-9]{32}$/.test(imageMd5());
 }
 $("image-file").addEventListener("change", updateImageUploadButton);
-$("image-sha512").addEventListener("input", updateImageUploadButton);
+$("image-md5").addEventListener("input", updateImageUploadButton);
+function renderImageList() {
+  const body = $("img-rows");
+  if (!IMG.list.length) { body.innerHTML = '<tr><td colspan="4" class="muted">No images uploaded yet.</td></tr>'; return; }
+  body.innerHTML = IMG.list.map(i => {
+    const tag = i.checksum
+      ? '<span class="pill OK" title="Saved when the image was uploaded. Use Verify to check the file again.">' + esc(i.checksum) + "</span>"
+      : '<span class="pill WARN" title="Upgrades refuse an image without a checksum. Upload it again with its MD5.">No checksum</span>';
+    return "<tr><td>" + esc(i.name) + "</td><td>" + fmtSize(i.size) + "</td><td>" + tag + '</td><td class="act">' +
+      (i.checksum ? '<button type="button" class="btn sm" data-verify="' + esc(i.name) + '">Verify</button>' : "") + "</td></tr>";
+  }).join("");
+}
+async function loadImageList() {
+  if (ME.role === "viewer") return;
+  try {
+    const r = await fetch("/api/images/details", {cache: "no-store"});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Could not read the image list.");
+    IMG.list = d.images; renderImageList();
+  } catch (e) { imgSay("err", e.message); }
+}
+$("img-refresh").addEventListener("click", loadImageList);
+$("img-rows").addEventListener("click", async ev => {
+  const b = ev.target.closest("[data-verify]");
+  if (!b) return;
+  b.disabled = true; const was = b.textContent; b.textContent = "Verifying ...";
+  imgSay("", "");
+  try { const r = await post("/api/images/verify", {name: b.dataset.verify}); imgSay("ok", r.message); }
+  catch (e) { imgSay("err", e.message); }
+  finally { b.disabled = false; b.textContent = was; }
+});
 $("btn-upload-image").addEventListener("click", async () => {
   const file = $("image-file").files[0];
-  const checksum = imageUploadChecksum();
+  const md5 = imageMd5();
   if (!file) return;
-  if (!file.name.toLowerCase().endsWith(".bin")) { sayIn(4, "err", "Only .bin image files can be uploaded."); return; }
-  if (!/^[a-f0-9]{128}$/.test(checksum)) {
-    sayIn(4, "err", "Paste the 128-character SHA-512 checksum shown on Cisco's download page."); return;
-  }
+  if (!file.name.toLowerCase().endsWith(".bin")) { imgSay("err", "Only .bin image files can be uploaded."); return; }
+  if (!/^[a-f0-9]{32}$/.test(md5)) { imgSay("err", "Paste the 32-character MD5 checksum shown on Cisco's download page."); return; }
   const status = $("image-upload-status");
   $("btn-upload-image").disabled = true;
-  status.textContent = "Uploading " + file.name + " and checking its Cisco SHA-512 checksum ... this can take a while.";
+  imgSay("", "");
+  status.textContent = "Uploading " + file.name + " and checking its MD5 checksum ... this can take a while.";
   status.className = "hint";
   try {
-    const r = await postFile("/api/images/upload", file, {"X-Image-SHA512": checksum});
-    status.textContent = r.message;
-    sayIn(4, "ok", r.message);
-    $("image-file-last").textContent = "Last uploaded and verified: " + file.name;
-    $("image-file").value = "";
-    $("image-sha512").value = "";
-    const sel = $("image-select");
-    sel.innerHTML = r.images.map(name => '<option value="' + esc(name) + '">' + esc(name) + "</option>").join("");
-    sel.value = r.filename;
-  } catch (e) {
-    status.textContent = ""; sayIn(4, "err", e.message);
-  } finally { updateImageUploadButton(); }
+    const r = await postFile("/api/images/upload", file, {"X-Image-MD5": md5});
+    status.textContent = "";
+    imgSay("ok", r.message);
+    $("image-file").value = ""; $("image-md5").value = "";
+    await loadImageList();
+    await refreshImages();
+    if (r.images.includes(r.filename)) $("image-select").value = r.filename;
+  } catch (e) { status.textContent = ""; imgSay("err", e.message); }
+  finally { updateImageUploadButton(); }
 });
 
 // ---- Upgrade output: shown in the right-hand drawer (Upgrade tab) instead of separate windows ----
@@ -7731,6 +8928,11 @@ function setCardMax(card, on) {
   b.innerHTML = on ? IC.shrink : IC.expand;
   b.title = on ? "Back to the normal layout (Esc)" : "Maximize " + name + " (Esc to restore)";
   b.setAttribute("aria-pressed", on ? "true" : "false");
+  if (card.id === "ev-card") {              // Events: the one icon switches between minimised and full view
+    card.classList.toggle("collapsed", !on);
+    b.setAttribute("aria-expanded", on ? "true" : "false");
+    b.title = on ? "Minimise the events (Esc)" : "Show the events in full view";
+  }
 }
 document.querySelectorAll("[data-max]").forEach(b => {
   b.title = "Maximize " + b.dataset.max + " (Esc to restore)";
@@ -7739,6 +8941,17 @@ document.querySelectorAll("[data-max]").forEach(b => {
     document.querySelectorAll(".card.max").forEach(c => { if (c !== card) setCardMax(c, false); });
     setCardMax(card, on);
   });
+});
+// ---- Events: minimised by default (the header shows the count and the latest event). ONE icon at the right of the
+// header switches between minimised and full view; clicking the header does the same. Esc minimises again. ----
+setCardMax($("ev-card"), false);
+$("ev-head").addEventListener("click", e => {
+  // the icon has its own handler (above). It swaps its own SVG, so e.target is already detached from the page when this
+  // runs - test the event's original path instead of e.target.closest()
+  if (e.composedPath().some(n => n.classList && n.classList.contains("mx"))) return;
+  const card = $("ev-card"), on = !card.classList.contains("max");
+  document.querySelectorAll(".card.max").forEach(c => { if (c !== card) setCardMax(c, false); });
+  setCardMax(card, on);
 });
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape" || !document.querySelector(".card.max")) return;
@@ -7921,20 +9134,26 @@ async function getJSON(url) {
 function stSay(kind, text) { const m = $("st-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
 
 function showView(view, push) {
-  const storage = view === "storage";
-  if (storage) { try { closeDrawer(); } catch (e) {} }
-  $("dashboard").hidden = storage;
+  if (view === "settings" && ME.role === "viewer") view = "home";
+  if (view !== "storage" && view !== "settings") view = "home";
+  const storage = view === "storage", settings = view === "settings";
+  if (storage || settings) { try { closeDrawer(); } catch (e) {} }
+  $("dashboard").hidden = storage || settings;
   $("storage").hidden = !storage;
-  for (const [id, on] of [["tab-home", !storage], ["tab-storage", storage]]) {
+  $("settings").hidden = !settings;
+  for (const [id, on] of [["tab-home", view === "home"], ["tab-storage", storage]]) {
     $(id).classList.toggle("on", on);
     $(id).setAttribute("aria-selected", String(on));
   }
-  if (push !== false) { try { history.replaceState(null, "", storage ? "#storage" : "#home"); } catch (e) {} }
+  $("btn-settings").classList.toggle("on", settings);
+  if (push !== false) { try { history.replaceState(null, "", "#" + view); } catch (e) {} }
   if (storage) openStorage();
+  if (settings) openSettings();
 }
 document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => showView(b.dataset.view)));
 
 async function openStorage() {
+  loadImageList();
   await loadSites();                       // refreshes siteList from the server
   renderStorageSites();
   if (stg.site) stRefresh(); else stRender();
@@ -8134,7 +9353,654 @@ $("st-search").addEventListener("keydown", e => { if (e.key === "Escape") $("st-
 $("st-clear").addEventListener("click", () => { $("st-search").value = ""; stg.query = ""; stRefresh(); $("st-search").focus(); });
 $("st-refresh").addEventListener("click", stRefresh);
 
+// ---- Settings page (gear icon): menu on the left, one panel per group; the values are global ----
+const SET = {data: null, draft: {}, tab: "rollout"};
+const SET_CAN_EDIT = ME.role !== "operator" && ME.role !== "viewer";
+if (ME.role === "viewer") $("btn-settings").hidden = true;
+$("btn-settings").addEventListener("click", () => showView($("settings").hidden ? "settings" : "home"));
+function setSay(kind, text) { const m = $("set-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
+const setUnit = (item, v) => item.type === "bool" ? (v ? "On" : "Off") : v + " " + item.unit;
+function setMinutes(item, v) {
+  if (item.unit !== "s" || !(v >= 120)) return "";
+  const m = v / 60;
+  return "\u2248 " + (Number.isInteger(m) ? m : m.toFixed(1)) + " min";
+}
+function setDirtyKeys() {
+  return SET.data ? SET.data.items.filter(i => SET.draft[i.key] !== SET.data.values[i.key]).map(i => i.key) : [];
+}
+function setUpdateDirty() {
+  const n = setDirtyKeys().length;
+  $("set-dirty").textContent = n ? n + " unsaved change" + (n === 1 ? "" : "s") : "";
+  $("set-save").disabled = !SET_CAN_EDIT || !n;
+}
+function setRow(item) {
+  const v = SET.draft[item.key], def = SET.data.defaults[item.key], k = esc(item.key), dis = SET_CAN_EDIT ? "" : " disabled";
+  const ctl = item.type === "bool"
+    ? '<label class="chk set-chk"><input type="checkbox" data-sk="' + k + '"' + (v ? " checked" : "") + dis + "><span>" + (v ? "On" : "Off") + "</span></label>"
+    : '<input type="number" data-sk="' + k + '" min="' + item.min + '" max="' + item.max + '" step="1" value="' + (Number.isNaN(v) ? "" : v) + '"' + dis + ">" +
+      '<span class="set-unit">' + esc(item.unit) + '</span><span class="set-hint">' + esc(setMinutes(item, v)) + "</span>";
+  return '<div class="set-row' + (v !== def ? " chg" : "") + '" data-row="' + k + '"><div class="set-info"><div class="set-label">' + esc(item.label) +
+    '</div><div class="set-help">' + esc(item.help) + '</div></div><div class="set-ctl">' + ctl +
+    '<button type="button" class="set-def" data-sdef="' + k + '" title="Use the default value"' + dis + ">Default: " + esc(setUnit(item, def)) + "</button></div></div>";
+}
+function renderSettings() {
+  if (!SET.data) return;
+  if (!SET.data.groups.some(g => g.id === SET.tab)) SET.tab = SET.data.groups[0].id;
+  $("set-nav").innerHTML = SET.data.groups.map(g => '<button type="button" role="tab" data-stab="' + esc(g.id) + '" class="' +
+    (g.id === SET.tab ? "on" : "") + '" aria-selected="' + (g.id === SET.tab) + '">' + esc(g.title) + "</button>").join("");
+  const g = SET.data.groups.find(x => x.id === SET.tab);
+  $("set-title").textContent = g.title;
+  $("set-note").hidden = SET_CAN_EDIT;
+  let html = '<div class="set-intro">' + esc(g.intro) + "</div>" +
+    (g.id === "timeouts" ? '<div id="tp-root"></div><div id="ct-root"></div>' : ""), sec = null;
+  for (const item of SET.data.items.filter(i => i.group === g.id)) {
+    if (item.section && item.section !== sec) { html += '<div class="set-sec">' + esc(item.section) + "</div>"; }
+    sec = item.section;
+    html += setRow(item);
+  }
+  $("set-body").innerHTML = html;
+  if (g.id === "timeouts") { tpRender(); ctRender(); }
+  $("set-reset").disabled = !SET_CAN_EDIT;
+  setUpdateDirty();
+}
+async function openSettings() {
+  setSay("", "");
+  try {
+    const r = await fetch("/api/settings", {cache: "no-store"});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Could not load the settings.");
+    SET.data = d; SET.draft = {...d.values}; renderSettings();
+    tpLoad();
+  } catch (e) { setSay("err", e.message); }
+}
+function setRowRefresh(key) {
+  const item = SET.data.items.find(i => i.key === key), row = $("set-body").querySelector('[data-row="' + key + '"]');
+  if (!item || !row) return;
+  const v = SET.draft[key];
+  row.classList.toggle("chg", v !== SET.data.defaults[key]);
+  const hint = row.querySelector(".set-hint"); if (hint) hint.textContent = setMinutes(item, v);
+  const lab = row.querySelector(".set-chk span"); if (lab) lab.textContent = v ? "On" : "Off";
+  setUpdateDirty();
+}
+$("set-nav").addEventListener("click", e => {
+  const b = e.target.closest("[data-stab]");
+  if (b) { SET.tab = b.dataset.stab; setSay("", ""); renderSettings(); }
+});
+$("set-body").addEventListener("input", e => {
+  const k = e.target.dataset.sk;
+  if (!k || e.target.type !== "number") return;
+  SET.draft[k] = e.target.value.trim() === "" ? NaN : Number(e.target.value);
+  setRowRefresh(k);
+});
+$("set-body").addEventListener("change", e => {
+  const k = e.target.dataset.sk;
+  if (!k || e.target.type !== "checkbox") return;
+  SET.draft[k] = e.target.checked; setRowRefresh(k);
+});
+$("set-body").addEventListener("click", e => {
+  const b = e.target.closest("[data-sdef]");
+  if (!b || !SET_CAN_EDIT) return;
+  SET.draft[b.dataset.sdef] = SET.data.defaults[b.dataset.sdef]; renderSettings();
+});
+$("set-reset").addEventListener("click", () => {
+  if (!SET.data) return;
+  for (const i of SET.data.items) if (i.group === SET.tab) SET.draft[i.key] = SET.data.defaults[i.key];
+  renderSettings();
+});
+$("set-save").addEventListener("click", async () => {
+  if (!SET.data || !SET_CAN_EDIT) return;
+  for (const i of SET.data.items) {
+    if (i.type === "bool") continue;
+    const v = SET.draft[i.key];
+    if (!Number.isInteger(v) || v < i.min || v > i.max) {
+      setSay("err", i.label + " must be a whole number from " + i.min + " to " + i.max + "."); return;
+    }
+  }
+  try {
+    const r = await post("/api/settings", {values: SET.draft});
+    SET.data = r; SET.draft = {...r.values};
+    applyRolloutSettings({max_parallel: r.values.max_parallel, stop_on_failure: r.values.stop_on_failure, limit: r.limit});
+    renderSettings(); setSay("ok", r.message);
+  } catch (e) { setSay("err", e.message); }
+});
+
+// ============================================================================================
+// Command duration profiles + Command time test (Settings > Command timeouts).
+//  - Profiles: named sets of the command timeouts. "Default" is built in. Apply copies a profile into the settings.
+//  - Command time test: run the preset commands on one switch with the Execute buttons, see each result and note
+//    the time it took. The numbers can become a report (CSV / printable page) or a new profile.
+// ============================================================================================
+const TP = {data: null, sel: "Default", form: false};
+const CT = {open: false, host: null, image: "", results: {}, outs: {}, running: null, margin: 3, keepDefault: true, form: false, sel: null, railClosed: {}};
+try {
+  const saved = JSON.parse(localStorage.getItem("ct") || "null");
+  if (saved && typeof saved === "object") {
+    CT.results = saved.results && typeof saved.results === "object" ? saved.results : {};
+    CT.host = saved.host || null;
+    CT.image = saved.image || "";
+    if (saved.margin >= 1 && saved.margin <= 20) CT.margin = saved.margin;
+  }
+} catch (e) {}
+function ctPersist() { try { localStorage.setItem("ct", JSON.stringify({results: CT.results, host: CT.host, image: CT.image, margin: CT.margin})); } catch (e) {} }
+const tmoItems = () => SET.data ? SET.data.items.filter(i => i.group === "timeouts") : [];
+const fmtS = n => typeof n === "number" ? n.toFixed(2) : "";
+function tipsIn(id) { const r = $(id); if (r) r.querySelectorAll(".tip").forEach(tipInit); }
+
+async function tpLoad() {
+  try {
+    const r = await fetch("/api/timeout-profiles", {cache: "no-store"});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Could not load the profiles.");
+    TP.data = d;
+    if (!d.profiles.some(p => p.name === TP.sel)) TP.sel = d.active || "Default";
+    tpRender(); ctRender();
+  } catch (e) { setSay("err", e.message); }
+}
+function tpDraftValues() {
+  const out = {};
+  for (const i of tmoItems()) {
+    const v = SET.draft[i.key];
+    if (!Number.isInteger(v) || v < i.min || v > i.max) throw new Error(i.label + " must be a whole number from " + i.min + " to " + i.max + ".");
+    out[i.key] = v;
+  }
+  return out;
+}
+function tpRender() {
+  const root = $("tp-root"); if (!root || !SET.data) return;
+  if (!TP.data) { root.innerHTML = '<div class="tp-bar tp-state">Loading the profiles ...</div>'; return; }
+  const list = TP.data.profiles, active = TP.data.active;
+  if (!list.some(p => p.name === TP.sel)) TP.sel = active || "Default";
+  const cur = list.find(p => p.name === TP.sel), dis = SET_CAN_EDIT ? "" : " disabled";
+  const edited = tmoItems().some(i => SET.draft[i.key] !== SET.data.values[i.key]);
+  const state = (active ? "In use: <b>" + esc(active) + "</b>" : "In use: <b>Custom values</b> (not the same as any profile)") +
+    (edited ? " &nbsp;|&nbsp; unsaved edits on this page" : "");
+  const opts = list.map(p => '<option value="' + esc(p.name) + '"' + (p.name === TP.sel ? " selected" : "") + ">" + esc(p.name) +
+    (p.builtin ? " (built-in)" : "") + (p.name === active ? " - in use" : "") + "</option>").join("");
+  const meta = cur.builtin ? "The timeouts the tool ships with. It cannot be changed or deleted."
+    : [cur.note, "Saved " + cur.saved_at + (cur.saved_by ? " by " + cur.saved_by : ""), cur.site ? "site " + cur.site : "",
+       cur.source === "command test" ? "built from a command time test" + (cur.switch ? " on " + cur.switch : "") : "typed in by hand"]
+      .filter(Boolean).join(" | ");
+  const grid = tmoItems().map(i => "<span>" + esc(i.label) + "</span><span>" + cur.values[i.key] + " s</span>").join("");
+  root.innerHTML = '<div class="tp-bar">' +
+    '<div class="tp-row"><label for="tp-sel">Command duration profile<span class="tip" data-tip="A profile is a named set of the command timeouts below. Apply puts its values into the settings and saves them. Create profiles from the values on this page, or from a Command time test measured on a real switch (for example one profile per site)."></span></label>' +
+    '<select id="tp-sel">' + opts + "</select>" +
+    '<button type="button" class="btn p sm" data-tp="apply"' + (SET_CAN_EDIT && cur.name !== active ? "" : " disabled") + ' title="Use the values of this profile now">Apply</button>' +
+    '<button type="button" class="btn sm" data-tp="new"' + dis + ' title="Save the values shown below as a new profile">New from page values...</button>' +
+    '<button type="button" class="btn sm" data-tp="update"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ' title="Replace the values of this profile with the values shown below">Update from page values</button>' +
+    '<button type="button" class="btn sm" data-tp="delete"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ">Delete</button>" +
+    '<span class="tp-state">' + state + "</span></div>" +
+    (TP.form ? '<div class="tp-row"><input type="text" id="tp-name" maxlength="40" placeholder="Profile name, e.g. Colombo site" aria-label="New profile name">' +
+      '<input type="text" id="tp-note" maxlength="300" placeholder="Note (optional)" aria-label="Note" style="min-width:260px">' +
+      '<button type="button" class="btn p sm" data-tp="create">Save profile</button><button type="button" class="btn sm" data-tp="cancel">Cancel</button></div>' : "") +
+    '<div class="tp-info">' + esc(meta) + "</div>" +
+    '<details class="tp-vals"><summary>Values in this profile</summary><div class="tp-grid">' + grid + "</div></details></div>";
+  tipsIn("tp-root");
+}
+async function tpAction(act) {
+  try {
+    if (!TP.data) return;
+    if (act === "new") { TP.form = true; tpRender(); const n = $("tp-name"); if (n) n.focus(); return; }
+    if (act === "cancel") { TP.form = false; tpRender(); return; }
+    if (act === "apply") {
+      if (setDirtyKeys().length && !confirm("There are unsaved changes on this page. Applying the profile replaces the timeout values and saves them. Continue?")) return;
+      const r = await post("/api/timeout-profiles/apply", {name: TP.sel});
+      SET.data = r.settings; SET.draft = {...r.settings.values}; TP.data = r;
+      renderSettings(); setSay("ok", r.message); return;
+    }
+    if (act === "delete") {
+      if (!confirm("Delete the profile '" + TP.sel + "'? The timeouts now in use do not change.")) return;
+      const r = await post("/api/timeout-profiles/delete", {name: TP.sel});
+      TP.data = r; TP.sel = "Default"; tpRender(); setSay("ok", r.message); return;
+    }
+    if (act === "update" || act === "create") {
+      const values = tpDraftValues();
+      let name = TP.sel, note = "", overwrite = true;
+      if (act === "create") {
+        name = ($("tp-name").value || "").trim(); note = ($("tp-note").value || "").trim();
+        const ex = TP.data.profiles.find(p => p.name.toLowerCase() === name.toLowerCase());
+        overwrite = !!ex;
+        if (ex && !ex.builtin && !confirm("A profile named '" + ex.name + "' already exists. Replace its values?")) return;
+      } else {
+        if (!confirm("Replace the values of '" + name + "' with the values shown on this page?")) return;
+        note = (TP.data.profiles.find(p => p.name === name) || {}).note || "";
+      }
+      const r = await post("/api/timeout-profiles/save", {name, values, note, source: "manual", site: siteName || "", overwrite});
+      TP.data = r; TP.sel = r.saved; TP.form = false; tpRender(); setSay("ok", r.message);
+    }
+  } catch (e) { setSay("err", e.message); }
+}
+
+// ---- Command time test: a manual upgrade of ONE switch, step by step, every step timed ----
+const ctHosts = () => (last && last.hosts) ? last.hosts : [];
+const ctHostInfo = () => ctHosts().find(h => h.host === CT.host) || null;
+const ctRuns = (host, id) => ((CT.results[host] || {})[id] || {}).runs || [];
+const ctGood = r => r.st === "ok" || r.st === "warning" || r.st === "timeout";      // the time of these runs counts
+const STATUS_TXT = {ok: ["ok", "OK"], warning: ["warn", "Check the result"], timeout: ["warn", "Timed out"], skipped: ["", "Nothing to do"],
+  stopped: ["warn", "Stopped"], unsupported: ["warn", "Not supported"], error: ["bad", "Failed"], connect_failed: ["bad", "Login failed"]};
+function ctStats(runs) {
+  const good = runs.filter(ctGood).map(r => r.s).filter(v => typeof v === "number");
+  const lastRun = runs.length ? runs[runs.length - 1] : null;
+  return {n: runs.length, last: lastRun, lastS: lastRun && ctGood(lastRun) ? lastRun.s : null,
+          max: good.length ? Math.max(...good) : null, avg: good.length ? good.reduce((a, b) => a + b, 0) / good.length : null};
+}
+function ctFeeds(keys) { const m = {}; for (const i of tmoItems()) m[i.key] = i.label; return keys.map(k => m[k] || k).join(" | "); }
+function ctStatusHtml(r) {
+  if (!r) return "not run yet";
+  const t = STATUS_TXT[r.st] || ["", r.st];
+  return '<span class="dot ' + t[0] + '"></span>' + esc(t[1]) + (r.d ? " - " + esc(r.d) : "") + (r.at ? ' <span class="muted">(' + esc(r.at) + ")</span>" : "");
+}
+function ctPartStats(p) {                 // steps that time several things (bundles, activate): per part, over all runs
+  const order = [], by = {};
+  for (const r of ctRuns(CT.host, p.id)) for (const x of (r.parts || [])) {
+    if (!(x.c in by)) { by[x.c] = []; order.push(x.c); }
+    by[x.c].push({s: x.s, st: x.st});
+  }
+  return order.map(c => ({command: c, ...ctStats(by[c])}));
+}
+function ctMeasured() {
+  const R = CT.results[CT.host] || {}, per = {};
+  const add = (k, id, v) => { if (typeof v !== "number") return; per[k] = per[k] || {}; per[k][id] = Math.max(per[k][id] || 0, v); };
+  for (const p of (TP.data ? TP.data.presets : [])) for (const r of ctRuns(CT.host, p.id)) {
+    if (r.parts && r.parts.length) { for (const x of r.parts) if (ctGood(x)) add(x.k, p.id, x.s); }
+    else if (ctGood(r)) for (const k of p.keys) add(k, p.id, r.s);
+  }
+  for (const v of (R._connect || [])) add("ssh_connect", "_login", v);
+  const m = {};
+  for (const k of Object.keys(per)) {
+    if (k === "install_total") {            // 'Whole install' = Add + Activate (two steps), or the one-command step; never the sum of both ways
+      const two = (per[k].install_add || 0) + (per[k].install_activate || 0), one = per[k].install_full || 0;
+      m[k] = Math.max(two, one);
+    } else m[k] = Math.max(...Object.values(per[k]));
+  }
+  return m;
+}
+function ctSuggested(m) {
+  const values = {}, rows = [];
+  for (const i of tmoItems()) {
+    const def = SET.data.defaults[i.key];
+    let v = def;
+    if (i.key in m) {
+      v = Math.ceil(m[i.key] * CT.margin / 5) * 5;
+      if (CT.keepDefault) v = Math.max(v, def);
+      v = Math.min(i.max, Math.max(i.min, v));
+    }
+    values[i.key] = v;
+    if (i.key in m) rows.push({item: i, measured: m[i.key], def, value: v});
+  }
+  return {values, rows};
+}
+function ctPartsHtml(parts) {
+  return "<table><thead><tr><th>Measured</th><th class=\"n\">Took (s)</th><th>Result</th></tr></thead><tbody>" +
+    parts.map(x => "<tr><td>" + esc(x.command || x.c) + '</td><td class="n">' + fmtS(x.seconds != null ? x.seconds : x.s) + "</td><td>" +
+      esc((STATUS_TXT[x.status || x.st] || ["", x.status || x.st])[1]) + (x.detail ? " - " + esc(x.detail) : "") + "</td></tr>").join("") + "</tbody></table>";
+}
+function ctOutHtml(r) {
+  return '<div class="ct-panel-h"><b>' + (r.seconds != null ? "Took " + fmtS(r.seconds) + " s" : "No time") + "</b>" +
+    (r.kind !== "bundle" && r.kind !== "activate" ? ", " + r.lines + " lines" : "") + (r.detail ? " - " + esc(r.detail) : "") +
+    (r.truncated ? ' <span class="muted">(first ' + r.output.length + " of " + r.chars + " characters)</span>" : "") + "</div>" +
+    (r.parts && r.parts.length ? ctPartsHtml(r.parts) : "") +
+    (r.output && !(r.kind === "bundle") ? "<pre>" + esc(r.output) + "</pre>" : r.parts && r.parts.length ? "" : "<pre>(no output)</pre>");
+}
+function ctLiveHtml() {
+  const r = CT.running; if (!r) return "";
+  return '<div class="ct-panel-h"><b>Running ... ' + Math.round(r.elapsed) + " s</b>" + (r.stopping ? " - stopping" : "") +
+    ' <span class="muted">- live output. If nothing appears for minutes the switch is waiting: press Stop to see what it printed.</span></div>' +
+    "<pre>" + esc(r.output || "(no output yet)") + "</pre>";
+}
+function ctRenderLive() {
+  const box = $("ct-live"); if (!box || !CT.running) return;
+  const old = box.querySelector("pre"), atEnd = !old || old.scrollTop + old.clientHeight >= old.scrollHeight - 8;
+  box.innerHTML = ctLiveHtml();
+  const nu = box.querySelector("pre"); if (nu && atEnd) nu.scrollTop = nu.scrollHeight;
+}
+function ctStepDone(p) { const st = ctStats(ctRuns(CT.host, p.id)); return !!(st.last && (ctGood(st.last) || st.last.st === "skipped")); }
+function ctSelected(presets) {            // the step shown on the right: your choice, else the first unfinished one
+  if (!presets.some(p => p.id === CT.sel)) CT.sel = (presets.find(p => !ctStepDone(p)) || presets[0]).id;
+  return presets.find(p => p.id === CT.sel);
+}
+function ctRailHtml(presets) {
+  const busy = !!CT.running && CT.running.host === CT.host;
+  let html = "", num = 0;
+  for (const g of [...new Set(presets.map(p => p.group))]) {
+    const steps = presets.filter(p => p.group === g), open = !CT.railClosed[g], done = steps.filter(ctStepDone).length;
+    html += '<div class="ct-rs' + (open ? " open" : "") + '"><button type="button" class="ct-rs-h" data-ct="stage" data-g="' + esc(g) + '" aria-expanded="' + open + '">' +
+      '<span class="ct-car">' + IC.dn + '</span><span>' + esc(g) + '</span><span class="ct-rs-c">' + done + "/" + steps.length + "</span></button>";
+    for (const p of steps) {
+      num++;
+      if (!open) continue;
+      const st = ctStats(ctRuns(CT.host, p.id)), running = busy && CT.running.id === p.id;
+      const cls = (p.id === CT.sel ? " sel" : "") + (running ? " run" : st.last ? (ctStepDone(p) ? " done" : " bad") : "");
+      html += '<button type="button" class="ct-r' + cls + '" data-ct="sel" data-id="' + esc(p.id) + '" title="' + esc(p.title) + '"><span class="ct-n">' + (ctStepDone(p) && !running ? "&#10003;" : num) + '</span>' +
+        '<span class="ct-r-t">' + esc(p.title) + '</span><span class="ct-r-v">' + (running ? Math.round(CT.running.elapsed) + " s" : st.max != null ? fmtS(st.max) + " s" : "") + "</span></button>";
+    }
+    html += "</div>";
+  }
+  return html;
+}
+function ctDetailHtml(p, num, total) {
+  const host = CT.host, runs = ctRuns(host, p.id), st = ctStats(runs), key = host + "|" + p.id, busy = !!CT.running;
+  const running = busy && CT.running.host === host && CT.running.id === p.id;
+  const badges = (p.warn ? (p.kind === "activate" ? '<span class="ct-badge d">reloads the switch</span>' : '<span class="ct-badge">changes the switch</span>') : "") +
+    (p.needs_image && !CT.image ? '<span class="ct-badge n">choose an image above</span>' : "");
+  const act = running ? '<button type="button" class="btn dg" data-ct="stop"' + (CT.running.stopping ? " disabled" : "") + ">" + (CT.running.stopping ? "Stopping ..." : "Stop") + "</button>"
+    : '<button type="button" class="btn p" data-ct="run" data-id="' + esc(p.id) + '"' + (busy ? " disabled" : "") + ">Execute</button>";
+  const idx = TP.data.presets.findIndex(x => x.id === p.id), nxt = TP.data.presets[idx + 1];
+  const chips = p.keys.length ? p.keys.map(k => '<span class="ct-chip">' + esc(ctFeeds([k])) + "</span>").join("") : '<span class="ct-chip">no timeout setting - for your information</span>';
+  const body = running ? '<div class="ct-panel" id="ct-live">' + ctLiveHtml() + "</div>"
+    : CT.outs[key] ? '<div class="ct-panel">' + ctOutHtml(CT.outs[key]) + "</div>"
+    : '<div class="ct-empty">Not run yet. Press Execute: the output appears here and in the console below.</div>';
+  return '<div class="ct-d"><div class="ct-d-h"><div class="ct-d-id"><div class="ct-d-k">Step ' + num + " of " + total + " &middot; " + esc(p.group.replace(/^\d+\.\s*/, "")) + "</div>" +
+    '<div class="ct-d-t">' + esc(p.title) + badges + '</div><code class="ct-cmd">' + esc(p.command) + "</code></div>" +
+    '<div class="ct-d-a">' + act + (nxt ? '<button type="button" class="btn" data-ct="next">Next step</button>' : "") + "</div></div>" +
+    '<p class="ct-d-desc">' + esc(p.desc) + "</p>" +
+    '<div class="ct-chips">Feeds: ' + chips + "</div>" +
+    '<div class="ct-tiles"><div class="ct-tile"><span>Last</span><b>' + (st.lastS != null ? fmtS(st.lastS) + " s" : "-") + '</b></div><div class="ct-tile"><span>Slowest</span><b>' + (st.max != null ? fmtS(st.max) + " s" : "-") +
+    '</b></div><div class="ct-tile"><span>Average</span><b>' + (st.avg != null ? fmtS(st.avg) + " s" : "-") + '</b></div><div class="ct-tile"><span>Runs</span><b>' + st.n + "</b></div></div>" +
+    (running || st.last ? '<div class="ct-status">' + (running ? '<span class="dot warn"></span>Running on ' + esc(host) : ctStatusHtml(st.last)) + "</div>" : "") + body + "</div>";
+}
+function ctRender() {
+  const root = $("ct-root"); if (!root || !SET.data) return;
+  const presets = TP.data ? TP.data.presets : [], hosts = ctHosts(), images = TP.data ? TP.data.images : [];
+  if (!hosts.some(h => h.host === CT.host)) CT.host = hosts.length ? hosts[0].host : null;
+  if (CT.image && !images.includes(CT.image)) CT.image = "";
+  let html = '<div class="ct-card' + (CT.open ? " open" : "") + '"><button type="button" class="ct-toggle" data-ct="toggle" aria-expanded="' + CT.open + '">' +
+    '<span>Command time test</span><span class="sub">upgrade ONE switch by hand, step by step, and time every step</span><span class="car">' + IC.dn + "</span></button>";
+  if (CT.open) {
+    if (!hosts.length || !presets.length) {
+      html += '<div class="ct-note">There are no switches in the device list yet. Add the test switch in the Device list and give it a credentials profile, then come back.</div>';
+    } else {
+      const busy = !!CT.running, p = ctSelected(presets), num = presets.indexOf(p) + 1;
+      const connect = (CT.results[CT.host] || {})._connect || [];
+      html += '<div class="ct-bar"><div class="ct-f"><label for="ct-host">Switch</label><select id="ct-host"' + (busy ? " disabled" : "") + ">" + hosts.map(h => '<option value="' + esc(h.host) + '"' + (h.host === CT.host ? " selected" : "") + ">" +
+          esc(h.host + (h.label ? " - " + h.label : "") + (h.platform ? " (" + h.platform + ")" : "")) + "</option>").join("") + "</select></div>" +
+        '<div class="ct-f"><label for="ct-image">Image</label><select id="ct-image"' + (busy ? " disabled" : "") + '><option value="">- choose the image to test with -</option>' +
+        images.map(n => '<option value="' + esc(n) + '"' + (n === CT.image ? " selected" : "") + ">" + esc(n) + "</option>").join("") + "</select></div>" +
+        '<div class="ct-bar-r"><span class="tip" data-tip="Run the steps from top to bottom on a TEST switch: it is a real upgrade done by hand. Pick a step on the left, press Execute, read the output here and in the console, then go on with Next step. The image is needed for the copy, the MD5 check and the add step. Steps marked as changing the switch ask first; Activate RELOADS the switch. Run a step again to get a second sample - the slowest time of each step is the one that counts."></span>' +
+        '<button type="button" class="btn sm" data-ct="stages" data-v="1">Expand all</button><button type="button" class="btn sm" data-ct="stages" data-v="0">Collapse all</button>' +
+        '<button type="button" class="btn sm" data-ct="clear"' + (busy ? " disabled" : "") + ">Clear results</button></div></div>";
+      html += '<div class="ct-wb"><nav class="ct-rail" aria-label="Steps">' + ctRailHtml(presets) + '</nav><div class="ct-main">' + ctDetailHtml(p, num, presets.length) + '<div id="cc-slot"></div></div></div>';
+      html += '<div class="ct-result"><div class="ct-result-t">Results and profile</div><div class="ct-result-g"><div id="ct-sugg-t"></div><div class="ct-side">' +
+        '<div class="ct-sg-h"><label for="ct-margin">Safety margin &times;<span class="tip" data-tip="The suggested timeout is the slowest measured time multiplied by this number, rounded up to 5 seconds. A switch is slower during a busy upgrade than during your test, so keep some room (3 is a good start)."></span></label>' +
+        '<input type="number" id="ct-margin" min="1" max="20" step="0.5" value="' + CT.margin + '">' +
+        '<label class="chk"><input type="checkbox" id="ct-keep"' + (CT.keepDefault ? " checked" : "") + '><span>Never go below the default</span></label></div>' +
+        '<div class="ct-note">Every Execute also times the SSH login' + (connect.length ? " (" + connect.length + " sample" + (connect.length > 1 ? "s" : "") + ", slowest " + fmtS(Math.max(...connect)) + " s)" : "") + ".</div>" +
+        '<div id="ct-sugg-a"></div></div></div></div>';
+    }
+  }
+  root.innerHTML = html + "</div>";
+  ctRenderSuggest();
+  tipsIn("ct-root");
+  const slot = $("cc-slot"); if (slot) slot.appendChild(CC_EL);
+  ccSync();
+}
+function ctRenderSuggest() {
+  const tbl = $("ct-sugg-t"), act = $("ct-sugg-a"); if (!tbl || !act) return;
+  const m = ctMeasured(), sg = ctSuggested(m);
+  if (!sg.rows.length) { tbl.innerHTML = '<div class="ct-empty" style="margin-top:0">Execute at least one step to see the suggested timeouts.</div>'; act.innerHTML = ""; return; }
+  const dis = SET_CAN_EDIT ? "" : " disabled";
+  tbl.innerHTML = '<table class="ct-table"><thead><tr><th>Timeout setting</th><th class="n">Slowest (s)</th><th class="n">Default (s)</th><th class="n">Suggested (s)</th></tr></thead><tbody>' +
+    sg.rows.map(r => "<tr><td>" + esc(r.item.label) + '</td><td class="n">' + fmtS(r.measured) + '</td><td class="n">' + r.def + '</td><td class="n"><b>' + r.value + "</b></td></tr>").join("") + "</tbody></table>" +
+    '<div class="ct-note">' + (tmoItems().length - sg.rows.length) + " timeout(s) have no measurement and keep their default value in the profile (for example the backup commands, which this test does not run).</div>";
+  act.innerHTML = '<div class="ct-actions"><button type="button" class="btn p" data-ct="saveform"' + dis + (SET_CAN_EDIT ? "" : ' title="Only an Administrator can save profiles"') + ">Save as profile...</button>" +
+    '<button type="button" class="btn sm" data-ct="csv">Report (CSV)</button><button type="button" class="btn sm" data-ct="print">Printable report</button></div>' +
+    (CT.form ? '<div class="ct-actions"><input type="text" id="ct-pname" maxlength="40" placeholder="Profile name, e.g. Production" aria-label="Profile name">' +
+      '<button type="button" class="btn p sm" data-ct="save"' + dis + '>Save</button><button type="button" class="btn sm" data-ct="cancelform">Cancel</button></div>' : "");
+}
+async function ctRun(id) {
+  if (CT.running || !CT.host || !TP.data) return;
+  const p = TP.data.presets.find(x => x.id === id); if (!p) return;
+  const host = CT.host;
+  if (p.needs_image && !CT.image) { setSay("err", "Choose the image to test with first."); return; }
+  if (p.warn && !confirm("'" + p.title + "' " + p.warn.replace("{host}", host) + "\n\nContinue?")) return;
+  CT.running = {host, id, elapsed: 0, output: "", stopping: false, job: null}; CT.sel = id; setSay("", ""); ctRender();
+  try {
+    const job = await post("/api/command-test/start", {host, id, image: CT.image});
+    CT.running.job = job.job;
+    let r = null, offset = 0;
+    while (!r) {
+      await new Promise(res => setTimeout(res, 1000));
+      const d = await post("/api/command-test/poll", {job: job.job, offset});
+      offset = d.offset; ccAppend(host, d.text);
+      if (d.state === "done") r = d.result;
+      else { CT.running.elapsed = d.elapsed; CT.running.output = d.output || ""; ctRenderLive(); }
+    }
+    const R = CT.results[host] = CT.results[host] || {};
+    const e = R[id] = R[id] || {runs: []};
+    e.runs.push({s: r.seconds, st: r.status, d: r.detail || "", at: r.time,
+                 parts: (r.parts || []).map(x => ({c: x.command, k: x.key, s: x.seconds, st: x.status}))});
+    if (e.runs.length > 20) e.runs.shift();
+    if (typeof r.connect_seconds === "number") { (R._connect = R._connect || []).push(r.connect_seconds); if (R._connect.length > 40) R._connect.shift(); }
+    CT.outs[host + "|" + id] = r; ctPersist();
+  } catch (e) { setSay("err", e.message); }
+  CT.running = null; ctRender();
+}
+async function ctStop() {
+  if (!CT.running || !CT.running.job) return;
+  CT.running.stopping = true; ctRender();
+  try { await post("/api/command-test/stop", {job: CT.running.job}); } catch (e) { setSay("err", e.message); }
+}
+function ctReportData() {
+  const h = ctHostInfo() || {host: CT.host}, m = ctMeasured(), sg = ctSuggested(m), cmds = [], details = [];
+  const R = CT.results[CT.host] || {};
+  const label = k => (STATUS_TXT[k] || ["", k])[1];
+  const connect = ctStats((R._connect || []).map(v => ({s: v, st: "ok"})));
+  if (connect.n) cmds.push({group: "", command: "SSH login (measured on every Execute)", feeds: ctFeeds(["ssh_connect"]), n: connect.n, last: connect.last.s, max: connect.max, avg: connect.avg, status: "OK"});
+  for (const p of TP.data.presets) {
+    const runs = ctRuns(CT.host, p.id); if (!runs.length) continue;
+    const st = ctStats(runs);
+    cmds.push({group: p.group, command: p.title, feeds: ctFeeds(p.keys), n: st.n, last: st.lastS, max: st.max, avg: st.avg, status: label(st.last.st)});
+    const parts = ctPartStats(p); if (parts.length) details.push({name: p.title, parts});
+  }
+  return {host: h, cmds, details, sg, image: CT.image, when: new Date().toLocaleString(), site: siteName || "",
+          ver: (document.querySelector(".appver") || {}).textContent || ""};
+}
+const csvCell = v => { let t = v == null ? "" : String(v); if (typeof v === "string" && /^[=+\-@]/.test(t)) t = "'" + t; return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+function ctDownload(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\ufeff" + text], {type})); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+const ctStamp = () => { const d = new Date(), z = n => String(n).padStart(2, "0"); return d.getFullYear() + z(d.getMonth() + 1) + z(d.getDate()) + "_" + z(d.getHours()) + z(d.getMinutes()); };
+function ctCsv() {
+  const d = ctReportData(), L = [];
+  const row = (...c) => L.push(c.map(csvCell).join(","));
+  row("NetUpgrade command time test report"); row("Generated", d.when); row("Application", d.ver); row("Site", d.site);
+  row("Switch", d.host.host, d.host.label || "", d.host.platform || "", d.host.version || ""); row("Image", d.image || "");
+  row("Safety margin (x)", CT.margin); row("Never below the default", CT.keepDefault ? "yes" : "no"); row();
+  row("Stage", "Step", "Feeds this timeout", "Runs", "Last (s)", "Slowest (s)", "Average (s)", "Last result");
+  for (const c of d.cmds) row(c.group, c.command, c.feeds, c.n, c.last == null ? "" : c.last, c.max == null ? "" : c.max, c.avg == null ? "" : +c.avg.toFixed(2), c.status);
+  for (const b of d.details) { row(); row(b.name + " - detail"); row("Measured", "Runs", "Last (s)", "Slowest (s)", "Average (s)");
+    for (const x of b.parts) row(x.command, x.n, x.lastS == null ? "" : x.lastS, x.max == null ? "" : x.max, x.avg == null ? "" : +x.avg.toFixed(2)); }
+  row(); row("Timeout setting", "Setting key", "Slowest measured (s)", "Default (s)", "Suggested (s)");
+  for (const r of d.sg.rows) row(r.item.label, r.item.key, r.measured, r.def, r.value);
+  ctDownload("command_time_test_" + String(d.host.host).replace(/[^A-Za-z0-9_.-]/g, "_") + "_" + ctStamp() + ".csv", L.join("\r\n") + "\r\n", "text/csv;charset=utf-8");
+}
+function ctPrint() {
+  const d = ctReportData();
+  const tr = cells => "<tr>" + cells.map(c => "<td>" + esc(c) + "</td>").join("") + "</tr>";
+  const th = cells => "<tr>" + cells.map(c => "<th>" + esc(c) + "</th>").join("") + "</tr>";
+  const html = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Command time test - ' + esc(d.host.host) + "</title><style>" +
+    "body{font:14px/1.45 Segoe UI,Arial,sans-serif;margin:28px;color:#111}h1{font-size:21px;margin:0 0 4px}h2{font-size:15px;margin:22px 0 4px}" +
+    "table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #bbb;padding:6px 9px;text-align:left}th{background:#eef1f5}" +
+    ".m{color:#555;font-size:13px}button{padding:7px 14px;margin-bottom:14px}@media print{.np{display:none}}</style></head><body>" +
+    '<button class="np" onclick="window.print()">Print / Save as PDF</button><h1>Command time test report</h1>' +
+    '<div class="m">' + esc(d.when) + " | NetUpgrade " + esc(d.ver) + (d.site ? " | Site: " + esc(d.site) : "") + "</div>" +
+    "<h2>Switch</h2><table>" + tr(["Address", d.host.host]) + tr(["Name", d.host.label || ""]) + tr(["Platform", d.host.platform || ""]) + tr(["Software version", d.host.version || ""]) + tr(["Image tested with", d.image || ""]) + "</table>" +
+    "<h2>Measured step times</h2><table>" + th(["Stage", "Step", "Feeds this timeout", "Runs", "Last (s)", "Slowest (s)", "Average (s)", "Last result"]) +
+    d.cmds.map(c => tr([c.group, c.command, c.feeds, c.n, fmtS(c.last), fmtS(c.max), fmtS(c.avg), c.status])).join("") + "</table>" +
+    d.details.map(b => "<h2>" + esc(b.name) + " - detail</h2><table>" + th(["Measured", "Runs", "Last (s)", "Slowest (s)", "Average (s)"]) +
+      b.parts.map(x => tr([x.command, x.n, fmtS(x.lastS), fmtS(x.max), fmtS(x.avg)])).join("") + "</table>").join("") +
+    "<h2>Suggested timeouts</h2><div class=\"m\">Slowest measured time x " + CT.margin + ", rounded up to 5 seconds" + (CT.keepDefault ? ", never below the default" : "") + ". 'Whole install' is the add step plus the activation.</div><table>" +
+    th(["Timeout setting", "Slowest measured (s)", "Default (s)", "Suggested (s)"]) + d.sg.rows.map(r => tr([r.item.label, fmtS(r.measured), r.def, r.value])).join("") + "</table></body></html>";
+  const url = URL.createObjectURL(new Blob([html], {type: "text/html"}));
+  if (!window.open(url, "_blank")) setSay("err", "The browser blocked the report window. Allow pop-ups for this page, or use the CSV download.");
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+// ---- Console next to the Command time test: the output of every step you Execute, live, plus an interactive SSH
+// session to the selected switch (the same /api/term session as the device drawer's Console) ----
+const CC = {};       // host -> {text, sid, offset, state: off|connecting|on|closed, hist, hi, polling}
+const CC_EL = document.createElement("div"); CC_EL.id = "cc-root";     // the console lives here; ctRender moves it into the page
+const ccGet = h => CC[h] || (CC[h] = {text: "", sid: null, offset: 0, state: "off", hist: [], hi: -1, polling: false});
+function ccAppend(host, text) {
+  if (!text) return;
+  const c = ccGet(host);
+  c.text += text; if (c.text.length > 400000) c.text = c.text.slice(-300000);
+  if (host === CT.host) ccPaint();
+}
+const ccSecretPrompt = c => /(?:password|secret|passphrase)[^\n]*:\s*$/i.test(c.text.slice(c.text.lastIndexOf("\n") + 1));
+function ccSync() {                        // (re)build the panel when the switch changed
+  const want = CT.open && CT.host ? CT.host : "";
+  if (CC_EL.dataset.host !== want || (want && !CC_EL.querySelector("#cc-out"))) ccRender();
+}
+function ccRender() {
+  const root = CC_EL;
+  const want = CT.open && CT.host ? CT.host : "";
+  root.dataset.host = want;
+  if (!want) { root.innerHTML = ""; return; }
+  root.innerHTML = '<div class="cc" id="cc"><div class="cc-h"><span class="cc-t" id="cc-title"></span><span class="cc-st" id="cc-state"></span><span class="cc-sp"></span>' +
+    '<button type="button" class="cc-b go" id="cc-connect">Connect</button><button type="button" class="cc-b" id="cc-ctrlc">Ctrl+C</button>' +
+    '<button type="button" class="cc-b" id="cc-clear">Clear</button><button type="button" class="cc-b" id="cc-max">Maximise</button></div>' +
+    '<pre class="cc-out" id="cc-out"></pre><div class="cc-in"><span>&gt;</span><input id="cc-input" type="text" autocomplete="off" spellcheck="false" aria-label="Command for the switch"></div>' +
+    '<div class="cc-n">The commands and output of every step appear here as the switch prints them. Connect opens an interactive SSH session to this switch, so you can also type commands, for example show install summary.</div></div>';
+  $("cc-connect").addEventListener("click", () => { const c = ccGet(CT.host); (c.state === "on" || c.state === "connecting") ? ccDisconnect(CT.host) : ccConnect(CT.host); });
+  $("cc-ctrlc").addEventListener("click", () => { ccSend({raw: "ctrl_c"}); $("cc-input").focus(); });
+  $("cc-clear").addEventListener("click", () => { ccGet(CT.host).text = ""; ccPaint(); });
+  $("cc-max").addEventListener("click", () => { const m = $("cc").classList.toggle("max"); $("cc-max").textContent = m ? "Restore" : "Maximise"; const o = $("cc-out"); o.scrollTop = o.scrollHeight; });
+  $("cc-out").addEventListener("click", () => { if (!String(getSelection()) && !$("cc-input").disabled) $("cc-input").focus(); });
+  $("cc-input").addEventListener("keydown", e => {
+    const c = ccGet(CT.host), inp = e.target;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const line = inp.value, secret = inp.type === "password";
+      inp.value = "";
+      if (!secret && line.trim()) { c.hist.push(line); c.hist = c.hist.slice(-100); }
+      c.hi = -1; ccSend({line, secret});
+    } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      if (inp.type === "password" || !c.hist.length) return;
+      e.preventDefault();
+      c.hi = e.key === "ArrowUp" ? Math.min(c.hist.length - 1, c.hi + 1) : Math.max(-1, c.hi - 1);
+      inp.value = c.hi < 0 ? "" : c.hist[c.hist.length - 1 - c.hi];
+    } else if (e.ctrlKey && (e.key === "c" || e.key === "C") && inp.selectionStart === inp.selectionEnd) {
+      e.preventDefault(); inp.value = ""; ccSend({raw: "ctrl_c"});
+    }
+  });
+  const c = ccGet(CT.host);
+  if (c.sid && !c.polling) ccPoll(CT.host);
+  ccPaint();
+}
+function ccPaint() {
+  const out = $("cc-out"); if (!out) return;
+  const host = CT.host, c = ccGet(host), h = ctHostInfo();
+  const live = c.state === "on" || c.state === "connecting";
+  const atEnd = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+  const shown = c.text || "Nothing yet. Execute a step on the left and its commands and output appear here live.";
+  if (out.textContent !== shown) { out.textContent = shown; if (atEnd || !c.text) out.scrollTop = out.scrollHeight; }
+  $("cc-title").textContent = "Console - " + host + (h && h.label ? " - " + h.label : "");
+  const st = $("cc-state");
+  st.textContent = {off: "No SSH session", connecting: "Connecting ...", on: "SSH session open", closed: "Session closed"}[c.state];
+  st.className = "cc-st" + (c.state === "on" ? " on" : c.state === "connecting" ? " busy" : "");
+  $("cc-connect").textContent = live ? "Disconnect" : "Connect";
+  $("cc-connect").className = "cc-b" + (live ? "" : " go");
+  $("cc-ctrlc").disabled = !live;
+  const inp = $("cc-input"), wasOff = inp.disabled;
+  inp.disabled = !live;
+  if (wasOff && live) inp.focus();
+  const pw = live && ccSecretPrompt(c);
+  inp.type = pw ? "password" : "text";
+  inp.placeholder = live ? (pw ? "Enter the password (not shown, not recorded)" : "Type a command and press Enter") : "Click Connect to type commands";
+}
+async function ccConnect(host) {
+  const c = ccGet(host);
+  c.state = "connecting"; c.offset = 0; c.text += "\n[Connecting an SSH session to " + host + " ...]\n"; ccPaint();
+  try {
+    const d = await post("/api/term/open", {host});
+    c.sid = d.sid; c.offset = 0; ccPoll(host);
+  } catch (e) { c.state = "off"; c.sid = null; c.text += "[" + e.message + "]\n"; }
+  ccPaint();
+}
+async function ccDisconnect(host) {
+  const c = ccGet(host), sid = c.sid;
+  c.sid = null; c.state = "off"; c.text += "\n[Disconnected]\n"; ccPaint();
+  if (sid) { try { await post("/api/term/close", {host, sid}); } catch (e) {} }
+}
+async function ccPoll(host) {
+  const c = ccGet(host);
+  if (c.polling) return;
+  c.polling = true;
+  try {
+    while (c.sid && document.body.contains(CC_EL)) {
+      const sid = c.sid;
+      let d = null;
+      try {
+        const r = await fetch("/api/term/read?host=" + encodeURIComponent(host) + "&sid=" + encodeURIComponent(sid) + "&offset=" + c.offset, {cache: "no-store"});
+        d = await r.json();
+        if (!r.ok) { if (r.status === 404) { c.sid = null; c.state = "closed"; c.text += "\n[The session no longer exists on the server]\n"; break; } throw new Error(d.error || r.status); }
+      } catch (e) { await new Promise(res => setTimeout(res, 1500)); continue; }
+      if (c.sid !== sid) break;
+      if (d.text) { c.text += d.text; if (c.text.length > 400000) c.text = c.text.slice(-300000); }
+      c.offset = d.offset;
+      c.state = d.closed ? "closed" : (d.ready ? "on" : "connecting");
+      if (host === CT.host) ccPaint();
+      if (d.closed) { c.sid = null; break; }
+      await new Promise(res => setTimeout(res, d.text ? 120 : 450));
+    }
+  } finally { c.polling = false; }
+  if (host === CT.host) ccPaint();
+}
+async function ccSend(payload) {
+  const host = CT.host, c = ccGet(host);
+  if (!c.sid) return;
+  try { await post("/api/term/send", Object.assign({host, sid: c.sid}, payload)); }
+  catch (e) { c.text += "\n[" + e.message + "]\n"; ccPaint(); }
+}
+async function ctSaveProfile() {
+  try {
+    const name = (($("ct-pname") || {}).value || "").trim();
+    if (!name) { setSay("err", "Type a name for the profile."); return; }
+    const sg = ctSuggested(ctMeasured()), h = ctHostInfo();
+    const ex = TP.data.profiles.find(p => p.name.toLowerCase() === name.toLowerCase());
+    if (ex && !ex.builtin && !confirm("A profile named '" + ex.name + "' already exists. Replace its values?")) return;
+    const note = "Measured on " + CT.host + (h && h.label ? " (" + h.label + ")" : "") + ", margin x" + CT.margin + (CT.keepDefault ? ", never below the default" : "");
+    const r = await post("/api/timeout-profiles/save", {name, values: sg.values, note, source: "command test", site: siteName || "", switch: CT.host, overwrite: !!ex});
+    TP.data = r; TP.sel = r.saved; CT.form = false; renderSettings(); setSay("ok", r.message);
+  } catch (e) { setSay("err", e.message); }
+}
+$("set-body").addEventListener("click", e => {
+  const t = e.target.closest("[data-tp]"); if (t) { tpAction(t.dataset.tp); return; }
+  const c = e.target.closest("[data-ct]"); if (!c) return;
+  switch (c.dataset.ct) {
+    case "toggle": CT.open = !CT.open; ctRender(); break;
+    case "run": ctRun(c.dataset.id); break;
+    case "stop": ctStop(); break;
+    case "sel": CT.sel = c.dataset.id; ctRender(); break;
+    case "next": { const ps = TP.data.presets, i = ps.findIndex(x => x.id === CT.sel); if (ps[i + 1]) { CT.sel = ps[i + 1].id; CT.railClosed[ps[i + 1].group] = false; ctRender(); } break; }
+    case "stage": CT.railClosed[c.dataset.g] = !CT.railClosed[c.dataset.g]; ctRender(); break;
+    case "stages": { for (const g of new Set(TP.data.presets.map(p => p.group))) CT.railClosed[g] = c.dataset.v !== "1"; ctRender(); break; }
+    case "clear": if (confirm("Clear the measured times of " + CT.host + "?")) {
+      delete CT.results[CT.host]; for (const k of Object.keys(CT.outs)) if (k.startsWith(CT.host + "|")) delete CT.outs[k];
+      ctPersist(); ctRender(); } break;
+    case "csv": ctCsv(); break;
+    case "print": ctPrint(); break;
+    case "saveform": CT.form = true; ctRenderSuggest(); { const n = $("ct-pname"); if (n) n.focus(); } break;
+    case "cancelform": CT.form = false; ctRenderSuggest(); break;
+    case "save": ctSaveProfile(); break;
+  }
+});
+$("set-body").addEventListener("change", e => {
+  if (e.target.id === "tp-sel") { TP.sel = e.target.value; tpRender(); }
+  else if (e.target.id === "ct-host") { CT.host = e.target.value; CT.form = false; ctPersist(); ctRender(); }
+  else if (e.target.id === "ct-image") { CT.image = e.target.value; ctPersist(); ctRender(); }
+  else if (e.target.id === "ct-keep") { CT.keepDefault = e.target.checked; ctRenderSuggest(); }
+});
+$("set-body").addEventListener("input", e => {
+  if (e.target.id !== "ct-margin") return;
+  const v = Number(e.target.value);
+  if (v >= 1 && v <= 20) { CT.margin = v; ctPersist(); ctRenderSuggest(); }
+});
+
 if (location.hash === "#storage") showView("storage", false);
+else if (location.hash === "#settings") showView("settings", false);
 
 // ============================================================================================
 // Device drawer: click a switch name in the device list -> a panel on the right with everything
@@ -8794,6 +10660,12 @@ def make_handler(manager, allowed_hosts, any_host):
                     self._json(200, self._me())
                 elif path == "/api/images":
                     self._json(200, {"images": list_images()})
+                elif path == "/api/images/details":
+                    self._json(200, {"images": list_image_details()})
+                elif path == "/api/settings":
+                    self._json(200, manager.settings_view())
+                elif path == "/api/timeout-profiles":
+                    self._json(200, manager.timeout_profiles_view())
                 elif path == "/api/device":
                     self._json(200, manager.device_detail(qv("host"), qv("image"), shared_target=self._me()["role"] == ROLE_VIEWER))
                 elif path == "/api/device/file":
@@ -8888,17 +10760,42 @@ def make_handler(manager, allowed_hosts, any_host):
                 elif path == "/api/upgrade":
                     result = manager.start_upgrade(body.get("hosts"), body.get("image_path"),
                                                    bool(body.get("backup_first")), body.get("action") or "full",
-                                                   self._who(), bool(body.get("skip_image_check")))
+                                                   self._who(), bool(body.get("skip_image_check")),
+                                                   bool(body.get("ignore_space")))
                 elif path == "/api/schedule":
                     result = manager.schedule_upgrade(body.get("hosts"), body.get("image_path"), body.get("run_at"),
                                                       bool(body.get("backup_first")),
                                                       body.get("action") or "full",
-                                                      self._who(), bool(body.get("skip_image_check")))
+                                                      self._who(), bool(body.get("skip_image_check")),
+                                                      bool(body.get("ignore_space")))
                 elif path == "/api/schedule/cancel":
                     result = manager.cancel_schedule(body.get("hosts"))
-                elif path == "/api/upgrade-settings":
-                    result = manager.set_upgrade_settings(body.get("max_parallel"), body.get("stop_on_failure"),
-                                                          self._who())
+                elif path == "/api/settings":
+                    result = manager.update_settings(body.get("values"), self._who())
+                elif path == "/api/timeout-profiles/save":
+                    result = manager.timeout_profile_save(body.get("name"), body.get("values"), body.get("note"),
+                                                          body.get("source"), body.get("site"), body.get("switch"),
+                                                          bool(body.get("overwrite")), self._who())
+                elif path == "/api/timeout-profiles/delete":
+                    result = manager.timeout_profile_delete(body.get("name"), self._who())
+                elif path == "/api/timeout-profiles/apply":
+                    result = manager.timeout_profile_apply(body.get("name"), self._who())
+                elif path == "/api/command-test/start":
+                    result = manager.command_test_start(body.get("host"), body.get("id"), self._who(), body.get("image"))
+                elif path == "/api/command-test/stop":
+                    result = manager.command_test_stop(body.get("job"))
+                elif path == "/api/command-test/poll":
+                    result = manager.command_test_poll(body.get("job"), body.get("offset"))
+                elif path == "/api/images/verify":
+                    name = safe_upload_filename(str(body.get("name") or ""))
+                    image = images_dir() / name
+                    if not name.lower().endswith(".bin") or not image.is_file():
+                        raise ApiError("That image is not in the IOS Images folder.", 404)
+                    try:
+                        verify_image_checksum_sidecar(image)
+                    except ValueError as exc:
+                        raise ApiError(f"{name}: {exc}", 409)
+                    result = {"message": f"{name}: the file matches its saved {image_checksum_kind(image)} checksum."}
                 else:
                     raise ApiError("Not found.", 404)
                 self._json(200, result)
@@ -8913,7 +10810,7 @@ def make_handler(manager, allowed_hosts, any_host):
             ctype = self.headers.get("Content-Type", "")
             try:
                 if path == "/api/images/upload":
-                    expected_sha512 = (self.headers.get("X-Image-SHA512") or "").strip().lower()
+                    expected_md5 = (self.headers.get("X-Image-MD5") or "").strip().lower()
                     chosen = {}
 
                     def dest_for_image(filename):
@@ -8932,16 +10829,17 @@ def make_handler(manager, allowed_hosts, any_host):
                     backups = []
                     installed = []
                     try:
-                        if not re.fullmatch(r"[0-9a-f]{128}", expected_sha512):
-                            raise ValueError("Paste the 128-character SHA-512 checksum shown on Cisco's download page.")
-                        verify_image_sha512(temp_path, expected_sha512)
-                        sidecar_path = Path(str(chosen["final_path"]) + ".sha512")
-                        legacy_sidecar = Path(str(chosen["final_path"]) + ".sha256")
+                        if not re.fullmatch(r"[0-9a-f]{32}", expected_md5):
+                            raise ValueError("Paste the 32-character MD5 checksum shown on Cisco's download page.")
+                        verify_image_md5(temp_path, expected_md5)
+                        sidecar_path = Path(str(chosen["final_path"]) + ".md5")
+                        older_sidecars = [Path(str(chosen["final_path"]) + ext) for ext in (".sha512", ".sha256")]
                         checksum_temp = Path(str(sidecar_path) + "." + secrets.token_hex(8) + ".upload")
-                        checksum_temp.write_text(expected_sha512 + "\n", encoding="ascii")
+                        checksum_temp.write_text(expected_md5 + "\n", encoding="ascii")
 
-                        # Back up existing files so a failed replacement can be rolled back.
-                        for old_path in (chosen["final_path"], sidecar_path, legacy_sidecar):
+                        # Back up existing files so a failed replacement can be rolled back (a replaced image
+                        # must not keep an older SHA sidecar that belongs to the previous file).
+                        for old_path in (chosen["final_path"], sidecar_path, *older_sidecars):
                             if old_path.exists():
                                 backup = Path(str(old_path) + "." + secrets.token_hex(8) + ".backup")
                                 os.replace(old_path, backup)
@@ -8967,14 +10865,14 @@ def make_handler(manager, allowed_hosts, any_host):
                                     leftover.unlink()
                                 except OSError:
                                     pass
-                        raise ApiError(f"Image rejected: {exc}") from exc
+                        raise ApiError("Image rejected: " + str(exc).replace(temp_path.name, chosen["name"])) from exc
                     for _, backup_path in backups:
                         try:
                             backup_path.unlink()
                         except OSError:
                             pass
                     self._json(200, {
-                        "message": f"Uploaded and verified Cisco SHA-512 checksum for {chosen['name']} "
+                        "message": f"Uploaded {chosen['name']} and verified its MD5 checksum "
                                    f"({size / 1_048_576:.1f} MB).",
                         "filename": chosen["name"], "images": list_images(),
                     })
