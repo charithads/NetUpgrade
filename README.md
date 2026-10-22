@@ -19,7 +19,7 @@ The dashboard shows switch availability, backup and upgrade state, events, and l
 - Test and manage device credentials.
 - Back up running configuration, version, boot, inventory, and optional additional commands.
 - Run readiness checks before upgrading, distribute IOS-XE images, activate upgrades, and verify the version after reload.
-- Verify the Cisco-published SHA-512 checksum while uploading each IOS-XE image; images with missing or mismatched checksums are rejected.
+- Check each IOS-XE image against Cisco's MD5 checksum during upload; images with missing or mismatched checksums are rejected.
 - Configure the maximum concurrent reloads per site (1–10); additional switches wait in a queue, with an administrator-selectable stop-on-failure policy.
 - Start upgrades immediately or schedule them for a later date and time; view each worker's live progress in the dashboard.
 - Review device events, backups, and per-device command history. Command logs record commands and results metadata, not switch command output.
@@ -116,7 +116,7 @@ The direct manager defaults to loopback. Enabling remote access exposes switch-m
 
 This application can run privileged commands that change network software. Use it in a controlled pilot until it has been reviewed and validated for your environment. See [SECURITY.md](SECURITY.md) for a deployment baseline and [DEPLOYMENT_READINESS.md](DEPLOYMENT_READINESS.md) for the engineering and operational gates that remain before broad deployment.
 
-To upload an image, choose its `.bin` file, paste the 128-character SHA-512 checksum shown on Cisco's software download page, then select **Upload and verify image**. NetUpgrade checks the uploaded image before saving it and blocks missing or mismatched checksums. It saves the verified checksum beside the image for later upgrade checks. Do not calculate the expected checksum from the local image or use a value from an untrusted source. Existing `.sha256` checksum files remain supported.
+To upload an image, choose its `.bin` file, paste the 32-character MD5 checksum shown on Cisco's software download page, then select **Upload and verify**. NetUpgrade checks the image before saving it and rejects missing or mismatched checksums. It saves the verified MD5 checksum beside the image and checks it again before an upgrade. Copy the checksum from Cisco's download page; do not calculate the expected value from the local image.
 
 ## Verification
 
