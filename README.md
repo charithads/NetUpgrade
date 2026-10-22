@@ -29,7 +29,7 @@ The dashboard shows switch availability, backup and upgrade state, events, and l
 ## Requirements
 
 - Windows 10 or later for the desktop launcher.
-- Python 3.10 or later to run from source or build the executable.
+- Python 3.11 or later to run from source or build the executable.
 - Network reachability to the switches and SSH credentials with the privileges required for backups and upgrades.
 - An Excel workbook (`.xlsx`) when importing a switch inventory.
 
