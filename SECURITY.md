@@ -22,10 +22,10 @@ management security boundary.
 - Limit device management access to the required management VLAN and hosts.
 - Keep configuration backups and audit records access-controlled and backed
   up. They may contain sensitive topology and configuration data.
-- When uploading an IOS-XE `.bin` image, paste the 128-character SHA-512
-  checksum shown on Cisco's software download page. NetUpgrade checks the image
-  before saving it and blocks a missing, malformed, or mismatched checksum.
-  Keep a tested recovery image and out-of-band access available.
+- When uploading an IOS-XE `.bin` image, paste the 32-character MD5 checksum
+  shown on Cisco's software download page. NetUpgrade checks the image before
+  saving it and blocks a missing, malformed, or mismatched checksum. Keep a
+  tested recovery image and out-of-band access available.
 - Upgrade a lab device and a small canary group first. Require a human change
   approval, a maintenance window, pre-check evidence, post-check evidence, and
   an explicit stop decision before expanding a rollout.
