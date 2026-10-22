@@ -23,39 +23,47 @@ def bare_manager(site="test-site"):
     obj.events = EventSink()
     obj.max_parallel = 1
     obj.stop_on_failure = True
+    obj.settings = manager.settings_defaults()
     return obj
 
 
 class ParallelSettingsTests(unittest.TestCase):
-    def test_parallelism_and_stop_policy_are_persisted_per_site(self):
+    def test_parallelism_and_stop_policy_are_persisted(self):
         with tempfile.TemporaryDirectory() as temp:
-            settings = Path(temp) / "upgrade_settings.json"
+            settings_file = Path(temp) / "settings.json"
             obj = bare_manager()
-            with patch.object(manager, "site_upgrade_settings_path", return_value=settings):
-                result = obj.set_upgrade_settings("4", False, who="admin")
-                self.assertEqual(result["max_parallel"], 4)
-                self.assertFalse(result["stop_on_failure"])
+            with patch.object(manager, "settings_path", return_value=settings_file):
+                result = obj.update_settings(
+                    {"max_parallel": "4", "stop_on_failure": False}, who="admin"
+                )
+                self.assertEqual(result["values"]["max_parallel"], 4)
+                self.assertFalse(result["values"]["stop_on_failure"])
 
                 loaded = bare_manager()
-                loaded._load_upgrade_settings("test-site")
+                loaded.settings = manager.load_global_settings()
+                loaded._apply_settings()
 
             self.assertEqual(loaded.upgrade_settings_view(), {
-                "max_parallel": 4, "stop_on_failure": False, "limit": manager.MAX_PARALLEL_LIMIT,
+                "max_parallel": 4,
+                "stop_on_failure": False,
+                "limit": manager.MAX_PARALLEL_LIMIT,
             })
 
     def test_parallelism_rejects_non_integer_and_out_of_range_values(self):
         obj = bare_manager()
         for value in (True, "invalid", 0, manager.MAX_PARALLEL_LIMIT + 1):
             with self.subTest(value=value), self.assertRaises(manager.ApiError):
-                obj.set_upgrade_settings(value, True)
+                obj.update_settings({"max_parallel": value, "stop_on_failure": True})
 
     def test_only_administrator_can_change_rollout_settings(self):
         allowed, message = manager.role_allows(
-            manager.ROLE_OPERATOR, "POST", "/api/upgrade-settings")
+            manager.ROLE_OPERATOR, "POST", "/api/settings")
         self.assertFalse(allowed)
-        self.assertIn("upgrade settings", message)
-        self.assertEqual(manager.role_allows(
-            manager.ROLE_ADMIN, "POST", "/api/upgrade-settings"), (True, ""))
+        self.assertIn("change the settings", message)
+        self.assertEqual(
+            manager.role_allows(manager.ROLE_ADMIN, "POST", "/api/settings"),
+            (True, ""),
+        )
 
 
 class ParallelQueueTests(unittest.TestCase):
