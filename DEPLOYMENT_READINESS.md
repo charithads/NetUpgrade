@@ -11,9 +11,8 @@ The application provides a local dashboard, user roles, optional HTTPS and
 client restrictions, device monitoring, configuration backups, readiness
 checks, an IOS-XE install workflow, scheduling, and post-upgrade checks. CI
 currently performs a static Python check, a startup smoke test, and a Windows
-packaging dry run. The application now checks a Cisco-published SHA-512 digest during image
-upload, and CI includes unit and
-dependency-audit jobs. Dashboard reload concurrency is configurable per site
+packaging dry run. The application checks the Cisco-published MD5 checksum during image upload,
+and CI includes unit and dependency-audit jobs. Dashboard reload concurrency is configurable per site
 (1–10), with queued switches and a stop-on-failure option; CLI upgrades support
 configurable parallel waves and stop-on-failure by default.
 
@@ -40,7 +39,7 @@ partially upgraded.
 ### 2. Safe upgrade orchestration
 
 - Add cryptographic signature verification where Cisco publishes a verifiable
-  signature, and retain the trusted-source checksum gate for each image.
+  signature, and keep checking each image against Cisco's published MD5 checksum.
 - Make pre-check results explicit and block upgrades on failed or stale checks.
 - Add controlled canary batch sizing, maintenance windows, approval gates, and
   a fleet-wide stop control. Per-site concurrency limits and stopping queued
