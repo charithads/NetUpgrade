@@ -2401,9 +2401,9 @@ SETTINGS_FILENAME = "settings.json"
 # profiles of the site are always kept. This used to be a switch on the Settings page; it is now fixed.
 FRESH_START = True
 SETTINGS_GROUPS = [
-    {"id": "rollout", "title": "Upgrade rollout",
+    {"id": "rollout", "title": "Upgrade Rollout",
      "intro": "How a batch of switches is upgraded. These apply to the whole dashboard, not to one site."},
-    {"id": "timeouts", "title": "Command timeouts",
+    {"id": "timeouts", "title": "Command Outputs",
      "intro": "How long the tool waits for a switch before it gives up. Raise a value when a production switch is slow "
               "to return a command's output or to save its configuration. The default is shown next to each value "
               "(click it to put the default back). A change applies to everything that starts after you save; an "
@@ -2429,31 +2429,31 @@ SETTINGS_ITEMS = [
      "type": "bool", "unit": "", "default": True},
     _t_item("ssh_connect", "Connection", "SSH connect and login",
             "Waiting for the TCP connection, the login prompt and the banner when the tool connects to a switch.", 5, 300),
-    _t_item("show_cmd", "Command output", "Show commands",
+    _t_item("show_cmd", "Command Outputs", "Show commands",
             "show version, show boot, show switch, dir flash: and show install summary.", 10, 1800),
-    _t_item("show_run", "Command output", "Backup: show running-config",
+    _t_item("show_run", "Command Outputs", "Backup: show running-config",
             "Large configurations on a busy switch can take minutes to print.", 30, 1800),
-    _t_item("backup_cmd", "Command output", "Backup: other commands",
+    _t_item("backup_cmd", "Command Outputs", "Backup: other commands",
             "Every other command saved by a backup, including the additional commands you list.", 10, 1800),
-    _t_item("snapshot_cmd", "Command output", "Pre-check and post-check snapshot commands",
+    _t_item("snapshot_cmd", "Command Outputs", "Pre-check and post-check snapshot commands",
             "The commands that capture the switch state before and after an upgrade.", 10, 1800),
-    _t_item("health_cmd", "Command output", "Health checks (CPU, memory, stack)",
+    _t_item("health_cmd", "Command Outputs", "Health checks (CPU, memory, stack)",
             "show processes cpu, show processes memory and show switch during the readiness check.", 5, 600),
-    _t_item("write_memory", "Saving and installing", "Saving the configuration (write memory)",
+    _t_item("write_memory", "Saving And Installing", "Saving the configuration (write memory)",
             "Used before and after the install steps. A switch with a large configuration can need several minutes.", 30, 1800),
-    _t_item("install_commit", "Saving and installing", "Install commit after the reload",
+    _t_item("install_commit", "Saving And Installing", "Install commit after the reload",
             "The install commit command that finishes the upgrade once the switch is back.", 30, 3600),
-    _t_item("md5_verify", "Saving and installing", "Image MD5 check on the switch (verify /md5)",
+    _t_item("md5_verify", "Saving And Installing", "Image MD5 check on the switch (verify /md5)",
             "Calculating the MD5 of the copied image on the switch's flash. Big images on slow flash take a while.", 60, 7200),
-    _t_item("install_total", "Saving and installing", "Whole install (add, activate, reload)",
+    _t_item("install_total", "Saving And Installing", "Whole install (add, activate, reload)",
             "How long the install may run before the tool reports a failure.", 600, 14400),
-    _t_item("clean_total", "Saving and installing", "Package clean-up (install remove inactive)",
+    _t_item("clean_total", "Saving And Installing", "Package clean-up (install remove inactive)",
             "How long removing inactive packages may take.", 300, 14400),
-    _t_item("reboot_down", "Reload and recovery", "Switch to stop answering ping",
+    _t_item("reboot_down", "Reload And Recovery", "Switch to stop answering ping",
             "After the install command, how long to wait for the switch to go down.", 60, 3600),
-    _t_item("reboot_up", "Reload and recovery", "Switch to answer ping again",
+    _t_item("reboot_up", "Reload And Recovery", "Switch to answer ping again",
             "How long to wait for the switch to come back. Stacks boot slowly.", 300, 7200),
-    _t_item("reboot_ssh", "Reload and recovery", "SSH to accept a login again",
+    _t_item("reboot_ssh", "Reload And Recovery", "SSH to accept a login again",
             "After it answers ping, how long to keep trying to log in.", 60, 3600),
 ]
 
@@ -2509,7 +2509,7 @@ def save_global_settings(values):
     tmp.replace(path)
 
 # --------------------------------------------------------------------------- #
-# Command duration profiles (Settings > Command timeouts). A profile is a named set of the command timeouts above.
+# Command duration profiles (Settings > Command Outputs). A profile is a named set of the command timeouts above.
 # "Default" is built in and always there; the others are kept in command_profiles.json next to the program.
 # Applying a profile copies its values into the settings (and saves them), so it works like typing them in.
 # The Command time test on the same page runs the preset commands below on one switch, times each of them and
@@ -2533,9 +2533,10 @@ _PRECHECK_STEPS = ([("show version", "show_cmd"), ("show boot", "show_cmd")]
 _POSTCHECK_STEPS = ([("show version", "show_cmd"), ("show processes cpu", "health_cmd"),
                      ("show processes memory", "health_cmd"), ("show switch", "health_cmd")]
                     + [(cmd, "snapshot_cmd") for _key, cmd in SNAPSHOT_COMMANDS])
-G_PRE, G_PREP, G_INST, G_POST = "1. Pre-check", "2. Prepare the switch", "3. Install", "4. Post-check"
+G_PRE, G_PREP, G_INST, G_INST1, G_POST = ("1. Pre-Check", "2. Prepare The Switch", "3. Install - Activate/Distribute",
+                                          "3. Install - Full Upgrade", "4. Post-Check")
 COMMAND_TEST_PRESETS = [
-    {"id": "precheck_bundle", "title": "Pre-check bundle", "command": "show version, show boot, snapshot and health commands",
+    {"id": "precheck_bundle", "title": "Pre-Check Bundle", "command": "show version, show boot, snapshot and health commands",
      "group": G_PRE, "kind": "bundle", "steps": _PRECHECK_STEPS,
      "desc": "Everything the upgrade reads before it changes anything. Each command and the total are timed."},
     {"id": "dir_flash", "title": "Check free space", "command": "dir flash:", "group": G_PREP, "kind": "command",
@@ -2575,14 +2576,14 @@ COMMAND_TEST_PRESETS = [
      "warn": "commits the activated image on {host}. Without it the switch rolls the activation back.",
      "desc": "Run it once the switch is back after the activation."},
     {"id": "install_full", "title": "Add, activate and commit (one command)",
-     "command": "install add file flash:<image> activate commit", "group": G_INST, "kind": "activate",
+     "command": "install add file flash:<image> activate commit", "group": G_INST1, "kind": "activate",
      "keys": ("install_total", "reboot_down", "reboot_up", "reboot_ssh"), "needs_image": True,
      "warn": "ADDS, ACTIVATES and COMMITS the selected image on {host} with ONE command and RELOADS it. The switch is "
              "offline for several minutes and everything connected to it loses connectivity.",
-     "desc": "The one-command path the upgrade normally uses. Use it INSTEAD of the three steps above (Add, Activate, "
+     "desc": "The one-command path the upgrade normally uses. Use it INSTEAD of the three-step path above (Add, Activate, "
              "Commit) - running both would upgrade the switch twice. After the reload the test checks the version and "
              "whether the image is committed."},
-    {"id": "postcheck_bundle", "title": "Post-check bundle", "command": "version, health and snapshot commands",
+    {"id": "postcheck_bundle", "title": "Post-Check Bundle", "command": "version, health and snapshot commands",
      "group": G_POST, "kind": "bundle", "steps": _POSTCHECK_STEPS,
      "desc": "What the upgrade checks after the reload. Each command and the total are timed."},
 ]
@@ -4815,7 +4816,7 @@ class Manager:
         return {"message": "Settings saved. They apply to everything that starts from now on; upgrades already "
                            "running keep the values they started with.", **self.settings_view()}
 
-    # ---- command duration profiles + command time test (Settings > Command timeouts) ------------ #
+    # ---- command duration profiles + command time test (Settings > Command Outputs) ------------ #
     def _current_timeouts(self):
         return {k: self.settings[k] for k in TIMEOUT_ITEMS}
 
@@ -6624,10 +6625,10 @@ class Manager:
             "border-top:1px solid #d5dce4;padding-top:8px}}button{{padding:6px 14px;margin:0 0 12px}}"
             "@media print{{button{{display:none}}body{{margin:8mm}}}}</style></head><body>"
             "<button onclick=\"window.print()\">Print / Save as PDF</button>"
-            "<h1>{app} - upgrade report</h1>"
+            "<h1>{app} - Upgrade Report</h1>"
             "<p class=\"sub\">Site: <b>{site}</b> &nbsp;|&nbsp; Generated {now} by {who} &nbsp;|&nbsp; v{ver}</p>"
             "<div class=\"tiles\">{tiles}</div>"
-            "<h2>Current status</h2>{t1}<h2>History (latest 100 runs)</h2>{t2}"
+            "<h2>Current Status</h2>{t1}<h2>History (Latest 100 Runs)</h2>{t2}"
             "<p class=\"foot\">Developed by <b>{author}</b> | <a href=\"{repo}\">GitHub</a></p></body></html>"
         ).format(app=e(APP_NAME), site=e(self.site_name or ""), now=datetime.now().strftime("%Y-%m-%d %H:%M"),
                  who=e(generated_by), ver=e(APP_VERSION), tiles=tiles,
@@ -6801,6 +6802,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ib:hover { background:var(--acs); }
   .mstate { font-size:12px; font-weight:600; padding:5px 13px; border-radius:999px; background:var(--t-a);
             color:var(--c-a); border:1px solid var(--c-a); white-space:nowrap; }
+  .mdot { width:11px; height:11px; border-radius:50%; background:var(--mu); flex:none; margin-right:-4px; }
+  .mdot.running { background:var(--gr); animation:mon-blink 1.3s ease-in-out infinite; }
+  @keyframes mon-blink { 0% { box-shadow:0 0 0 0 rgba(34,170,90,.65); opacity:1; } 50% { opacity:.45; }
+                         100% { box-shadow:0 0 0 9px rgba(34,170,90,0); opacity:1; } }
+  @media (prefers-reduced-motion:reduce) { .mdot.running { animation:none; } }
+  .mainmsg { margin:0 0 10px; } .mainmsg:has(#msg:empty) { display:none; } .mainmsg .msg { margin:0; }
   .mstate.running { background:var(--t-gn); color:var(--gr); border-color:var(--gr); }
 
   /* site badge + dropdown */
@@ -7329,7 +7336,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .img-table { min-width:0; margin-top:10px; }
   .img-table td, .img-table th { padding:7px 8px; }
 
-  /* ---- command duration profiles + command time test (Settings > Command timeouts) ---- */
+  /* ---- command duration profiles + command time test (Settings > Command Outputs) ---- */
   .tp-bar, .ct-card { border:1px solid var(--bd); border-radius:10px; background:var(--pn2); margin:14px 0 4px; padding:12px 14px; max-width:1280px; }
   .tp-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
   .tp-row + .tp-row { margin-top:10px; }
@@ -7367,6 +7374,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ct-rs.open .ct-car { transform:none; }
   .ct-r { display:flex; align-items:center; gap:9px; width:100%; background:none; border:0; border-radius:7px; padding:7px 8px; font:inherit; font-size:13px; color:var(--tx); cursor:pointer; text-align:left; }
   .ct-r:hover { background:var(--pn2); }
+  .ct-rs.off .ct-r, .ct-rs.off .ct-rs-h { opacity:.5; }
   .ct-r.sel { background:var(--acs); box-shadow:inset 3px 0 0 var(--ac); font-weight:600; }
   .ct-r-t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .ct-r-v { font-size:11.5px; font-weight:400; color:var(--mu); font-variant-numeric:tabular-nums; white-space:nowrap; }
@@ -7459,6 +7467,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </nav>
   <span class="sp"></span>
   <span class="lost" id="lost"></span>
+  <span class="mdot" id="mon-dot" role="img" aria-label="Monitoring status" title="Monitoring status"></span>
   <span id="state" class="mstate">Monitor starting</span>
   <button class="btn p" id="btn-mon" style="padding:7px 14px">Start monitoring</button>
   <span class="notemenu"><button class="ib" id="btn-bell" title="Notifications - upgrades started and completed" aria-haspopup="true" aria-expanded="false" style="position:relative"><span data-i="bell"></span><span class="nbadge" id="bell-count" hidden>0</span></button><div class="note-pop" id="note-pop" role="dialog" aria-label="Notifications" hidden><div class="nh"><span>Notifications</span><span><button type="button" id="note-sound" title="Play a sound for new alerts (not for logins)">Sound: on</button> <button type="button" id="note-clear">Clear all</button></span></div><div class="nl" id="note-list"></div></div></span>
@@ -7472,7 +7481,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="sh"><button class="cb" id="btn-collapse" title="Collapse panel"><span data-i="menu"></span></button><span class="shl">Upgrade Manager</span></div>
 
     <div class="sec" data-sec="1">
-      <h3 tabindex="0" role="button" title="Device list"><span data-i="1"></span><span class="lbl">Device list</span><span class="ch" data-i="dn"></span></h3>
+      <h3 tabindex="0" role="button" title="Device List"><span data-i="1"></span><span class="lbl">Device List</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
         <div class="msg" id="msg-1" role="status" aria-live="polite"></div>
         <div class="note" style="margin-top:0" id="device-count">No devices loaded yet.</div>
@@ -7491,7 +7500,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="sec" data-sec="2">
-      <h3 tabindex="0" role="button" title="Credential profiles"><span data-i="2"></span><span class="lbl">Credential profiles</span><span class="ch" data-i="dn"></span></h3>
+      <h3 tabindex="0" role="button" title="Credential Profiles"><span data-i="2"></span><span class="lbl">Credential Profiles</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
         <div class="msg" id="msg-2" role="status" aria-live="polite"></div>
         <label for="prof-assign">Use this profile for the selected devices</label>
@@ -7518,7 +7527,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="sec" data-sec="3">
-      <h3 tabindex="0" role="button" title="Configuration backup"><span data-i="3"></span><span class="lbl">Configuration backup</span><span class="ch" data-i="dn"></span></h3>
+      <h3 tabindex="0" role="button" title="Configuration Backup"><span data-i="3"></span><span class="lbl">Configuration Backup</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
         <div class="msg" id="msg-3" role="status" aria-live="polite"></div>
         <label for="custom-commands" style="margin-top:0">Additional commands (optional)</label>
@@ -7530,7 +7539,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="sec o" data-sec="4">
-      <h3 tabindex="0" role="button" title="Firmware upgrade"><span data-i="4"></span><span class="lbl">Firmware upgrade</span><span class="ch" data-i="dn"></span></h3>
+      <h3 tabindex="0" role="button" title="Firmware Upgrade"><span data-i="4"></span><span class="lbl">Firmware Upgrade</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
         <div class="msg" id="msg-4" role="status" aria-live="polite"></div>
         <label for="image-select" id="image-select-label" style="margin-top:0">Select image to install<span class="tip" data-tip="To add an image, open Storage and use IOS-XE images (upload + MD5 check). Rollout options (switches at the same time, stop on failure) and command timeouts are in Settings (gear icon)."></span></label>
@@ -7555,20 +7564,25 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
+    <div class="sec" data-sec="5">
+      <h3 tabindex="0" role="button" title="Reports"><span data-i="5"></span><span class="lbl">Reports</span><span class="ch" data-i="dn"></span></h3>
+      <div class="body">
+        <label for="rep-type">Report Type</label>
+        <select id="rep-type">
+          <option value="xlsx">Excel (.xlsx)</option>
+          <option value="pdf">Print / PDF</option>
+          <option value="csv">CSV (.csv)</option>
+        </select>
+        <p class="muted" id="rep-desc" style="margin:6px 0 10px"></p>
+        <button type="button" class="btn p" id="rep-go" style="width:100%">Generate</button>
+      </div>
+    </div>
   </aside>
 
   <main>
-    <div class="fbar">
-      <span class="ftext"><span id="p-text">Waiting for first check...</span><span id="p-cycles"></span></span>
-      <span id="meta"></span>
-      <span class="sp"></span>
-      <span class="msg" id="msg" role="status" aria-live="polite"></span>
-      <span class="repbtns">
-        <a class="btn p" href="/api/upgrade-report.xlsx" title="Excel report: summary, current status and full run history">Report (Excel)</a>
-        <a class="btn" href="/api/upgrade-report/print" target="_blank" rel="noopener" title="Printable page - use Print, then Save as PDF">Print / PDF</a>
-        <a class="btn" href="/api/upgrade-report.csv">CSV</a>
-      </span>
-      <div class="pbar"><div id="p-bar"></div></div>
+    <div class="mainmsg"><span class="msg" id="msg" role="status" aria-live="polite"></span></div>
+    <div hidden>
+      <span id="p-text"></span><span id="p-cycles"></span><span id="meta"></span><div id="p-bar"></div>
     </div>
 
     <div class="wg">
@@ -7632,7 +7646,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <thead><tr>
               <th class="ck"><input type="checkbox" id="sel-all" title="Select all shown"></th>
               <th>Switch</th><th class="c-platform">Platform</th><th class="c-status">Status</th><th class="c-creds">Credentials</th><th class="c-ready">Readiness</th>
-              <th class="c-version">Software version</th><th class="c-boot" title="Running mode (INSTALL / BUNDLE) and the boot variable">Boot mode</th><th class="c-backup">Backup</th><th class="c-stage" title="Where the firmware image is on this switch: distributed to flash, being activated, or upgraded">Image stage</th><th class="c-upgrade">Firmware upgrade</th><th class="c-post">Post-check</th><th class="rc c-recent">Recent checks</th>
+              <th class="c-version">Software Version</th><th class="c-boot" title="Running mode (INSTALL / BUNDLE) and the boot variable">Boot Mode</th><th class="c-backup">Backup</th><th class="c-stage" title="Where the firmware image is on this switch: distributed to flash, being activated, or upgraded">Image Stage</th><th class="c-upgrade">Firmware Upgrade</th><th class="c-post">Post-Check</th><th class="rc c-recent">Recent Checks</th>
             </tr></thead>
             <tbody id="rows"></tbody>
           </table>
@@ -7650,7 +7664,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </aside>
   <main>
     <div class="card img-card" id="img-card">
-      <h4>IOS-XE images<span class="tip" data-tip="Images are saved in the IOS Images folder next to the program and used by Firmware upgrade. Paste the MD5 checksum from Cisco's download page: the upload is rejected if the file does not match it."></span>
+      <h4>IOS-XE Images<span class="tip" data-tip="Images are saved in the IOS Images folder next to the program and used by Firmware upgrade. Paste the MD5 checksum from Cisco's download page: the upload is rejected if the file does not match it."></span>
         <span class="a"><button type="button" class="btn sm" id="img-refresh">Refresh</button></span></h4>
       <div class="img-body">
         <div class="img-form">
@@ -7731,7 +7745,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <div id="site-modal" class="modal" hidden>
   <div class="modal-card" role="dialog" aria-labelledby="site-modal-title">
-    <h2 id="site-modal-title">Create new site</h2>
+    <h2 id="site-modal-title">Create New Site</h2>
     <label for="site-new">Site name</label>
     <input type="text" id="site-new" placeholder="e.g. Chicago-HQ, Customer 12 ..." maxlength="100" autocomplete="off">
     <div class="msg" id="site-msg" role="status" aria-live="polite" style="margin-top:8px"></div>
@@ -7787,6 +7801,7 @@ const IC = {
   1: I('<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>'),
   2: I('<circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M16 7l3 3M14 9l2 2"/>'),
   3: I('<ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6M4 11.5v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>'),
+  5: I('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>'),
   4: I('<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>'),
   sun: I('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
   moon: I('<path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/>'),
@@ -8164,6 +8179,7 @@ function render(d) {
 
   const m = d.monitor;
   const st = $("state"); st.textContent = "Monitor " + m.state; st.className = "mstate " + m.state;
+  const md = $("mon-dot"); md.className = "mdot " + m.state;
   $("meta").textContent = "Check: " + m.mode + " every " + m.interval + "s" + (m.started_at ? "  |  started " + m.started_at : "");
   $("btn-mon").textContent = m.state === "running" ? "Stop monitoring" : "Start monitoring";
   $("btn-mon").className = "btn" + (m.state === "running" ? "" : " p");
@@ -8198,6 +8214,10 @@ function render(d) {
       : "Monitoring is " + m.state;
   }
   $("p-cycles").textContent = m.cycles + " check cycles";
+  { // static text only (no timers or counters): a title that changes every poll makes the browser tooltip flicker
+    const tip = "Monitoring is " + m.state + " - Check: " + m.mode + " every " + m.interval + "s";
+    const md2 = $("mon-dot");
+    if (md2.title !== tip) { md2.title = tip; md2.setAttribute("aria-label", tip); $("state").title = tip; } }
 
   fillProfileLists(d);
   syncNotes(d);
@@ -9089,7 +9109,7 @@ let openSec = 4, collapsed = false;
 try {
   if (localStorage.getItem("col") === "1") collapsed = true;
   const so = localStorage.getItem("open");
-  if (so === "none") openSec = null; else if (so !== null && [1, 2, 3, 4].includes(+so)) openSec = +so;
+  if (so === "none") openSec = null; else if (so !== null && [1, 2, 3, 4, 5].includes(+so)) openSec = +so;
 } catch (e) {}
 function layoutSide() {
   const side = $("side");
@@ -9104,6 +9124,16 @@ function layoutSide() {
 }
 function openSection(n) { collapsed = false; openSec = n; layoutSide(); }
 $("btn-collapse").addEventListener("click", () => { collapsed = !collapsed; layoutSide(); });
+const REP_TYPES = {
+  xlsx: {url: "/api/upgrade-report.xlsx", desc: "Excel workbook: summary, current status and the full run history."},
+  pdf: {url: "/api/upgrade-report/print", blank: true, desc: "Printable page - use Print, then Save as PDF."},
+  csv: {url: "/api/upgrade-report.csv", desc: "Plain CSV file of the current status."}};
+function repSync() { $("rep-desc").textContent = REP_TYPES[$("rep-type").value].desc; }
+$("rep-type").addEventListener("change", repSync); repSync();
+$("rep-go").addEventListener("click", () => {
+  const t = REP_TYPES[$("rep-type").value];
+  if (t.blank) window.open(t.url, "_blank", "noopener"); else window.location.href = t.url;
+});
 document.querySelectorAll(".sec > h3").forEach(h => {
   const n = +h.parentNode.dataset.sec;
   const act = () => { if (collapsed) openSection(n); else { openSec = openSec === n ? null : n; layoutSide(); } };
@@ -9465,13 +9495,13 @@ $("set-save").addEventListener("click", async () => {
 });
 
 // ============================================================================================
-// Command duration profiles + Command time test (Settings > Command timeouts).
+// Command duration profiles + Command time test (Settings > Command Outputs).
 //  - Profiles: named sets of the command timeouts. "Default" is built in. Apply copies a profile into the settings.
 //  - Command time test: run the preset commands on one switch with the Execute buttons, see each result and note
 //    the time it took. The numbers can become a report (CSV / printable page) or a new profile.
 // ============================================================================================
 const TP = {data: null, sel: "Default", form: false};
-const CT = {open: false, host: null, image: "", results: {}, outs: {}, running: null, margin: 3, keepDefault: true, form: false, sel: null, railClosed: {}};
+const CT = {open: false, host: null, image: "", results: {}, outs: {}, running: null, margin: 3, keepDefault: true, form: false, sel: null, railClosed: {}, path: "three"};
 try {
   const saved = JSON.parse(localStorage.getItem("ct") || "null");
   if (saved && typeof saved === "object") {
@@ -9658,18 +9688,21 @@ function ctSelected(presets) {            // the step shown on the right: your c
   if (!presets.some(p => p.id === CT.sel)) CT.sel = (presets.find(p => !ctStepDone(p)) || presets[0]).id;
   return presets.find(p => p.id === CT.sel);
 }
+const CT_PATH_GROUP = {"3. Install - Activate/Distribute": "three", "3. Install - Full Upgrade": "one"};
+function ctPathOff(g) { return !!CT_PATH_GROUP[g] && CT_PATH_GROUP[g] !== CT.path; }   // the install path you did not choose
 function ctRailHtml(presets) {
   const busy = !!CT.running && CT.running.host === CT.host;
   let html = "", num = 0;
   for (const g of [...new Set(presets.map(p => p.group))]) {
     const steps = presets.filter(p => p.group === g), open = !CT.railClosed[g], done = steps.filter(ctStepDone).length;
-    html += '<div class="ct-rs' + (open ? " open" : "") + '"><button type="button" class="ct-rs-h" data-ct="stage" data-g="' + esc(g) + '" aria-expanded="' + open + '">' +
+    const off = ctPathOff(g);
+    html += '<div class="ct-rs' + (open ? " open" : "") + (off ? " off" : "") + '"><button type="button" class="ct-rs-h" data-ct="stage" data-g="' + esc(g) + '" aria-expanded="' + open + '">' +
       '<span class="ct-car">' + IC.dn + '</span><span>' + esc(g) + '</span><span class="ct-rs-c">' + done + "/" + steps.length + "</span></button>";
     for (const p of steps) {
       num++;
       if (!open) continue;
       const st = ctStats(ctRuns(CT.host, p.id)), running = busy && CT.running.id === p.id;
-      const cls = (p.id === CT.sel ? " sel" : "") + (running ? " run" : st.last ? (ctStepDone(p) ? " done" : " bad") : "");
+      const cls = (off ? " off" : "") + (p.id === CT.sel ? " sel" : "") + (running ? " run" : st.last ? (ctStepDone(p) ? " done" : " bad") : "");
       html += '<button type="button" class="ct-r' + cls + '" data-ct="sel" data-id="' + esc(p.id) + '" title="' + esc(p.title) + '"><span class="ct-n">' + (ctStepDone(p) && !running ? "&#10003;" : num) + '</span>' +
         '<span class="ct-r-t">' + esc(p.title) + '</span><span class="ct-r-v">' + (running ? Math.round(CT.running.elapsed) + " s" : st.max != null ? fmtS(st.max) + " s" : "") + "</span></button>";
     }
@@ -9684,7 +9717,7 @@ function ctDetailHtml(p, num, total) {
     (p.needs_image && !CT.image ? '<span class="ct-badge n">choose an image above</span>' : "");
   const act = running ? '<button type="button" class="btn dg" data-ct="stop"' + (CT.running.stopping ? " disabled" : "") + ">" + (CT.running.stopping ? "Stopping ..." : "Stop") + "</button>"
     : '<button type="button" class="btn p" data-ct="run" data-id="' + esc(p.id) + '"' + (busy ? " disabled" : "") + ">Execute</button>";
-  const idx = TP.data.presets.findIndex(x => x.id === p.id), nxt = TP.data.presets[idx + 1];
+  const idx = TP.data.presets.findIndex(x => x.id === p.id), nxt = TP.data.presets.slice(idx + 1).find(x => !ctPathOff(x.group));
   const chips = p.keys.length ? p.keys.map(k => '<span class="ct-chip">' + esc(ctFeeds([k])) + "</span>").join("") : '<span class="ct-chip">no timeout setting - for your information</span>';
   const body = running ? '<div class="ct-panel" id="ct-live">' + ctLiveHtml() + "</div>"
     : CT.outs[key] ? '<div class="ct-panel">' + ctOutHtml(CT.outs[key]) + "</div>"
@@ -9719,7 +9752,7 @@ function ctRender() {
         '<button type="button" class="btn sm" data-ct="stages" data-v="1">Expand all</button><button type="button" class="btn sm" data-ct="stages" data-v="0">Collapse all</button>' +
         '<button type="button" class="btn sm" data-ct="clear"' + (busy ? " disabled" : "") + ">Clear results</button></div></div>";
       html += '<div class="ct-wb"><nav class="ct-rail" aria-label="Steps">' + ctRailHtml(presets) + '</nav><div class="ct-main">' + ctDetailHtml(p, num, presets.length) + '<div id="cc-slot"></div></div></div>';
-      html += '<div class="ct-result"><div class="ct-result-t">Results and profile</div><div class="ct-result-g"><div id="ct-sugg-t"></div><div class="ct-side">' +
+      html += '<div class="ct-result"><div class="ct-result-t">Results And Profile</div><div class="ct-result-g"><div id="ct-sugg-t"></div><div class="ct-side">' +
         '<div class="ct-sg-h"><label for="ct-margin">Safety margin &times;<span class="tip" data-tip="The suggested timeout is the slowest measured time multiplied by this number, rounded up to 5 seconds. A switch is slower during a busy upgrade than during your test, so keep some room (3 is a good start)."></span></label>' +
         '<input type="number" id="ct-margin" min="1" max="20" step="0.5" value="' + CT.margin + '">' +
         '<label class="chk"><input type="checkbox" id="ct-keep"' + (CT.keepDefault ? " checked" : "") + '><span>Never go below the default</span></label></div>' +
@@ -9823,14 +9856,14 @@ function ctPrint() {
     "body{font:14px/1.45 Segoe UI,Arial,sans-serif;margin:28px;color:#111}h1{font-size:21px;margin:0 0 4px}h2{font-size:15px;margin:22px 0 4px}" +
     "table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #bbb;padding:6px 9px;text-align:left}th{background:#eef1f5}" +
     ".m{color:#555;font-size:13px}button{padding:7px 14px;margin-bottom:14px}@media print{.np{display:none}}</style></head><body>" +
-    '<button class="np" onclick="window.print()">Print / Save as PDF</button><h1>Command time test report</h1>' +
+    '<button class="np" onclick="window.print()">Print / Save as PDF</button><h1>Command Time Test Report</h1>' +
     '<div class="m">' + esc(d.when) + " | NetUpgrade " + esc(d.ver) + (d.site ? " | Site: " + esc(d.site) : "") + "</div>" +
     "<h2>Switch</h2><table>" + tr(["Address", d.host.host]) + tr(["Name", d.host.label || ""]) + tr(["Platform", d.host.platform || ""]) + tr(["Software version", d.host.version || ""]) + tr(["Image tested with", d.image || ""]) + "</table>" +
-    "<h2>Measured step times</h2><table>" + th(["Stage", "Step", "Feeds this timeout", "Runs", "Last (s)", "Slowest (s)", "Average (s)", "Last result"]) +
+    "<h2>Measured Step Times</h2><table>" + th(["Stage", "Step", "Feeds this timeout", "Runs", "Last (s)", "Slowest (s)", "Average (s)", "Last result"]) +
     d.cmds.map(c => tr([c.group, c.command, c.feeds, c.n, fmtS(c.last), fmtS(c.max), fmtS(c.avg), c.status])).join("") + "</table>" +
     d.details.map(b => "<h2>" + esc(b.name) + " - detail</h2><table>" + th(["Measured", "Runs", "Last (s)", "Slowest (s)", "Average (s)"]) +
       b.parts.map(x => tr([x.command, x.n, fmtS(x.lastS), fmtS(x.max), fmtS(x.avg)])).join("") + "</table>").join("") +
-    "<h2>Suggested timeouts</h2><div class=\"m\">Slowest measured time x " + CT.margin + ", rounded up to 5 seconds" + (CT.keepDefault ? ", never below the default" : "") + ". 'Whole install' is the add step plus the activation.</div><table>" +
+    "<h2>Suggested Timeouts</h2><div class=\"m\">Slowest measured time x " + CT.margin + ", rounded up to 5 seconds" + (CT.keepDefault ? ", never below the default" : "") + ". 'Whole install' is the add step plus the activation.</div><table>" +
     th(["Timeout setting", "Slowest measured (s)", "Default (s)", "Suggested (s)"]) + d.sg.rows.map(r => tr([r.item.label, fmtS(r.measured), r.def, r.value])).join("") + "</table></body></html>";
   const url = URL.createObjectURL(new Blob([html], {type: "text/html"}));
   if (!window.open(url, "_blank")) setSay("err", "The browser blocked the report window. Allow pop-ups for this page, or use the CSV download.");
@@ -9973,8 +10006,9 @@ $("set-body").addEventListener("click", e => {
     case "toggle": CT.open = !CT.open; ctRender(); break;
     case "run": ctRun(c.dataset.id); break;
     case "stop": ctStop(); break;
-    case "sel": CT.sel = c.dataset.id; ctRender(); break;
-    case "next": { const ps = TP.data.presets, i = ps.findIndex(x => x.id === CT.sel); if (ps[i + 1]) { CT.sel = ps[i + 1].id; CT.railClosed[ps[i + 1].group] = false; ctRender(); } break; }
+    case "sel": { CT.sel = c.dataset.id; const sp = TP.data.presets.find(x => x.id === CT.sel); if (sp && CT_PATH_GROUP[sp.group]) CT.path = CT_PATH_GROUP[sp.group]; ctRender(); break; }
+    case "next": { const ps = TP.data.presets, i = ps.findIndex(x => x.id === CT.sel); let j = i + 1; while (ps[j] && ctPathOff(ps[j].group)) j++;
+      if (ps[j]) { CT.sel = ps[j].id; CT.railClosed[ps[j].group] = false; ctRender(); } break; }
     case "stage": CT.railClosed[c.dataset.g] = !CT.railClosed[c.dataset.g]; ctRender(); break;
     case "stages": { for (const g of new Set(TP.data.presets.map(p => p.group))) CT.railClosed[g] = c.dataset.v !== "1"; ctRender(); break; }
     case "clear": if (confirm("Clear the measured times of " + CT.host + "?")) {
