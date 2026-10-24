@@ -8090,6 +8090,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .st-table { min-width:640px; }
   .st-table th.sortable { cursor:pointer; user-select:none; }
   .st-table th.sortable:hover { color:var(--tx); }
+  #dev-table th[data-sort] { cursor:pointer; user-select:none; }
+  #dev-table th[data-sort]:hover { color:var(--tx); }
+  #dev-table th[data-sort].sorted { color:var(--tx); }
   .st-table td { white-space:nowrap; }
   .st-table td.nm { width:100%; max-width:0; overflow:hidden; text-overflow:ellipsis; }
   .st-table td.act { text-align:right; }
@@ -8519,8 +8522,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <table id="dev-table">
             <thead><tr>
               <th class="ck"><input type="checkbox" id="sel-all" title="Select all shown"></th>
-              <th>Switch</th><th class="c-platform">Platform</th><th class="c-status">Status</th><th class="c-creds">Credentials</th><th class="c-ready">Readiness</th>
-              <th class="c-version">Software Version</th><th class="c-boot" title="Running mode (INSTALL / BUNDLE) and the boot variable">Boot Mode</th><th class="c-backup">Backup</th><th class="c-stage" title="Where the firmware image is on this switch: distributed to flash, being activated, or upgraded">Image Stage</th><th class="c-upgrade">Firmware Upgrade</th><th class="c-post">Post-Check</th><th class="rc c-recent">Recent Checks</th>
+              <th data-sort="host">Switch</th><th class="c-platform" data-sort="platform">Platform</th><th class="c-status" data-sort="status">Status</th><th class="c-creds" data-sort="creds">Credentials</th><th class="c-ready" data-sort="ready">Readiness</th>
+              <th class="c-version" data-sort="version">Software Version</th><th class="c-boot" data-sort="boot" title="Running mode (INSTALL / BUNDLE) and the boot variable">Boot Mode</th><th class="c-backup" data-sort="backup">Backup</th><th class="c-stage" data-sort="stage" title="Where the firmware image is on this switch: distributed to flash, being activated, or upgraded">Image Stage</th><th class="c-upgrade" data-sort="upgrade">Firmware Upgrade</th><th class="c-post" data-sort="post">Post-Check</th><th class="rc c-recent">Recent Checks</th>
             </tr></thead>
             <tbody id="rows"></tbody>
           </table>
@@ -9051,8 +9054,83 @@ function hostMatches(h) {
   }
   return true;
 }
+const DSORT = {key: null, dir: 1};
+const SORT_ORDER = {status: {UP: 0, DOWN: 1}};
+function sortValue(h, k) {
+  const st = o => String((o && o.state) || "");
+  switch (k) {
+    case "host": return String(h.label || h.host || "");
+    case "platform": return String(h.platform || "");
+    case "status": return String(h.status || "");
+    case "creds": return st(h.creds);
+    case "ready": return st(h.readiness);
+    case "version": return String(h.version || "");
+    case "boot": return String((h.boot && h.boot.mode) || "");
+    case "backup": return st(h.backup);
+    case "stage": return String(h.stage || "");
+    case "upgrade": return upgradeKey(h);
+    case "post": return st(h.postcheck);
+  }
+  return "";
+}
+function sortHosts(list) {
+  if (!DSORT.key) return list;
+  const k = DSORT.key, dir = DSORT.dir;
+  const cmp = new Intl.Collator(undefined, {numeric: true, sensitivity: "base"});
+  return list.map((h, i) => [h, i, sortValue(h, k)]).sort((a, b) => {
+    const ae = a[2] === "", be = b[2] === "";
+    if (ae !== be) return ae ? 1 : -1;               // empty values always last
+    return cmp.compare(a[2], b[2]) * dir || a[1] - b[1];
+  }).map(x => x[0]);
+}
+function syncSortHeaders() {
+  document.querySelectorAll("#dev-table th[data-sort]").forEach(th => {
+    th.querySelectorAll(".sort-ind").forEach(e => e.remove());
+    const on = th.dataset.sort === DSORT.key;
+    th.classList.toggle("sorted", on);
+    th.setAttribute("aria-sort", on ? (DSORT.dir > 0 ? "ascending" : "descending") : "none");
+    if (on) {
+      const sp = document.createElement("span");
+      sp.className = "sort-ind";
+      sp.textContent = DSORT.dir > 0 ? " \u25B2" : " \u25BC";
+      th.appendChild(sp);
+    }
+  });
+}
+document.querySelectorAll("#dev-table th[data-sort]").forEach(th => {
+  th.addEventListener("click", () => {
+    const k = th.dataset.sort;
+    if (DSORT.key !== k) { DSORT.key = k; DSORT.dir = 1; }
+    else if (DSORT.dir === 1) DSORT.dir = -1;
+    else { DSORT.key = null; DSORT.dir = 1; }     // third click clears the sort
+    syncSortHeaders();
+    if (last) render(last);
+  });
+});
+// Download the device-list template through the page's own connection. A plain <a download> makes the
+// browser open a SECOND connection from its download manager, which can fail with "Network issue"
+// (e.g. over HTTPS with a self-signed certificate). If the in-page fetch fails, fall back to the plain link.
+$("btn-device-template").addEventListener("click", async e => {
+  e.preventDefault();
+  const a = e.currentTarget;
+  try {
+    let r = null;
+    for (let i = 0; i < 3 && !(r && r.ok); i++) {
+      try { r = await fetch(a.getAttribute("href"), {cache: "no-store", credentials: "same-origin"}); } catch (_) { r = null; }
+      if (!(r && r.ok)) await new Promise(res => setTimeout(res, 400));
+    }
+    if (!(r && r.ok)) throw new Error("download failed");
+    const url = URL.createObjectURL(await r.blob());
+    const t = document.createElement("a");
+    t.href = url; t.download = "device_list_template.xlsx";
+    document.body.appendChild(t); t.click(); t.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (_) {
+    window.location.href = a.getAttribute("href");
+  }
+});
 function visibleHosts() {
-  return last ? last.hosts.filter(hostMatches) : [];
+  return last ? sortHosts(last.hosts.filter(hostMatches)) : [];
 }
 function syncDevFilters(d) {
   const plats = [...new Set(d.hosts.map(h => h.platform).filter(Boolean))].sort();
