@@ -96,7 +96,7 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.10.1"          # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "5.11.0"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 APP_ICON_DATA_URI = (
@@ -269,8 +269,57 @@ class RecordedSession(object):
         return self._conn.__exit__(*exc)
 
 
+# Switches whose credential profile says Telnet: {ip: "telnet"}. Every other switch uses SSH. It is refreshed from the
+# profile each time credentials are looked up, so one place (the ConnectHandler below) switches every connection - backup,
+# credential test, readiness, topology, commands - between SSH and Telnet.
+HOST_PROTOCOL = {}
+HOST_PORT = {}      # {ip: port} - only when the credential profile uses a non-default port (SSH 22 / Telnet 23)
+
+
+def default_port(protocol):
+    return 23 if protocol == "telnet" else 22
+
+
+def clean_port(value, protocol="ssh"):
+    """Port typed in the profile form -> int. Empty means the protocol's default. Raises ValueError when invalid."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default_port(protocol)
+    if isinstance(value, bool):
+        raise ValueError("Enter a port number between 1 and 65535.")
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError("Enter a port number between 1 and 65535.")
+    if not 1 <= port <= 65535:
+        raise ValueError("Enter a port number between 1 and 65535.")
+    return port
+
+
+def set_host_protocol(host, protocol, port=None):
+    if protocol == "telnet":
+        HOST_PROTOCOL[str(host)] = "telnet"
+    else:
+        HOST_PROTOCOL.pop(str(host), None)
+    try:
+        port = int(port) if port else 0
+    except (TypeError, ValueError):
+        port = 0
+    if port and port != default_port(protocol):
+        HOST_PORT[str(host)] = port
+    else:
+        HOST_PORT.pop(str(host), None)
+
+
 def ConnectHandler(*args, **kwargs):  # noqa: N802 - same name on purpose: every call site records its commands
     host = kwargs.get("host") or kwargs.get("ip") or ""
+    if HOST_PROTOCOL.get(str(host)) == "telnet":                       # cisco_xe -> cisco_xe_telnet, port 23
+        dtype = str(kwargs.get("device_type") or "cisco_xe")
+        dtype = dtype[:-4] if dtype.endswith("_ssh") else dtype
+        if not dtype.endswith("_telnet"):
+            kwargs["device_type"] = dtype + "_telnet"
+        kwargs.setdefault("port", 23)
+    if HOST_PORT.get(str(host)):                                        # profile asks for a non-default port
+        kwargs["port"] = HOST_PORT[str(host)]
     kwargs["conn_timeout"] = kwargs["auth_timeout"] = kwargs["banner_timeout"] = tmo("ssh_connect")
     started = time.time()
     try:
@@ -2129,6 +2178,7 @@ def job_main(job_path):
     set_console_title('Upgrade {} ({})'.format(device['name'], device['ipaddr']))
     creds = (job['username'], job['password'], job.get('secret') or None)
     del job['password']
+    set_host_protocol(job['ip'], 'ssh', job.get('port'))
 
     action = job.get('action') or 'full'          # 'full' (default) | 'distribute' | 'activate'
     ignore_space = bool(job.get('ignore_space'))  # operator chose to bypass the flash space check
@@ -2409,6 +2459,10 @@ SETTINGS_GROUPS = [
               "(click it to put the default back). A change applies to everything that starts after you save; an "
               "upgrade that is already running keeps the values it started with. Command duration profiles "
               "keep named sets of these values, and the Command time test can measure a switch to build one."},
+    {"id": "notifications", "title": "Notifications",
+     "intro": "E-mail copies of the notifications shown under the bell icon. Off until you switch it on. Gmail: "
+              "smtp.gmail.com, port 587 (STARTTLS) and an App password (2-Step Verification > App passwords) - "
+              "your normal password will not work. The password is stored encrypted and is never shown again."},
 ]
 
 
@@ -3232,8 +3286,9 @@ class EventLog:
 # Excel loading
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
-# E-mail notifications. Optional and OFF until switched on in the launcher's "Notifications"
-# tab (the launcher puts the settings in access["email"]; see gui_main). Every dashboard
+# E-mail notifications. Optional and OFF until switched on in the dashboard's Settings page
+# (gear icon > Notifications). They are saved in email_settings.json next to the program, the
+# password encrypted. Every dashboard
 # notification goes through Manager._notify, which hands a copy to EMAILER; the e-mail is
 # sent from a background thread so a slow mail server can never slow down an upgrade.
 # --------------------------------------------------------------------------- #
@@ -3241,6 +3296,50 @@ EMAIL_BATCH_SECONDS = 20          # events close together are combined into ONE 
 EMAIL_MAX_RECIPIENTS = 20
 EMAIL_SUBJECT_PREFIX = "[NetUpgrade]"
 _EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
+
+
+EMAIL_SETTINGS_FILENAME = "email_settings.json"
+EMAIL_KINDS = [        # (key, label shown in Settings, ticked by default) - must match the categories Manager._notify sends
+    ("started", "Started", False),
+    ("completed", "Completed", True),
+    ("failed", "Failed", True),
+    ("attention", "Needs attention", True),
+    ("postcheck", "Post-check result", True),
+    ("missed", "Schedule missed", True),
+    ("login", "Sign-ins", False),
+]
+EMAIL_PROBLEM_KINDS = ("failed", "attention", "missed")
+EMAIL_SECURITY = {"starttls": "STARTTLS (port 587)", "ssl": "SSL (port 465)"}
+EMAIL_DEFAULTS = {"enabled": False, "host": "smtp.gmail.com", "port": 587, "security": "starttls",
+                  "username": "", "password_enc": "", "to": "",
+                  "kinds": [k for k, _label, on in EMAIL_KINDS if on]}
+
+
+def email_settings_path():
+    return this_program_path().parent / EMAIL_SETTINGS_FILENAME
+
+
+def load_email_settings():
+    """The saved e-mail settings, always complete and valid in shape (a damaged file gives the defaults)."""
+    cfg = dict(EMAIL_DEFAULTS)
+    data = read_json_file(email_settings_path())
+    if isinstance(data, dict):
+        for key in EMAIL_DEFAULTS:
+            if key in data:
+                cfg[key] = data[key]
+    cfg["enabled"] = bool(cfg["enabled"])
+    cfg["kinds"] = [k for k in (cfg["kinds"] if isinstance(cfg["kinds"], list) else [])
+                    if k in [x[0] for x in EMAIL_KINDS]]
+    if cfg["security"] not in EMAIL_SECURITY:
+        cfg["security"] = "starttls"
+    return cfg
+
+
+def save_email_settings(cfg):
+    path = email_settings_path()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def parse_recipients(text):
@@ -3421,7 +3520,8 @@ EMAILER = EmailNotifier()
 ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER = "administrator", "operator", "viewer"
 ROLES = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER)
 ROLE_LABELS = {ROLE_ADMIN: "Administrator", ROLE_OPERATOR: "Operator", ROLE_VIEWER: "Viewer"}
-OPERATOR_DENIED_POSTS = ("/api/monitor/stop", "/api/settings", "/api/timeout-profiles/save",
+OPERATOR_DENIED_POSTS = ("/api/monitor/stop", "/api/settings", "/api/notifications/email",
+                         "/api/notifications/email/test", "/api/timeout-profiles/save",
                          "/api/timeout-profiles/delete", "/api/timeout-profiles/apply")
 VIEWER_PAGES = ("/", "/index.html", "/favicon.ico")
 VIEWER_GETS = ("/api/status", "/api/console", "/api/me", "/api/device", "/api/upgrade-report.csv",
@@ -3533,6 +3633,55 @@ def load_hosts_from_bytes(data, sheet=None, column=None):
     except Exception as exc:  # noqa: BLE001 - openpyxl raises various errors for a bad/corrupt file
         raise ValueError(f"Could not read that as an Excel (.xlsx) file: {exc}")
     return parse_hosts_from_workbook(wb, sheet, column)
+
+
+def device_list_template_xlsx():
+    """The blank device-list workbook offered next to 'Upload device list'. Sheet 1 ('Switches') has only the
+    header row - nothing is imported until the user types devices in. Sheet 2 explains the columns."""
+    from openpyxl import Workbook
+    from openpyxl.comments import Comment
+    from openpyxl.styles import Alignment, Font, PatternFill
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Switches"
+    headers = ["ip", "hostname", "platform"]
+    ws.append(headers)
+    notes = {"ip": "Required. The management IP address (or DNS name) of the switch.",
+             "hostname": "Optional. A friendly name shown in the dashboard.",
+             "platform": "Optional. The model, for example C9200L-48P-4G. It is read from the switch later if left empty."}
+    for cell in ws[1]:
+        cell.fill = PatternFill("solid", fgColor="1F4E79")
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(vertical="center")
+        cell.comment = Comment(notes[cell.value], APP_NAME)
+    for col, width in zip("ABC", (22, 28, 26)):
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A2"
+    help_ws = wb.create_sheet("Instructions")
+    for line in [
+            (APP_NAME + " - device list template",),
+            ("",),
+            ("1. Type one switch per row on the 'Switches' sheet, below the header row. Keep the header row as it is.",),
+            ("2. Save the file as .xlsx.",),
+            ("3. In the dashboard open Device List > Upload device list, choose the file and click Upload list.",),
+            ("",),
+            ("Column", "Needed?", "Example"),
+            ("ip", "Required", "10.10.1.11"),
+            ("hostname", "Optional", "SW-FLOOR1-01"),
+            ("platform", "Optional", "C9200L-48P-4G"),
+            ("",),
+            ("Devices that are already in the list are skipped. Blank rows are ignored.",),
+            ("This sheet is ignored by the upload - only the first sheet is read.",)]:
+        help_ws.append(list(line))
+    help_ws["A1"].font = Font(bold=True, size=14)
+    for cell in help_ws[7]:
+        cell.font = Font(bold=True)
+    help_ws.column_dimensions["A"].width = 26
+    help_ws.column_dimensions["B"].width = 14
+    help_ws.column_dimensions["C"].width = 24
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
 
 
 # --------------------------------------------------------------------------- #
@@ -3958,7 +4107,12 @@ def load_site_profiles(name):
     for pname, rec in (data.get("profiles") or {}).items():
         if isinstance(rec, dict) and isinstance(rec.get("username"), str) and isinstance(rec.get("password"), str):
             profiles[str(pname)] = {"username": rec["username"], "password": rec["password"],
-                                    "secret": rec.get("secret") if isinstance(rec.get("secret"), str) else ""}
+                                    "secret": rec.get("secret") if isinstance(rec.get("secret"), str) else "",
+                                    "protocol": "telnet" if rec.get("protocol") == "telnet" else "ssh"}
+            try:
+                profiles[str(pname)]["port"] = clean_port(rec.get("port"), profiles[str(pname)]["protocol"])
+            except ValueError:
+                profiles[str(pname)]["port"] = default_port(profiles[str(pname)]["protocol"])
     assign = {h: p for h, p in (data.get("assignments") or {}).items()
               if isinstance(h, str) and p in profiles}
     return profiles, assign
@@ -4215,8 +4369,75 @@ def term_clean(text):
     return "".join(out)
 
 
+class _TelnetChannel(object):
+    """Just enough Telnet for the web console, with the same send / recv / close calls as an SSH channel.
+    Telnet option negotiation is answered (only 'suppress go-ahead' and the server's echo are accepted)."""
+    IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
+
+    def __init__(self, host, port=23, timeout=15):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.settimeout(0.5)
+        self._pend = b""
+
+    def settimeout(self, seconds):
+        self.sock.settimeout(seconds)
+
+    def send(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8", "replace")
+        data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n").replace(b"\xff", b"\xff\xff")
+        self.sock.sendall(data)
+
+    def recv(self, n):
+        raw = self.sock.recv(n)
+        if not raw:
+            return b""                                   # the switch closed the connection
+        out = self._strip(raw)
+        if not out:
+            raise socket.timeout()                       # only negotiation bytes arrived: nothing to show yet
+        return out
+
+    def _strip(self, raw):
+        data, self._pend, out, i = self._pend + raw, b"", bytearray(), 0
+        n = len(data)
+        while i < n:
+            b = data[i]
+            if b != self.IAC:
+                out.append(b); i += 1; continue
+            if i + 1 >= n:
+                self._pend = data[i:]; break
+            c = data[i + 1]
+            if c == self.IAC:
+                out.append(self.IAC); i += 2
+            elif c in (self.WILL, self.WONT, self.DO, self.DONT):
+                if i + 2 >= n:
+                    self._pend = data[i:]; break
+                opt = data[i + 2]
+                if c == self.WILL:
+                    self.sock.sendall(bytes([self.IAC, self.DO if opt in (1, 3) else self.DONT, opt]))
+                elif c == self.DO:
+                    self.sock.sendall(bytes([self.IAC, self.WILL if opt == 3 else self.WONT, opt]))
+                i += 3
+            elif c == self.SB:
+                end = data.find(bytes([self.IAC, self.SE]), i + 2)
+                if end < 0:
+                    self._pend = data[i:]; break
+                i = end + 2
+            else:
+                i += 2
+        return bytes(out)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class TerminalSession(object):
-    def __init__(self, host, label, username, password, secret, opened_by):
+    def __init__(self, host, label, username, password, secret, opened_by, protocol="ssh", port=None):
+        self.protocol = "telnet" if protocol == "telnet" else "ssh"
+        self.port = port or default_port(self.protocol)
         self.id = os.urandom(8).hex()
         self.host, self.label, self.opened_by = host, label, opened_by
         self.lock = threading.Lock()
@@ -4251,14 +4472,19 @@ class TerminalSession(object):
     def _run(self, username, password, secret):
         import codecs
         try:
-            self._add(f"Connecting to {self.label or self.host} ({self.host}) over SSH ...\n")
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(self.host, port=22, username=username, password=password, look_for_keys=False,
-                           allow_agent=False, timeout=15, auth_timeout=20, banner_timeout=20)
-            self.client = client
-            chan = self.chan = client.invoke_shell(term="vt100", width=200, height=50)
-            chan.settimeout(0.5)
+            self._add(f"Connecting to {self.label or self.host} ({self.host}) over {'Telnet' if self.protocol == 'telnet' else 'SSH'} ...\n")
+            if self.protocol == "telnet":
+                chan = self.chan = _TelnetChannel(self.host, self.port)
+                if not self._telnet_login(chan, username, password):
+                    return
+            else:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client.connect(self.host, port=self.port, username=username, password=password, look_for_keys=False,
+                               allow_agent=False, timeout=15, auth_timeout=20, banner_timeout=20)
+                self.client = client
+                chan = self.chan = client.invoke_shell(term="vt100", width=200, height=50)
+                chan.settimeout(0.5)
         except paramiko.AuthenticationException:
             self._finish("Login failed: wrong username or password in the credential profile.")
             return
@@ -4281,6 +4507,39 @@ class TerminalSession(object):
         except Exception:  # noqa: BLE001 - the connection dropped
             pass
         self._finish("Connection closed by the switch." if not self.closed else "")
+
+    def _telnet_login(self, chan, username, password):
+        """Answer the switch's Username: / Password: prompts from the profile. True once the prompt is reached."""
+        import codecs
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        seen, sent_user, sent_pw, end = "", False, 0, time.time() + 25
+        while time.time() < end and not self.closed:
+            try:
+                data = chan.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not data:
+                self._finish("Connection closed by the switch.")
+                return False
+            text = term_clean(decoder.decode(data))
+            self._add(text)
+            seen = (seen + text)[-300:]
+            tail = seen.rstrip().lower()
+            if "authentication failed" in tail or "login invalid" in tail or "access denied" in tail:
+                self._finish("Login failed: wrong username or password in the credential profile.")
+                return False
+            if tail.endswith(("username:", "login:")) and not sent_user:
+                chan.send(username + "\n"); sent_user = True; seen = ""
+            elif tail.endswith("password:"):
+                if sent_pw >= 2:                                   # asked again: the password was refused
+                    self._finish("Login failed: wrong username or password in the credential profile.")
+                    return False
+                chan.send(password + "\n"); sent_pw += 1; seen = ""
+            elif tail.endswith((">", "#")):
+                return True
+        return True
 
     def _wait_for(self, predicate, seconds):
         end = time.time() + seconds
@@ -4331,6 +4590,164 @@ class TerminalSession(object):
         self._finish("")
 
 
+# --------------------------------------------------------------------------- #
+# Diagram tab: CDP topology (what is connected to what)
+# --------------------------------------------------------------------------- #
+def site_topology_path(name):
+    return site_dir(name) / "topology.json"
+
+
+_CDP_SPLIT_RE = re.compile(r"^-{10,}\s*$", re.M)
+_CORE_HINT_RE = re.compile(r"9[456]\d\d|3850|3750|65\d\d|60\d\d|N[3579]K", re.I)
+
+
+def parse_cdp_neighbors_detail(text):
+    """'show cdp neighbors detail' -> [{device_id, ips, platform, caps, kind, local_if, remote_if}].
+    kind is 'net' for a switch or router and 'other' for phones, access points and hosts."""
+    out = []
+    for block in _CDP_SPLIT_RE.split(text or ""):
+        m = re.search(r"^Device ID:\s*(\S.*?)\s*$", block, re.M)
+        if not m:
+            continue
+        ips = []
+        for ip in re.findall(r"IP(?:v4)? address:\s*(\d{1,3}(?:\.\d{1,3}){3})", block):
+            if ip not in ips:
+                ips.append(ip)
+        pm = re.search(r"^Platform:\s*(.*?),\s*Capabilities:\s*(.*?)\s*$", block, re.M)
+        platform = re.sub(r"^cisco\s+", "", pm.group(1).strip(), flags=re.I) if pm else ""
+        caps = pm.group(2).strip() if pm else ""
+        im = re.search(r"^Interface:\s*(.*?),\s*Port ID \(outgoing port\):\s*(.*?)\s*$", block, re.M)
+        is_net = bool(re.search(r"\b(Switch|Router)\b", caps)) and not re.search(r"\b(Phone|Host)\b", caps)
+        out.append({"device_id": m.group(1)[:80], "ips": ips[:4], "platform": platform[:60], "caps": caps[:60],
+                    "kind": "net" if is_net else "other",
+                    "local_if": (im.group(1) if im else "")[:48], "remote_if": (im.group(2) if im else "")[:48]})
+        if len(out) >= 128:
+            break
+    return out
+
+
+def cdp_name_key(name):
+    """'SW-DIST1.corp.local(FOC1234)' and 'sw-dist1' are the same device."""
+    text = re.sub(r"\(.*?\)\s*$", "", str(name or "").strip()).strip().lower()
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", text):
+        return text
+    return text.split(".", 1)[0]
+
+
+def build_topology_graph(info, order, devices, roots):
+    """Turn what each scanned switch reported into {nodes, edges}. Neighbours are matched to onboarded
+    devices by IP address or hostname; anything else shows as a 'not onboarded' node. Each node gets a
+    level (0 = top of its tree) so the page can draw distribution above access."""
+    managed = {h: info[h] for h in order if h in info}
+    by_name = {}
+    for h, rec in managed.items():
+        for nm in (rec.get("label"), (devices.get(h) or {}).get("hostname")):
+            key = cdp_name_key(nm)
+            if key:
+                by_name.setdefault(key, h)
+    nodes, links = {}, {}
+
+    def managed_node(h):
+        if h not in nodes:
+            rec = managed[h]
+            dev = devices.get(h) or {}
+            nodes[h] = {"id": h, "host": h, "name": rec.get("label") or dev.get("hostname") or h, "managed": True,
+                        "platform": rec.get("platform") or "", "kind": "net", "scanned": False, "scan_ok": None,
+                        "scan_error": "", "scan_time": "", "is_root": h in roots, "level": 0, "comp": 0}
+        return nodes[h]
+
+    for h in order:
+        dev = devices.get(h)
+        if h not in managed or not isinstance(dev, dict):
+            continue
+        me = managed_node(h)
+        me.update(scanned=True, scan_ok=bool(dev.get("ok")), scan_error=str(dev.get("error") or ""),
+                  scan_time=str(dev.get("time") or ""))
+        for nb in dev.get("neighbors") or []:
+            target = next((ip for ip in nb.get("ips", []) if ip in managed), None) \
+                or by_name.get(cdp_name_key(nb.get("device_id")))
+            if target is None:
+                key = cdp_name_key(nb.get("device_id")) or str(nb.get("device_id"))
+                target = "x:" + key
+                if target not in nodes:
+                    nodes[target] = {"id": target, "host": (nb.get("ips") or [None])[0], "managed": False,
+                                     "name": re.sub(r"\(.*?\)\s*$", "", str(nb.get("device_id"))).strip(),
+                                     "platform": nb.get("platform") or "", "kind": nb.get("kind") or "other",
+                                     "scanned": False, "scan_ok": None, "scan_error": "", "scan_time": "",
+                                     "is_root": False, "level": 0, "comp": 0}
+            else:
+                # Only show switches that were part of the scan: a managed switch that
+                # was deselected (no scan data) must not reappear as a neighbour.
+                if not isinstance(devices.get(target), dict):
+                    continue
+                managed_node(target)
+            if target == h:
+                continue
+            ends = sorted([(h, nb.get("local_if") or ""), (target, nb.get("remote_if") or "")])
+            links.setdefault((ends[0][0], ends[1][0]), set()).add((ends[0][1], ends[1][1]))
+
+    net = {i for i, n in nodes.items() if n["kind"] == "net"}
+    adj = {i: set() for i in nodes}
+    for a, b in links:
+        adj[a].add(b)
+        adj[b].add(a)
+
+    def score(i):
+        n = nodes[i]
+        return (len(adj[i] & net) * 10 + (6 if n["managed"] else 0)
+                + (4 if _CORE_HINT_RE.search(n["platform"] or "") else 0))
+
+    seen, comp = set(), 0
+    for start in sorted(net, key=lambda i: (-score(i), nodes[i]["name"].lower())):
+        if start in seen:
+            continue
+        members, stack = [], [start]
+        seen.add(start)
+        while stack:                                         # one connected group of switches
+            cur = stack.pop()
+            members.append(cur)
+            for nxt in adj[cur] & net:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        def reach(src):                                      # distances from src within this group
+            seen_d, q = {src: 0}, [src]
+            while q:
+                cur = q.pop(0)
+                for nxt in adj[cur] & net:
+                    if nxt not in seen_d:
+                        seen_d[nxt] = seen_d[cur] + 1
+                        q.append(nxt)
+            return seen_d
+        chosen = [i for i in members if nodes[i]["is_root"]]
+        # Automatic top = the centre of the group (core above distribution above access); the most links breaks a tie.
+        root = chosen[0] if chosen else min(members, key=lambda i: (max(reach(i).values()), -score(i), nodes[i]["name"].lower()))
+        depth, queue = {root: 0}, [root]
+        while queue:
+            cur = queue.pop(0)
+            for nxt in sorted(adj[cur] & net):
+                if nxt not in depth:
+                    depth[nxt] = depth[cur] + 1
+                    queue.append(nxt)
+        for i in members:
+            nodes[i]["level"], nodes[i]["comp"] = depth.get(i, 0), comp
+        comp += 1
+    for i, n in nodes.items():                               # phones, access points ...: just below their switch
+        if n["kind"] != "net":
+            parents = [nodes[j] for j in adj[i] if j in net]
+            if parents:
+                top = min(parents, key=lambda p: p["level"])
+                n["level"], n["comp"] = top["level"] + 1, top["comp"]
+            else:
+                n["comp"], comp = comp, comp + 1
+    edges = [{"a": a, "b": b, "links": [{"a_if": x, "b_if": y} for x, y in sorted(ports)]}
+             for (a, b), ports in sorted(links.items())]
+    stamps = [n["scan_time"] for n in nodes.values() if n["scan_time"]]
+    return {"nodes": sorted(nodes.values(), key=lambda n: (n["comp"], n["level"], n["name"].lower())),
+            "edges": edges, "scanned": sum(1 for n in nodes.values() if n["scanned"]),
+            "updated": max(stamps) if stamps else ""}
+
+
 class Manager:
     def __init__(self, monitor, events):
         self.monitor = monitor
@@ -4354,6 +4771,7 @@ class Manager:
         self.max_parallel = MAX_CONCURRENT_RELOADS   # switches upgraded at the same time (global setting)
         self.stop_on_failure = True         # stop starting queued switches once one in the rollout fails
         self.settings = load_global_settings()          # the Settings page (gear icon); one file for every site
+        self.email_cfg = load_email_settings()          # Settings > Notifications (e-mail copies of the notifications)
         self.session_started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # "fresh start" = nothing older than this
         self._apply_settings()
         self.rollouts = {}                  # rollout id -> {"hosts": set, "failed": bool, "by": str}
@@ -4365,6 +4783,8 @@ class Manager:
         self.keep_awake = KeepAwake(self._need_awake, self._awake_changed)
         self.backup_run = None
         self.target_image = ""              # image last picked in an Operator/Administrator drawer (shown to Viewers)
+        self.topo_lock = threading.RLock()  # Diagram tab: guards topology.json and the scan progress below
+        self.topo_run = None                # the latest CDP topology scan of the active site
         self.pool = ThreadPoolExecutor(max_workers=BACKUP_WORKERS)
         self.job_tmp = tempfile.mkdtemp(prefix="swmgr_")  # private dir (0700) for credential job files
         self._stop = threading.Event()
@@ -4420,6 +4840,7 @@ class Manager:
             self.ops = {h: self._new_ops() for h in self.order}
             self.jobs = {}
             self.backup_run = None
+            self.topo_run = None
             try:
                 self.profiles, self.assign = load_site_profiles(name)
             except Exception as exc:  # noqa: BLE001 - a damaged profile file must not block the site
@@ -4627,9 +5048,11 @@ class Manager:
             for h, pname in self.assign.items():
                 counts[pname] = counts.get(pname, 0) + 1
             return [{"name": n, "username": r["username"], "has_secret": bool(r.get("secret")),
+                     "protocol": "telnet" if r.get("protocol") == "telnet" else "ssh",
+                     "port": r.get("port") or default_port(r.get("protocol")),
                      "devices": counts.get(n, 0)} for n, r in sorted(self.profiles.items(), key=lambda kv: kv[0].lower())]
 
-    def save_profile(self, name, username, password, secret, clear_secret=False, original=None):
+    def save_profile(self, name, username, password, secret, clear_secret=False, original=None, protocol="ssh", port=None):
         """Create a profile, or edit one (original = its current name). When editing, an empty
         password / secret means 'keep the saved one'."""
         self._require_site()
@@ -4639,6 +5062,11 @@ class Manager:
             raise ApiError("Profile name: 1-40 characters - letters, digits, spaces, '.', '_' or '-'.")
         if not username or len(username) > 128:
             raise ApiError("Enter the switch username (up to 128 characters).")
+        protocol = "telnet" if str(protocol or "ssh").strip().lower() == "telnet" else "ssh"
+        try:
+            port = clean_port(port, protocol)
+        except ValueError as exc:
+            raise ApiError(str(exc))
         for label, val in (("password", password), ("enable secret", secret)):
             if val is not None and (not isinstance(val, str) or len(val) > 256):
                 raise ApiError(f"Invalid {label}.")
@@ -4665,10 +5093,11 @@ class Manager:
                 for h, p in list(self.assign.items()):
                     if p == original:
                         self.assign[h] = name
-            self.profiles[name] = {"username": username, "password": new_pw, "secret": new_secret}
+            self.profiles[name] = {"username": username, "password": new_pw, "secret": new_secret, "protocol": protocol,
+                                   "port": port}
             self._save_profiles()
         self.events.add("-", "", f"Credential profile '{name}' {'updated' if editing else 'created'}", "info")
-        return {"message": f"Profile '{name}' saved.", "name": name}
+        return {"message": f"Profile '{name}' saved ({'Telnet' if protocol == 'telnet' else 'SSH'}, port {port}).", "name": name}
 
     def delete_profile(self, name):
         with self.lock:
@@ -4746,6 +5175,7 @@ class Manager:
             out = {}
             for h in hosts:
                 rec = self.profiles[self.assign[h]]
+                set_host_protocol(h, rec.get("protocol"), rec.get("port"))
                 try:
                     out[h] = (rec["username"], unprotect_secret(rec["password"]),
                               unprotect_secret(rec.get("secret", "")))
@@ -4815,6 +5245,112 @@ class Manager:
                         + (f" and {len(changed) - 4} more" if len(changed) > 4 else ""), "info")
         return {"message": "Settings saved. They apply to everything that starts from now on; upgrades already "
                            "running keep the values they started with.", **self.settings_view()}
+
+    # ---- e-mail notifications (Settings > Notifications) ----------------------------------------- #
+    def email_live_config(self):
+        """What EMAILER reads on every notification (the saved settings, applied at once after a Save)."""
+        cfg = dict(self.email_cfg)
+        cfg["from"] = cfg.get("username", "")
+        return cfg
+
+    def email_settings_view(self):
+        """For the Settings page. The password is never sent back - only whether one is saved."""
+        cfg = self.email_cfg
+        return {"values": {"enabled": cfg["enabled"], "host": cfg["host"], "port": cfg["port"],
+                           "security": cfg["security"], "username": cfg["username"], "to": cfg["to"],
+                           "kinds": list(cfg["kinds"])},
+                "password_saved": bool(cfg.get("password_enc")),
+                "kinds": [{"key": k, "label": label} for k, label, _on in EMAIL_KINDS],
+                "problem_kinds": list(EMAIL_PROBLEM_KINDS),
+                "security_options": [{"key": k, "label": v} for k, v in EMAIL_SECURITY.items()],
+                "last": dict(EMAILER.last)}
+
+    @staticmethod
+    def _clean_email_values(values, strict):
+        """(cfg without password, problems). strict=True also demands a complete form."""
+        if not isinstance(values, dict):
+            raise ApiError("Send the e-mail settings as a JSON object.")
+        known = [k for k, _l, _o in EMAIL_KINDS]
+        kinds = values.get("kinds")
+        kinds = [k for k in (kinds if isinstance(kinds, list) else []) if k in known]
+        cfg = {"enabled": bool(values.get("enabled")), "host": str(values.get("host") or "").strip()[:200],
+               "port": values.get("port"), "security": values.get("security") if values.get("security") in EMAIL_SECURITY else "starttls",
+               "username": str(values.get("username") or "").strip()[:200], "to": str(values.get("to") or "").strip()[:2000],
+               "kinds": kinds}
+        problems = []
+        if strict:
+            if not cfg["host"]:
+                problems.append("Enter the SMTP server (for Gmail: smtp.gmail.com).")
+            try:
+                port = int(cfg["port"])
+                if isinstance(cfg["port"], bool) or not 1 <= port <= 65535:
+                    raise ValueError
+                cfg["port"] = port
+            except (TypeError, ValueError):
+                problems.append("The port must be a number (587 for STARTTLS, 465 for SSL).")
+            if not _EMAIL_RE.match(cfg["username"]):
+                problems.append("Enter the e-mail address used to sign in to the mail server.")
+            recipients = [r for r in re.split(r"[,;\s]+", cfg["to"]) if r]
+            bad = [r for r in recipients if not _EMAIL_RE.match(r)]
+            if not recipients:
+                problems.append("Enter at least one address under 'Send to'.")
+            elif bad:
+                problems.append("Not a valid e-mail address: " + ", ".join(bad[:3]))
+        else:
+            try:
+                cfg["port"] = int(cfg["port"])
+            except (TypeError, ValueError):
+                cfg["port"] = EMAIL_DEFAULTS["port"]
+        return cfg, problems
+
+    def update_email_settings(self, values, who=None):
+        if not isinstance(values, dict):
+            raise ApiError("Send the e-mail settings as a JSON object.")
+        cfg, problems = self._clean_email_values(values, strict=bool((values or {}).get("enabled")))
+        password = str((values or {}).get("password") or "")
+        if cfg["enabled"] and not password and not self.email_cfg.get("password_enc"):
+            problems.append("Enter the App password.")
+        if problems:
+            raise ApiError(" ".join(problems))
+        cfg["password_enc"] = self.email_cfg.get("password_enc", "")
+        if password:
+            try:
+                cfg["password_enc"] = protect_secret(password)
+            except (Exception, SystemExit) as exc:  # noqa: BLE001
+                raise ApiError(f"Could not encrypt the password ({type(exc).__name__}).", 500)
+        was_on = self.email_cfg.get("enabled")
+        try:
+            save_email_settings(cfg)
+        except OSError as exc:
+            raise ApiError(f"Could not save the e-mail settings ({type(exc).__name__}).", 500)
+        self.email_cfg = cfg                              # applied at once, no restart
+        self.events.add("-", "", f"E-mail notification settings saved by {who or 'local'}: " + (
+            f"ON ({len(cfg['kinds'])} type(s), {cfg['host']})" if cfg["enabled"]
+            else ("switched OFF" if was_on else "OFF")), "info")
+        out = self.email_settings_view()
+        out["message"] = ("Saved - applied now." if cfg["enabled"] else "Saved - e-mail notifications are OFF.")
+        if cfg["enabled"] and not cfg["kinds"]:
+            out["message"] += " No notification type is ticked, so no e-mail will be sent."
+        return out
+
+    def test_email_settings(self, values, who=None):
+        cfg, problems = self._clean_email_values(values, strict=True)
+        password = str((values or {}).get("password") or "")
+        if not password and not self.email_cfg.get("password_enc"):
+            problems.append("Enter the App password.")
+        if problems:
+            raise ApiError(" ".join(problems))
+        cfg["from"] = cfg["username"]
+        if password:
+            cfg["password"] = password                    # used for this test only, not stored
+        else:
+            cfg["password_enc"] = self.email_cfg.get("password_enc", "")
+        try:
+            n = send_test_email(cfg)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
+            raise ApiError("Test e-mail failed: " + describe_email_error(exc))
+        self.events.add("-", "", f"Test e-mail sent by {who or 'local'} to {n} address(es)", "info")
+        return {"message": f"Test e-mail sent to {n} address(es). Check the inbox."}
 
     # ---- command duration profiles + command time test (Settings > Command Outputs) ------------ #
     def _current_timeouts(self):
@@ -5507,11 +6043,18 @@ class Manager:
         self.events.add(host, self.label(host), confirmed or f"Software version: {version}{info}",
                         "ok" if confirmed else "info")
 
-    def test_credentials(self, hosts, profile=None):
+    def test_credentials(self, hosts, profile=None, adhoc=None):
         """Log in to the switches. With `profile` (a saved profile name) that profile is tried on every
-        switch WITHOUT assigning it; without it each switch's own assigned profile is used."""
+        switch WITHOUT assigning it; without it each switch's own assigned profile is used.
+        `adhoc` = the details typed in the profile form (NOT saved): {username, password, secret, protocol, port,
+        original}. An empty password / secret while editing falls back to the saved profile `original`."""
         hosts = self._validate_hosts(hosts)
-        if profile:
+        if adhoc is not None:
+            cm, protocol, port = self._adhoc_creds(hosts, adhoc)
+            for h in hosts:
+                set_host_protocol(h, protocol, port)
+            profile = None
+        elif profile:
             with self.lock:
                 rec = self.profiles.get(profile)
             if rec is None:
@@ -5523,6 +6066,8 @@ class Manager:
                                "(was it saved by another Windows user?). Open the profile and "
                                "enter the password again.")
             cm = {h: one for h in hosts}
+            for h in hosts:
+                set_host_protocol(h, rec.get("protocol"), rec.get("port"))   # the chosen profile decides SSH or Telnet + port
         else:
             cm = self._creds_map(hosts)
         with self.lock:
@@ -5532,12 +6077,49 @@ class Manager:
                     raise ApiError(f"{h} is being upgraded right now - wait for it to finish.", 409)
                 self.ops[h]["creds"] = {"state": "testing", "detail": "Connecting ...", "time": None}
         for h in hosts:
-            self.pool.submit(self._test_credentials_one, h, *cm[h], profile or None)
+            self.pool.submit(self._test_credentials_one, h, *cm[h], profile or None,
+                             "the details in the form (not saved)" if adhoc is not None else None)
+        if adhoc is not None:
+            return {"message": f"Testing the entered credentials ({'Telnet' if protocol == 'telnet' else 'SSH'}, port {port}) "
+                               f"on {len(hosts)} switch(es) - nothing is saved ..."}
         return {"message": f"Testing profile '{profile}' on {len(hosts)} switch(es) (not assigned) ..." if profile
                 else f"Testing credentials on {len(hosts)} switch(es) ..."}
 
+    def _adhoc_creds(self, hosts, adhoc):
+        """Credentials typed in the profile form -> ({host: (user, password, secret)}, protocol, port)."""
+        if not isinstance(adhoc, dict):
+            raise ApiError("Nothing to test.")
+        username = adhoc.get("username").strip() if isinstance(adhoc.get("username"), str) else ""
+        if not username or len(username) > 128:
+            raise ApiError("Enter the switch username first (up to 128 characters).")
+        protocol = "telnet" if str(adhoc.get("protocol") or "ssh").strip().lower() == "telnet" else "ssh"
+        try:
+            port = clean_port(adhoc.get("port"), protocol)
+        except ValueError as exc:
+            raise ApiError(str(exc))
+        password, secret = adhoc.get("password"), adhoc.get("secret")
+        for label, val in (("password", password), ("enable secret", secret)):
+            if val is not None and (not isinstance(val, str) or len(val) > 256):
+                raise ApiError(f"Invalid {label}.")
+        password, secret = password or "", secret or ""
+        original = adhoc.get("original")
+        if not password or (not secret and not adhoc.get("clear_secret")):
+            with self.lock:
+                old = self.profiles.get(original) if isinstance(original, str) else None
+            try:
+                if not password and old:
+                    password = unprotect_secret(old["password"])
+                if not secret and old and not adhoc.get("clear_secret"):
+                    secret = unprotect_secret(old.get("secret", ""))
+            except Exception:  # noqa: BLE001
+                raise ApiError("The saved password of this profile cannot be read - type the password again.")
+        if not password:
+            raise ApiError("Enter the password first.")
+        one = (username, password, secret)
+        return {h: one for h in hosts}, protocol, port
+
     @activity("Credentials test")
-    def _test_credentials_one(self, host, username, password, secret, profile=None):
+    def _test_credentials_one(self, host, username, password, secret, profile=None, source=None):
         dtype = BACKUP_DEVICE_TYPES.get(self.info[host]["type"], "cisco_xe")
         device = {"device_type": dtype, "host": host, "username": username, "password": password,
                   "secret": secret, "conn_timeout": 15, "auth_timeout": 15, "banner_timeout": 15}
@@ -5552,8 +6134,11 @@ class Manager:
                 detail = "Login OK" + (" + enable OK" if secret else "") + f" ({prompt.strip()})"
                 if profile:
                     detail += f" - tested with profile '{profile}'"
+                elif source:
+                    detail += f" - tested with {source}"
         except NetmikoAuthenticationException:
-            detail = "Authentication failed (bad username/password or enable secret)" + (f" - tested with profile '{profile}'" if profile else "")
+            detail = "Authentication failed (bad username/password or enable secret)" + (
+                f" - tested with profile '{profile}'" if profile else (f" - tested with {source}" if source else ""))
         except NetmikoTimeoutException:
             detail = "Connection timed out"
         except Exception as exc:  # noqa: BLE001
@@ -5633,9 +6218,24 @@ class Manager:
         self.events.add(host, self.label(host), f"Readiness check: {detail}", level)
 
     # ---- upgrade ----------------------------------------------------------- #
+    def _port_of(self, host):
+        with self.lock:
+            rec = self.profiles.get(self.assign.get(host))
+        return (rec or {}).get("port") or default_port((rec or {}).get("protocol"))
+
+    def _protocol_of(self, host):
+        with self.lock:
+            rec = self.profiles.get(self.assign.get(host))
+        return "telnet" if rec and rec.get("protocol") == "telnet" else "ssh"
+
     def _check_upgradable(self, hosts):
         """Common checks for starting an upgrade now or scheduling one. Called with self.lock held."""
         for h in hosts:
+            rec = self.profiles.get(self.assign.get(h)) or {}
+            if rec.get("protocol") == "telnet":
+                raise ApiError(f"{h} uses the Telnet profile '{self.assign.get(h)}'. Upgrades copy the image with SCP, "
+                               "which needs SSH - switch the device to an SSH profile first. (Backups, credential tests, "
+                               "readiness checks, the console and topology discovery work over Telnet.)")
             if self.info[h]["type"] != "cisco-xe":
                 raise ApiError(f"{h} is type '{self.info[h]['type']}' - only cisco-xe switches "
                                "can be upgraded.")
@@ -5883,6 +6483,9 @@ class Manager:
                    "username": username, "password": password, "secret": secret,
                    "status_path": job["status_path"], "log_path": job["log_path"],
                    "timeouts": dict(TIMEOUTS)}
+        _rec = self.profiles.get(self.assign.get(host)) or {}
+        if _rec.get("port") and _rec.get("port") != default_port("ssh"):
+            payload["port"] = int(_rec["port"])         # custom SSH port: the worker (and its SCP copy) must use it too
         if image:
             payload["image_path"] = image
         if ignore_space:
@@ -6092,6 +6695,11 @@ class Manager:
 
     def snapshot(self):
         mon = self.monitor.snapshot()
+        if not self.monitor.running:
+            # Up/down is only monitored while monitoring is enabled: otherwise every device reads as DOWN.
+            mon = dict(mon)
+            mon["hosts"] = [{**h, "status": "DOWN"} for h in mon["hosts"]]
+            mon["summary"] = {**mon["summary"], "up": 0, "down": len(mon["hosts"]), "pending": 0}
         by_host = {h["host"]: h for h in mon["hosts"]}
         with self.lock:
             self._poll_all()
@@ -6132,6 +6740,155 @@ class Manager:
                             "completed": completed_count, "settings": self.upgrade_settings_view()},
                 "backup_run": run_info}
 
+    # ---- Diagram tab: CDP topology ------------------------------------------- #
+    def _topology_load(self):
+        data = read_json_file(site_topology_path(self.site_name)) if self.site_name else None
+        data = data if isinstance(data, dict) else {}
+        devices = data.get("devices") if isinstance(data.get("devices"), dict) else {}
+        roots = [r for r in (data.get("roots") or []) if isinstance(r, str)]
+        return {"devices": devices, "roots": roots}
+
+    def _topology_save(self, store):
+        try:
+            site_dir(self.site_name).mkdir(parents=True, exist_ok=True)
+            tmp = site_topology_path(self.site_name).with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(store, indent=1), encoding="utf-8")
+            tmp.replace(site_topology_path(self.site_name))
+        except OSError as exc:
+            print(f"Could not save the topology for site '{self.site_name}': {exc}", flush=True)
+
+    def topology_view(self):
+        """Everything the Diagram tab draws: the saved CDP graph plus one row per device for the picker."""
+        with self.lock:
+            site = self.site_name
+            order = list(self.order)
+            info = {h: dict(self.info[h]) for h in order}
+            cred_ok = {h: self.assign.get(h) in self.profiles for h in order}
+            profile = {h: self.assign.get(h) for h in order}
+        with self.topo_lock:
+            store = self._topology_load()
+            run = self.topo_run if (self.topo_run and self.topo_run.get("site") == site) else None
+            run_copy = None if run is None else {
+                "started": run["started"], "finished": run["finished"], "total": run["total"], "done": run["done"],
+                "hosts": {h: dict(v) for h, v in run["hosts"].items()}}
+        graph = build_topology_graph(info, order, store["devices"], set(store["roots"]))
+        devices = []
+        for h in order:
+            scan = store["devices"].get(h) if isinstance(store["devices"].get(h), dict) else {}
+            devices.append({"host": h, "label": info[h].get("label") or h, "platform": info[h].get("platform") or "",
+                            "has_creds": cred_ok[h], "profile": profile[h] if cred_ok[h] else None,
+                            "scan_ok": scan.get("ok"), "scan_time": scan.get("time") or "",
+                            "scan_error": scan.get("error") or "", "neighbors": len(scan.get("neighbors") or [])})
+        return {"site": site, "devices": devices, "graph": graph, "run": run_copy}
+
+    def start_topology_discovery(self, hosts):
+        """Read 'show cdp neighbors detail' from the selected switches (each must have a credentials profile)."""
+        self._require_site()
+        hosts = self._validate_hosts(hosts)
+        with self.lock:
+            missing = [h for h in hosts if self.assign.get(h) not in self.profiles]
+        if missing:
+            shown = ", ".join(self.label(h) for h in missing[:5]) + (f" (+{len(missing) - 5} more)" if len(missing) > 5 else "")
+            raise ApiError(f"No credentials profile is attached to: {shown}. Assign a profile on the Home page "
+                           "first - the topology is read from the switches with it.")
+        cm = self._creds_map(hosts)
+        with self.lock:
+            self._poll_all()
+            busy = {h for h in hosts if self._upgrade_active(h)}
+        with self.topo_lock:
+            if self.topo_run and self.topo_run.get("site") == self.site_name and not self.topo_run["finished"]:
+                raise ApiError("A topology scan is already running - wait for it to finish.", 409)
+            # The diagram shows only the switches selected for this discovery: drop stored scans of the rest.
+            store = self._topology_load()
+            keep = set(hosts)
+            stale = [h for h in list(store["devices"]) if h not in keep]
+            if stale:
+                for h in stale:
+                    store["devices"].pop(h, None)
+                self._topology_save(store)
+            run = {"site": self.site_name, "started": now_str(), "finished": None, "total": len(hosts), "done": 0,
+                   "hosts": {h: {"state": "queued", "detail": ""} for h in hosts}}
+            for h in busy:
+                run["hosts"][h] = {"state": "skipped", "detail": "Upgrade in progress - kept the previous result"}
+                run["done"] += 1
+            if run["done"] >= run["total"]:
+                run["finished"] = now_str()
+            self.topo_run = run
+        todo = [h for h in hosts if h not in busy]
+        for h in todo:
+            self.pool.submit(self._topology_one, h, self.site_name, *cm[h])
+        self.events.add("-", "", f"Topology scan started on {len(todo)} device(s)", "info")
+        msg = f"Reading CDP neighbours from {len(todo)} switch(es) ..."
+        if busy:
+            msg += f" {len(busy)} skipped because an upgrade is running on them."
+        return {"message": msg}
+
+    @activity("Topology scan")
+    def _topology_one(self, host, site, username, password, secret):
+        with self.topo_lock:
+            if self.topo_run and self.topo_run.get("site") == site and host in self.topo_run["hosts"]:
+                self.topo_run["hosts"][host] = {"state": "running", "detail": "Connecting ..."}
+        info = self.info.get(host) or {}
+        device = {"device_type": BACKUP_DEVICE_TYPES.get(info.get("type"), "cisco_xe"), "host": host,
+                  "username": username, "password": password, "secret": secret,
+                  "conn_timeout": 15, "auth_timeout": 15, "banner_timeout": 15}
+        ok, detail, neighbors, hostname = False, "", [], ""
+        try:
+            with ConnectHandler(**device) as conn:
+                if secret:
+                    conn.enable()
+                hostname = re.sub(r"\(.*?\)|[#>\s]+$", "", conn.find_prompt()).strip()
+                raw = conn.send_command("show cdp neighbors detail", read_timeout=tmo('show_cmd'))
+            if re.search(r"CDP is not enabled|Invalid input", raw or "", re.I):
+                detail = "CDP is not enabled on this switch (cdp run)"
+            else:
+                neighbors = parse_cdp_neighbors_detail(raw)
+                ok, detail = True, f"{len(neighbors)} CDP neighbour(s)"
+        except NetmikoAuthenticationException:
+            detail = "Authentication failed"
+        except NetmikoTimeoutException:
+            detail = "Connection timed out"
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {exc}"[:160]
+        with self.topo_lock:
+            if self.site_name == site:                       # the site was switched meanwhile: drop the result
+                store = self._topology_load()
+                old = store["devices"].get(host) if isinstance(store["devices"].get(host), dict) else {}
+                if ok:
+                    store["devices"][host] = {"hostname": hostname, "time": now_str(), "ok": True, "error": "",
+                                              "neighbors": neighbors}
+                else:                                        # keep what we knew; only note why the scan failed
+                    store["devices"][host] = {"hostname": old.get("hostname", ""), "time": old.get("time", ""),
+                                              "ok": False, "error": detail, "neighbors": old.get("neighbors") or []}
+                self._topology_save(store)
+            run = self.topo_run
+            if run and run.get("site") == site and host in run["hosts"]:
+                run["hosts"][host] = {"state": "ok" if ok else "failed", "detail": detail}
+                run["done"] += 1
+                if run["done"] >= run["total"] and not run["finished"]:
+                    run["finished"] = now_str()
+        self.events.add(host, self.label(host) if host in self.info else host, f"Topology scan: {detail}",
+                        "ok" if ok else "bad")
+
+    def topology_set_root(self, host, on):
+        """Choose which switch is the top of its tree (the distribution / core), overriding the automatic guess."""
+        self._require_site()
+        if not isinstance(host, str) or host not in self.info:
+            raise ApiError("Unknown switch.")
+        with self.topo_lock:
+            store = self._topology_load()
+            with self.lock:
+                order, info = list(self.order), {h: dict(self.info[h]) for h in self.order}
+            graph = build_topology_graph(info, order, store["devices"], set())
+            comp = {n["id"]: n["comp"] for n in graph["nodes"]}
+            if host not in comp:
+                raise ApiError("Scan this switch first - it is not on the diagram yet.")
+            store["roots"] = [r for r in store["roots"] if comp.get(r) != comp[host] and r != host]
+            if on:
+                store["roots"].append(host)
+            self._topology_save(store)
+        return {"message": f"{self.label(host)} is now the top of its tree." if on else "Top of tree cleared - back to automatic."}
+
     # ---- web terminal (device drawer > Console) ------------------------------ #
     def _term_reap(self):
         """Drop finished sessions and close the ones nobody has used for a while. Called with term_lock held."""
@@ -6167,7 +6924,7 @@ class Manager:
                     return {"sid": s.id, "offset": 0, "reused": True}
             if sum(1 for s in self.terms.values() if not s.closed) >= TERM_MAX_SESSIONS:
                 raise ApiError(f"Too many consoles are open ({TERM_MAX_SESSIONS}) - close one first.", 429)
-            s = TerminalSession(host, label, username, password, secret, user)
+            s = TerminalSession(host, label, username, password, secret, user, self._protocol_of(host), self._port_of(host))
             self.terms[s.id] = s
         self.events.add(host, label, f"Web console opened by {user}", "info")
         return {"sid": s.id, "offset": 0, "reused": False}
@@ -6252,6 +7009,8 @@ class Manager:
             mon = {"status": s.get("status") or "PENDING", "last_checked": s.get("last_checked"),
                    "last_change": s.get("last_change"), "last_rtt": s.get("last_rtt"),
                    "checks": s.get("checks"), "successes": s.get("successes")}
+        if not self.monitor.running:                  # up/down is only known while monitoring is on
+            mon["status"], mon["monitoring_off"] = "DOWN", True
 
         facts = read_device_facts(device_dir)
         backups = list_device_backups(device_dir)
@@ -6296,7 +7055,9 @@ class Manager:
             items.append({"key": key, "title": title, "state": state, "detail": detail})
 
         st = mon.get("status")
-        if st == "UP":
+        if mon.get("monitoring_off"):
+            add("reach", "Reachable", "bad", "Monitoring is stopped - the switch is shown as down until monitoring is started")
+        elif st == "UP":
             rtt = mon.get("last_rtt")
             add("reach", "Reachable", "ok", "Answers ping" + (f" ({rtt:.1f} ms)" if isinstance(rtt, (int, float)) else ""))
         elif st == "DOWN":
@@ -6807,7 +7568,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   @keyframes mon-blink { 0% { box-shadow:0 0 0 0 rgba(34,170,90,.65); opacity:1; } 50% { opacity:.45; }
                          100% { box-shadow:0 0 0 9px rgba(34,170,90,0); opacity:1; } }
   @media (prefers-reduced-motion:reduce) { .mdot.running { animation:none; } }
-  .mainmsg { margin:0 0 10px; } .mainmsg:has(#msg:empty) { display:none; } .mainmsg .msg { margin:0; }
+  /* status note: floats over the page (no layout space) and fades out by itself */
+  .mainmsg { position:fixed; right:18px; bottom:18px; z-index:1200; max-width:min(520px,calc(100vw - 36px));
+             margin:0; padding:9px 14px; border-radius:8px; background:var(--pn); border:1px solid var(--bd);
+             box-shadow:0 6px 20px rgba(0,0,0,.25); pointer-events:none; }
+  .mainmsg:has(#msg:empty) { display:none; } .mainmsg .msg { margin:0; }
   .mstate.running { background:var(--t-gn); color:var(--gr); border-color:var(--gr); }
 
   /* site badge + dropdown */
@@ -6877,10 +7642,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   input[type=file] { width:100%; font-size:11px; color:var(--mu); }
   input[type=checkbox] { accent-color:var(--ac); width:15px; height:15px; cursor:pointer; margin:0; }
   textarea { height:80px; resize:vertical; font-family:ui-monospace,Consolas,monospace; font-size:11.5px; }
+  a.lnk { color:var(--ac); text-decoration:underline; cursor:pointer; font-size:11px; }
+  a.lnk:hover { opacity:.8; }
   .hint, .note { font-size:11px; color:var(--mu); margin-top:6px; }
   .hint.bad { color:var(--rd); }
   .msg { font-size:12px; font-weight:600; margin:2px 0 6px; }
   .msg:empty { display:none; }
+  .side .body > .msg { margin:12px 0 0; overflow-wrap:anywhere; }          /* status lines sit at the bottom of each section */
+  .protobox { display:flex; align-items:center; gap:12px; flex-wrap:nowrap; margin-top:2px; }
+  .protobox .ropt { display:flex; align-items:center; gap:6px; margin:0; font-size:12px; color:var(--tx); cursor:pointer; }
+  input[type=radio] { accent-color:var(--ac); width:15px; height:15px; cursor:pointer; margin:0; }
+  .protobox .portwrap { display:flex; align-items:center; gap:6px; margin-left:auto; flex:none; white-space:nowrap; }
+  .protobox .portwrap label { margin:0; }
+  .protobox .portwrap input[type=text] { width:56px; text-align:center; padding:5px 6px; }
   .msg.ok { color:var(--gr); } .msg.err { color:var(--rd); }
   .row { display:flex; gap:6px; margin-top:10px; }
   .row .btn { flex:1; padding:6px 8px; white-space:nowrap; }
@@ -7201,6 +7975,88 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tab:hover { color:var(--tx); background:var(--acs); }
   .tab.on { color:var(--tx); font-weight:600; border-bottom-color:var(--ac); }
 
+  /* ---- Diagram page ---- */
+  .dg-side { width:300px; }
+  .dg-sec { padding:0 14px 14px; }
+  .dg-actions { position:sticky; top:0; z-index:3; display:flex; gap:8px; margin:8px -14px 0; padding:8px 14px; background:var(--pn2); border-bottom:1px solid var(--bd); }
+  .dg-actions .btn { flex:1; min-width:0; justify-content:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #diagram main { overflow:hidden; }
+  .dg-list { display:flex; flex-direction:column; gap:2px; margin:10px 0 4px; }
+  .dg-dev { display:flex; align-items:flex-start; gap:9px; padding:7px 8px; border-radius:8px; cursor:pointer; margin:0; font-size:13px; color:var(--tx); }
+  .dg-dev:hover { background:var(--acs); }
+  .dg-dev.off { opacity:.62; cursor:not-allowed; }
+  .dg-dev input { flex:none; margin-top:3px; }
+  .dg-dev .meta { min-width:0; flex:1; }
+  .dg-dev .t1 { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dg-dev .t2 { font-size:11.5px; color:var(--mu); word-break:break-word; }
+  .dg-dev .t2.bad { color:var(--rd); } .dg-dev .t2.ok { color:var(--gr); } .dg-dev .t2.warn { color:var(--c-a); }
+  .dg-card { flex:1; min-height:0; }
+  .dg-banner { margin:10px 14px 0; padding:9px 12px; border-radius:8px; background:var(--t-a); color:var(--c-a); border:1px solid var(--c-a); font-size:13px; font-weight:600; }
+  .dg-banner[hidden] { display:none; }
+  .dg-wrap { position:relative; flex:1; min-height:380px; overflow:hidden; background:var(--pn); cursor:grab; touch-action:none; user-select:none; -webkit-user-select:none; }
+  .dg-wrap.panning { cursor:grabbing; }
+  #dg-svg { position:absolute; inset:0; width:100%; height:100%; display:block; }
+  .dg-ico { display:inline-grid; place-items:center; padding:5px 8px; }
+  .dg-ico .i { width:15px; height:15px; }
+  .dg-hint { position:absolute; left:12px; bottom:10px; font-size:11px; color:var(--mu); background:var(--pn); border:1px solid var(--bd);
+             border-radius:999px; padding:2px 10px; pointer-events:none; opacity:.9; z-index:1; }
+  .dg-hint:empty { display:none; }
+  /* Full screen: the whole Topology card (toolbar, canvas, legend, details panel) fills the screen */
+  .dg-card:fullscreen { width:100vw; height:100vh; border-radius:0; border:0; background:var(--pn); }
+  .dg-card:fullscreen .dg-wrap { min-height:0; }
+  .dg-card.dg-full { position:fixed; inset:0; z-index:500; border-radius:0; border:0; background:var(--pn); }
+  .dg-card.dg-full .dg-wrap { min-height:0; }
+  .dg-empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; padding:24px; color:var(--mu); font-size:14px; pointer-events:none; }
+  .dg-empty:empty { display:none; }
+  .dg-legend { display:flex; flex-wrap:wrap; gap:6px 16px; padding:8px 14px; border-top:1px solid var(--bd); font-size:11.5px; color:var(--mu); align-items:center; }
+  .dg-legend .dot { margin-right:5px; }
+  .dg-legend .lg-run, .dg-legend .lg-done, .dg-legend .lg-fail, .dg-legend .lg-q, .dg-legend .lg-hold { padding:1px 8px; border-radius:999px; font-weight:600; }
+  .dg-legend .lg-run { background:var(--t-a); color:var(--c-a); } .dg-legend .lg-done { background:var(--t-gn); color:var(--gr); }
+  .dg-legend .lg-fail { background:var(--t-r); color:var(--c-r); } .dg-legend .lg-q { background:var(--t-b); color:var(--c-b); }
+  .dg-legend .lg-hold { border:1px dashed var(--am); color:var(--c-a); }
+  .dg-n { cursor:grab; outline:none; }
+  .dg-n:active { cursor:grabbing; }
+  .dg-n .bx { fill:var(--pn2); stroke:var(--bd); stroke-width:2; }
+  .dg-n.s-UP .bx { stroke:var(--gr); } .dg-n.s-DOWN .bx { stroke:var(--rd); } .dg-n.s-PENDING .bx { stroke:var(--mu); }
+  .dg-n.ext .bx { stroke:var(--mu); stroke-dasharray:5 4; }
+  .dg-n .sd { fill:var(--mu); } .dg-n.s-UP .sd { fill:var(--gr); } .dg-n.s-DOWN .sd { fill:var(--rd); }
+  .dg-n text { fill:var(--tx); font-size:12px; pointer-events:none; }
+  .dg-n .nm { font-weight:700; }
+  .dg-n .ipt { fill:var(--mu); font-size:10.5px; }
+  .dg-n .stt { font-size:10.5px; font-weight:700; fill:var(--mu); }
+  .dg-n.s-UP .stt { fill:var(--gr); } .dg-n.s-DOWN .stt { fill:var(--rd); }
+  .dg-n .strip rect { fill:var(--t-g); }
+  .dg-n .strip text { font-size:10.5px; font-weight:600; fill:var(--mu); }
+  .dg-n.u-none .strip { display:none; }
+  .dg-n.u-running .strip rect, .dg-n.u-attention .strip rect { fill:var(--t-a); }
+  .dg-n.u-running .strip text, .dg-n.u-attention .strip text { fill:var(--c-a); }
+  .dg-n.u-completed .strip rect { fill:var(--t-gn); } .dg-n.u-completed .strip text { fill:var(--gr); }
+  .dg-n.u-failed .strip rect { fill:var(--t-r); } .dg-n.u-failed .strip text { fill:var(--c-r); }
+  .dg-n.u-queued .strip rect { fill:var(--t-b); } .dg-n.u-queued .strip text { fill:var(--c-b); }
+  .dg-n.u-running .bx { stroke-width:3; animation:pulse 1.4s ease-in-out infinite; }
+  .dg-n.hold .bx { stroke:var(--am); stroke-dasharray:6 4; stroke-width:3; }
+  .dg-n.u-hold .strip rect { fill:var(--t-a); stroke:var(--am); stroke-dasharray:4 3; } .dg-n.u-hold .strip text { fill:var(--c-a); }
+  .dg-n.sel .bx { filter:drop-shadow(0 0 5px var(--ac)); }
+  .dg-n:focus-visible .bx { stroke:var(--ac); }
+  .dg-e { fill:none; stroke:var(--mu); opacity:.85; }
+  .dg-e.down { stroke:var(--rd); stroke-dasharray:6 5; }
+  .dg-e.upg { stroke:var(--am); }
+  .dg-e.hold { stroke:var(--am); stroke-dasharray:6 4; }
+  .dg-lbl { fill:var(--mu); font-size:9.5px; paint-order:stroke; stroke:var(--pn); stroke-width:4px; stroke-linejoin:round; pointer-events:none; }
+  .dg-cap { fill:var(--mu); font-size:12px; font-weight:600; }
+  .dg-detail { position:absolute; top:10px; right:10px; width:290px; max-height:calc(100% - 20px); overflow:auto; background:var(--pn);
+               border:1px solid var(--bd); border-radius:10px; box-shadow:0 8px 28px rgba(0,0,0,.28); padding:12px 14px; font-size:13px; z-index:2; }
+  .dg-detail[hidden] { display:none; }
+  .dg-detail h5 { margin:0 0 8px; font-size:14px; display:flex; align-items:center; gap:8px; }
+  .dg-detail h5 span { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dg-detail h5 button { background:none; border:0; color:var(--mu); font-size:18px; cursor:pointer; line-height:1; }
+  .dg-detail dl { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; margin:0 0 10px; }
+  .dg-detail dt { color:var(--mu); } .dg-detail dd { margin:0; word-break:break-word; }
+  .dg-detail .nbs { margin:0 0 10px; padding:0; list-style:none; font-size:12px; }
+  .dg-detail .nbs li { padding:4px 0; border-top:1px solid var(--bd); }
+  .dg-detail .nbs .pt { color:var(--mu); }
+  @media (prefers-reduced-motion: reduce) { .dg-n.u-running .bx { animation:none; } }
+
   /* ---- Storage page ---- */
   .st-side { width:266px; }
   .st-side .sh { font-size:15px; padding:14px 14px 8px; }
@@ -7276,7 +8132,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .user-pop a[hidden] { display:none; }
   @media (max-width:900px) { .userbtn .uname { display:none; } }
   /* ---- roles: the server enforces them; this only hides what a role cannot use ---- */
-  body.role-viewer #side, body.role-viewer #storage, body.role-viewer #tab-storage, body.role-viewer #btn-mon,
+  body.role-viewer #side, body.role-viewer #storage, body.role-viewer #tab-storage, body.role-viewer #diagram, body.role-viewer #tab-diagram, body.role-viewer #btn-mon,
   body.role-viewer #sel-count, body.role-viewer #btn-version, body.role-viewer #btn-delete-devices,
   body.role-viewer .ck, body.role-viewer #note-clear { display:none !important; }
   body.role-viewer #site-badge { pointer-events:none; cursor:default; }
@@ -7320,6 +8176,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .set-def:disabled { cursor:default; }
   .set-chk { margin:0; }
   .set-note { padding:8px 18px 0; color:var(--mu); font-size:12px; }
+  .nt-form { display:grid; grid-template-columns:180px minmax(220px,420px); gap:10px 14px; align-items:center; max-width:720px; margin-top:16px; }
+  .nt-form label { margin:0; font-size:13px; color:var(--tx); font-weight:600; }
+  .nt-form .nt-inline { display:flex; gap:8px; align-items:center; }
+  .nt-form .nt-inline input[type=text] { width:90px; }
+  .nt-form .nt-inline select { flex:1; width:auto; }
+  .nt-form .nt-hint { grid-column:2; color:var(--mu); font-size:11.5px; margin-top:-6px; }
+  .nt-kinds { display:flex; flex-wrap:wrap; gap:6px 18px; margin:6px 0 8px; max-width:720px; }
+  .nt-kinds label { display:flex; align-items:center; gap:6px; margin:0; font-size:13px; color:var(--tx); }
+  .nt-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:14px; }
+  .nt-last { color:var(--mu); font-size:12px; margin-top:10px; }
+  .nt-last.ok { color:var(--gr); } .nt-last.bad { color:var(--rd); }
   .card.e { cursor:default; }
   .card.e > h4 { cursor:pointer; user-select:none; flex-wrap:nowrap; }
   .card.e.collapsed { height:auto; }
@@ -7460,17 +8327,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span>NetUpgrade</span>
     <span class="appver" title="Application version">v__APP_VERSION__</span>
   </div>
-  <span class="sitemenu"><button type="button" id="site-badge" class="badge warn site-btn" aria-haspopup="true" aria-expanded="false" title="Select or create a site">Site: not assigned</button><div id="site-pop" class="site-pop" role="menu" hidden></div></span>
+  <span class="sitemenu"><button type="button" id="site-badge" class="badge warn site-btn" aria-haspopup="true" aria-expanded="false" title="Select or create a site">Site: Not Assigned</button><div id="site-pop" class="site-pop" role="menu" hidden></div></span>
   <nav class="tabs" aria-label="Sections" role="tablist">
     <button type="button" class="tab on" id="tab-home" role="tab" aria-selected="true" data-view="home"><span data-i="home"></span>Home</button>
+    <button type="button" class="tab" id="tab-diagram" role="tab" aria-selected="false" data-view="diagram"><span data-i="diagram"></span>Diagram</button>
     <button type="button" class="tab" id="tab-storage" role="tab" aria-selected="false" data-view="storage"><span data-i="storage"></span>Storage</button>
   </nav>
   <span class="sp"></span>
   <span class="lost" id="lost"></span>
   <span class="mdot" id="mon-dot" role="img" aria-label="Monitoring status" title="Monitoring status"></span>
   <span id="state" class="mstate">Monitor starting</span>
-  <button class="btn p" id="btn-mon" style="padding:7px 14px">Start monitoring</button>
-  <span class="notemenu"><button class="ib" id="btn-bell" title="Notifications - upgrades started and completed" aria-haspopup="true" aria-expanded="false" style="position:relative"><span data-i="bell"></span><span class="nbadge" id="bell-count" hidden>0</span></button><div class="note-pop" id="note-pop" role="dialog" aria-label="Notifications" hidden><div class="nh"><span>Notifications</span><span><button type="button" id="note-sound" title="Play a sound for new alerts (not for logins)">Sound: on</button> <button type="button" id="note-clear">Clear all</button></span></div><div class="nl" id="note-list"></div></div></span>
+  <button class="btn p" id="btn-mon" style="padding:7px 14px">Start Monitoring</button>
+  <span class="notemenu"><button class="ib" id="btn-bell" title="Notifications - upgrades started and completed" aria-haspopup="true" aria-expanded="false" style="position:relative"><span data-i="bell"></span><span class="nbadge" id="bell-count" hidden>0</span></button><div class="note-pop" id="note-pop" role="dialog" aria-label="Notifications" hidden><div class="nh"><span>Notifications</span><span><button type="button" id="note-sound" title="Play a sound for new alerts (not for logins)">Sound: On</button> <button type="button" id="note-clear">Clear All</button></span></div><div class="nl" id="note-list"></div></div></span>
   <button class="ib" id="btn-settings" title="Settings" aria-label="Settings"><span data-i="gear"></span></button>
   <button class="ib" id="btn-theme" title="Switch between light and dark mode"></button>
   <span class="usermenu"><button type="button" class="userbtn" id="btn-user" aria-haspopup="true" aria-expanded="false" title="Signed-in user"><span data-i="user"></span><span class="uname" id="uname"></span></button><div class="user-pop" id="user-pop" role="dialog" aria-label="Signed-in user" hidden><div class="uh"><b id="uname2"></b><span id="urole2"></span></div><a id="btn-logout" href="/__guard/logout" target="_top">Sign out</a></div></span>
@@ -7478,40 +8346,31 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
 <div class="app nosite" id="dashboard">
   <aside class="side wide" id="side">
-    <div class="sh"><button class="cb" id="btn-collapse" title="Collapse panel"><span data-i="menu"></span></button><span class="shl">Upgrade Manager</span></div>
+    <div class="sh"><button class="cb" id="btn-collapse" title="Collapse panel"><span data-i="menu"></span></button><span class="shl">NetUpgrade</span></div>
 
     <div class="sec" data-sec="1">
       <h3 tabindex="0" role="button" title="Device List"><span data-i="1"></span><span class="lbl">Device List</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
-        <div class="msg" id="msg-1" role="status" aria-live="polite"></div>
-        <div class="note" style="margin-top:0" id="device-count">No devices loaded yet.</div>
-        <label for="device-file">Upload device list (.xlsx)<span class="tip" data-tip="Excel columns: ip (required), hostname and platform."></span></label>
+        <label for="device-file" style="margin-top:0">Upload device list (.xlsx)<span class="tip" data-tip="Excel columns: ip (required), hostname and platform. Use Download template for a ready-made file."></span></label>
         <input type="file" id="device-file" accept=".xlsx">
         <div class="note" id="device-file-last"></div>
-        <div class="row"><button class="btn" id="btn-upload-devices" disabled>Upload list</button></div>
+        <div class="row"><button class="btn p" id="btn-upload-devices" disabled>Upload List</button></div>
+        <div class="note"><a class="lnk" id="btn-device-template" href="/api/devices/template.xlsx" download="device_list_template.xlsx" title="Download an empty Excel file with the right columns (ip, hostname, platform) to fill in and upload">Download template</a></div>
         <hr class="sep">
         <label for="new-hostname">Add device manually</label>
         <input type="text" id="new-hostname" placeholder="Hostname (required)" autocomplete="off" spellcheck="false">
         <input type="text" id="new-ip" placeholder="IP address (required)" autocomplete="off" spellcheck="false">
         <input type="text" id="new-platform" list="platform-options" placeholder="Platform (e.g. C9200L-48P-4G)" autocomplete="off" spellcheck="false" maxlength="40">
         <datalist id="platform-options"><option value="C9200"><option value="C9200L"><option value="C9300"><option value="C9300L"><option value="C9500"><option value="2960X"></datalist>
-        <div class="row"><button class="btn p" id="btn-add-device">Add device</button></div>
+        <div class="row"><button class="btn p" id="btn-add-device">Add Device</button></div>
+        <div class="msg" id="msg-1" role="status" aria-live="polite"></div>
       </div>
     </div>
 
     <div class="sec" data-sec="2">
       <h3 tabindex="0" role="button" title="Credential Profiles"><span data-i="2"></span><span class="lbl">Credential Profiles</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
-        <div class="msg" id="msg-2" role="status" aria-live="polite"></div>
-        <label for="prof-assign">Use this profile for the selected devices</label>
-        <select id="prof-assign"></select>
-        <div class="row" style="flex-wrap:wrap">
-          <button class="btn p" id="btn-prof-assign" disabled>Assign to selected</button>
-          <button class="btn" id="btn-test-creds" disabled
-              title="Log in (and enable, if a secret is set) on the selected switches with the profile chosen above - no need to assign it first">Test credentials</button>
-        </div>
-        <hr class="sep">
-        <label for="prof-edit">Create or edit a profile<span class="tip w" data-tip="Every device needs a profile before it can be backed up or upgraded (credential tests can use any saved profile without assigning it). Passwords are saved encrypted (only your Windows user can read them), never written to logs and never shown again. When editing, leave a password empty to keep the saved one."></span></label>
+        <label for="prof-edit" style="margin-top:0">Create or edit a profile<span class="tip w" data-tip="Every device needs a profile before it can be backed up or upgraded (credential tests can use any saved profile without assigning it). Passwords are saved encrypted (only your Windows user can read them), never written to logs and never shown again. When editing, leave a password empty to keep the saved one.\n\nTo test: select a switch in the Devices table, press Test Credentials, and save the profile once the login works. The test never saves or assigns anything."></span></label>
         <select id="prof-edit"></select>
         <input type="text" id="prof-name" placeholder="Profile name (e.g. Core switches)" maxlength="40" autocomplete="off" spellcheck="false">
         <input type="text" id="prof-user" placeholder="Username" autocomplete="off" spellcheck="false">
@@ -7519,29 +8378,43 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <input type="password" id="prof-secret" placeholder="Enable secret (optional)" autocomplete="new-password">
         <label class="chk"><input type="checkbox" id="prof-show"><span>Show password</span></label>
         <label class="chk" id="prof-clear-wrap" hidden><input type="checkbox" id="prof-clear"><span>Remove the saved enable secret</span></label>
-        <div class="row">
-          <button class="btn p" id="btn-prof-save">Save profile</button>
-          <button class="btn" id="btn-prof-delete" disabled>Delete profile</button>
+        <label id="prof-proto-label">Connection<span class="tip w" data-tip="Telnet sends the username, password and every command in clear text. Use it only on a trusted management network. Upgrades need SSH (the image is copied with SCP); backups, credential tests, readiness checks, the console and topology discovery work over Telnet."></span></label>
+        <div class="protobox" role="radiogroup" aria-labelledby="prof-proto-label">
+          <label class="ropt"><input type="radio" name="prof-proto" value="ssh" checked><span>SSH</span></label>
+          <label class="ropt"><input type="radio" name="prof-proto" value="telnet"><span>Telnet</span></label>
+          <span class="portwrap"><label for="prof-port">Port</label><input type="text" id="prof-port" value="22" placeholder="22" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" title="TCP port used to reach the switch. SSH is normally 22, Telnet 23."></span>
         </div>
+        <div class="row">
+          <button class="btn" id="btn-prof-test" disabled
+              title="Log in (and enable, if a secret is typed) on the switches selected in the Devices table using the details above - nothing is saved or assigned">Test Credentials</button>
+          <button class="btn p" id="btn-prof-save">Save Profile</button>
+        </div>
+        <div class="row"><button class="btn" id="btn-prof-delete" disabled>Delete Profile</button></div>
+        <hr class="sep">
+        <label for="prof-assign">Use a saved profile on the selected devices</label>
+        <select id="prof-assign"></select>
+        <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
+          <button class="btn p" id="btn-prof-assign" disabled>Assign To Selected</button>
+        </div>
+        <div class="msg" id="msg-2" role="status" aria-live="polite"></div>
       </div>
     </div>
 
     <div class="sec" data-sec="3">
       <h3 tabindex="0" role="button" title="Configuration Backup"><span data-i="3"></span><span class="lbl">Configuration Backup</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
-        <div class="msg" id="msg-3" role="status" aria-live="polite"></div>
         <label for="custom-commands" style="margin-top:0">Additional commands (optional)</label>
         <textarea id="custom-commands" placeholder="show vlan brief&#10;show interfaces status"></textarea>
-        <div class="row"><button class="btn p" id="btn-backup" disabled>Run backup</button><span class="tip" data-tip="Saves show running-config, show version, show boot, show inventory and the additional commands (all outputs in ONE file per switch), then shows the current software version in the table. Additional commands: one per line."></span></div>
+        <div class="row"><button class="btn p" id="btn-backup" disabled>Run Backup</button><span class="tip" data-tip="Saves show running-config, show version, show boot, show inventory and the additional commands (all outputs in ONE file per switch), then shows the current software version in the table. Additional commands: one per line."></span></div>
         <div class="hint" id="backup-status">No backup run yet.</div>
         <div class="hint" id="backup-commands-log" style="max-height:110px; overflow-y:auto; display:none;"></div>
+        <div class="msg" id="msg-3" role="status" aria-live="polite"></div>
       </div>
     </div>
 
     <div class="sec o" data-sec="4">
       <h3 tabindex="0" role="button" title="Firmware Upgrade"><span data-i="4"></span><span class="lbl">Firmware Upgrade</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
-        <div class="msg" id="msg-4" role="status" aria-live="polite"></div>
         <label for="image-select" id="image-select-label" style="margin-top:0">Select image to install<span class="tip" data-tip="To add an image, open Storage and use IOS-XE images (upload + MD5 check). Rollout options (switches at the same time, stop on failure) and command timeouts are in Settings (gear icon)."></span></label>
         <select id="image-select"><option value="">No images uploaded yet</option></select>
         <label for="upgrade-action">Action<span class="tip" id="action-tip" data-tip="Full upgrade: uploads the image, activates it and reloads the switch in one step."></span></label>
@@ -7551,17 +8424,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <option value="activate">Activate only</option>
         </select>
         <div class="row"><button class="btn" id="btn-readiness" disabled
-              title="Log in and check version, free flash space, CPU, memory and stack health - read-only, no upload or reload">Readiness check</button></div>
+              title="Log in and check version, free flash space, CPU, memory and stack health - read-only, no upload or reload">Readiness Check</button></div>
         <label class="chk"><input type="checkbox" id="backup-before-upgrade" checked><span>Back up configuration first</span></label>
         <label class="chk"><input type="checkbox" id="skip-image-check"><span>Ignore image check warnings</span><span class="tip w" data-tip="Tick only if you are sure: the image does not match the switch model, or it is older than the running version."></span></label>
         <label class="chk"><input type="checkbox" id="ignore-space"><span>Ignore flash space check</span><span class="tip w" data-tip="Tick only if you are sure: continues even when free flash is below the image size + 1 GB that Cisco asks for. Free some flash first if you can (delete old .bin / .pkg files). If flash really runs out, the install can fail part-way."></span></label>
         <label for="sched-time">Schedule for (optional)<span class="tip" id="slot-tip" data-tip="A live web console opens at the bottom of this page for every switch, immediately or at its scheduled time. The switch reloads by itself; the table shows the new version once it is back."></span></label>
         <input type="datetime-local" id="sched-time">
         <div class="row">
-          <button class="btn p" id="btn-upgrade" disabled>Start now</button>
+          <button class="btn p" id="btn-upgrade" disabled>Start Now</button>
           <button class="btn" id="btn-schedule" disabled>Schedule</button>
           <button class="btn" id="btn-unschedule" disabled title="Cancel the scheduled upgrade on the selected switches">Cancel</button>
         </div>
+        <div class="msg" id="msg-4" role="status" aria-live="polite"></div>
       </div>
     </div>
     <div class="sec" data-sec="5">
@@ -7603,8 +8477,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <h4>Devices
           <span class="a">
             <span id="sel-count">0 selected</span>
-            <button class="btn sm" id="btn-version" disabled title="Log in to the selected switches and read the current software version">Refresh version</button>
-            <button class="btn sm" id="btn-delete-devices" disabled title="Remove the selected devices from the list (existing backups are not affected)">Delete selected</button>
+            <button class="btn sm" id="btn-version" disabled title="Log in to the selected switches and read the current software version">Refresh Version</button>
+            <button class="btn sm" id="btn-delete-devices" disabled title="Remove the selected devices from the list (existing backups are not affected)">Delete Selected</button>
             <button class="btn sm" id="btn-cols" type="button" title="Choose which columns the table shows">Columns</button>
             <span class="fl">
               <button class="btn sm on" data-f="all">All</button>
@@ -7639,7 +8513,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </select>
           <select id="dev-f-platform" aria-label="Filter by platform"><option value="all">Platform: any</option></select>
           <span class="dev-shown" id="dev-shown"></span>
-          <button type="button" class="btn sm" id="dev-reset" hidden>Reset filters</button>
+          <button type="button" class="btn sm" id="dev-reset" hidden>Reset Filters</button>
         </div>
         <div class="sc">
           <table id="dev-table">
@@ -7653,6 +8527,46 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="card e collapsed" id="ev-card"><h4 id="ev-head"><span>Events</span><span class="evn" id="ev-count"></span><span class="evlast" id="ev-last"></span><button type="button" class="ib mx" id="ev-toggle" data-max="Events" aria-pressed="false" aria-expanded="false" aria-controls="events"><span data-i="expand"></span></button></h4><div class="ev" id="events"><span class="muted">Nothing yet.</span></div></div>
+    </div>
+  </main>
+</div>
+
+<div class="app" id="diagram" hidden>
+  <aside class="side dg-side" aria-label="Diagram devices">
+    <div class="sh"><span data-i="diagram"></span><span class="shl">Diagram</span></div>
+    <div class="dg-sec">
+      <div class="note" id="dg-site" style="margin-top:0"></div>
+      <div class="dg-actions"><button type="button" class="btn" id="dg-all" disabled>Select All</button><button type="button" class="btn p" id="dg-run" title="Discover topology: read the CDP neighbours of the ticked switches" disabled>Discover</button></div>
+      <div class="dg-list" id="dg-list"></div>
+      <div class="msg" id="dg-msg" role="status" aria-live="polite" style="margin-top:8px"></div>
+    </div>
+  </aside>
+  <main>
+    <div class="card dg-card" id="dg-card">
+      <h4>Topology<span class="tip" data-tip="Built from CDP: each selected switch is asked for its CDP neighbours, so the links shown are the ones the switches report. Devices need a credentials profile. The top of each tree is picked automatically (the switch in the middle of the network). Only the switches ticked for the last Discover are shown. Drag a switch to place it anywhere; drag empty space to move the whole diagram; scroll the mouse wheel to zoom."></span>
+        <span class="a">
+          <label class="chk" style="margin:0"><input type="checkbox" id="dg-ports" checked>Port labels</label>
+          <label class="chk" style="margin:0"><input type="checkbox" id="dg-other">APs, phones &amp; hosts</label>
+          <button type="button" class="btn sm" id="dg-zout" title="Zoom out">&minus;</button>
+          <button type="button" class="btn sm" id="dg-zin" title="Zoom in">+</button>
+          <button type="button" class="btn sm" id="dg-reset" title="Forget dragged positions and arrange the switches again">Reset Layout</button>
+          <button type="button" class="btn sm" id="dg-fit" title="Fit the whole diagram in the window">Fit</button>
+          <button type="button" class="btn sm" id="dg-png" title="Save the diagram as a PNG picture, with the switches where you placed them" disabled>Export PNG</button>
+          <button type="button" class="btn sm" id="dg-refresh">Refresh</button>
+          <button type="button" class="btn sm dg-ico" id="dg-full" title="Full screen (Esc to exit)" aria-label="Full screen" aria-pressed="false"><span data-i="expand"></span></button>
+        </span></h4>
+      <div class="dg-banner" id="dg-banner" hidden></div>
+      <div class="dg-wrap" id="dg-wrap">
+        <svg id="dg-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Network topology"></svg>
+        <div class="dg-empty" id="dg-empty"></div>
+        <div class="dg-hint" id="dg-hint">Drag a switch to move it &middot; drag the background to pan &middot; mouse wheel to zoom</div>
+        <aside class="dg-detail" id="dg-detail" hidden></aside>
+      </div>
+      <div class="dg-legend">
+        <span><i class="dot ok"></i>Up</span><span><i class="dot bad"></i>Down</span><span><i class="dot"></i>Not checked yet</span>
+        <span class="lg-run">Upgrading</span><span class="lg-done">Upgrade completed</span><span class="lg-fail">Failed</span><span class="lg-q">Scheduled / queued</span>
+        <span class="lg-hold">Hold: uplink of a switch being upgraded</span><span class="lg-ext">Dashed grey: not onboarded</span>
+      </div>
     </div>
   </main>
 </div>
@@ -7671,7 +8585,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div><label for="image-file">Image file (.bin)</label><input type="file" id="image-file" accept=".bin"></div>
           <div><label for="image-md5">Cisco MD5 checksum</label>
             <input type="text" id="image-md5" maxlength="32" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="32 hexadecimal characters"></div>
-          <div><button class="btn p" id="btn-upload-image" disabled>Upload and verify</button></div>
+          <div><button class="btn p" id="btn-upload-image" disabled>Upload And Verify</button></div>
         </div>
         <div class="hint" id="image-upload-status"></div>
         <div class="msg" id="img-msg" role="status" aria-live="polite"></div>
@@ -7690,7 +8604,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input type="text" id="st-search" placeholder="Search backups, reports and runs in this site..." autocomplete="off" spellcheck="false" aria-label="Search files and folders">
           <button type="button" class="st-clear" id="st-clear" title="Clear search" hidden>&times;</button>
         </div>
-        <a class="btn sm" id="st-zip" href="#" title="Download this folder as a ZIP file">Download folder (.zip)</a>
+        <a class="btn sm" id="st-zip" href="#" title="Download this folder as a ZIP file">Download Folder (.zip)</a>
         <button type="button" class="btn sm" id="st-refresh">Refresh</button>
       </div>
       <div class="msg" id="st-msg" role="status" aria-live="polite" style="margin:6px 14px 0"></div>
@@ -7715,8 +8629,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card set-card">
       <h4><span id="set-title">Settings</span>
         <span class="a"><span id="set-dirty"></span>
-          <button type="button" class="btn sm" id="set-reset" title="Put every value on this tab back to its default (not saved until you click Save)">Restore defaults</button>
-          <button type="button" class="btn p sm" id="set-save">Save settings</button></span></h4>
+          <button type="button" class="btn sm" id="set-reset" title="Put every value on this tab back to its default (not saved until you click Save)">Restore Defaults</button>
+          <button type="button" class="btn p sm" id="set-save">Save Settings</button></span></h4>
       <div class="msg" id="set-msg" role="status" aria-live="polite" style="margin:8px 18px 0"></div>
       <div class="set-note" id="set-note" hidden>Only an Administrator can change these settings.</div>
       <div class="set-body" id="set-body"></div>
@@ -7751,7 +8665,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="msg" id="site-msg" role="status" aria-live="polite" style="margin-top:8px"></div>
     <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:8px;">
       <button class="btn" id="btn-site-cancel" type="button">Cancel</button>
-      <button class="btn p" id="btn-site-create" type="button">Create site</button>
+      <button class="btn p" id="btn-site-create" type="button">Create Site</button>
     </div>
   </div>
 </div>
@@ -7808,6 +8722,7 @@ const IC = {
   menu: I('<path d="M4 6h16M4 12h16M4 18h16"/>'),
   dn: I('<path d="m6 9 6 6 6-6"/>'),
   home: I('<path d="M3 11 12 3l9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>'),
+  diagram: I('<rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-4h12v4"/>'),
   storage: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   folder: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   file: I('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>'),
@@ -7906,7 +8821,7 @@ const colPop = document.createElement("div");
 colPop.className = "col-pop"; colPop.hidden = true;
 colPop.innerHTML = '<div class="cp-h">Show columns</div>' +
   COLS.map(c => '<label class="ci"><input type="checkbox" data-col="' + c[0] + '"> ' + c[1] + "</label>").join("") +
-  '<div class="cp-f"><button type="button" class="btn sm" id="cols-all">Show all</button></div>';
+  '<div class="cp-f"><button type="button" class="btn sm" id="cols-all">Show All</button></div>';
 document.body.appendChild(colPop);
 function syncColChecks() { colPop.querySelectorAll("input[data-col]").forEach(i => { i.checked = !hiddenCols.includes(i.dataset.col); }); }
 function applyCols() {
@@ -7935,7 +8850,12 @@ document.addEventListener("click", closeColPop);
 document.addEventListener("keydown", e => { if (e.key === "Escape") closeColPop(); });
 applyCols();
 
-function say(kind, text) { const m = $("msg"); m.className = "msg " + kind; m.textContent = text; }
+let sayTimer = null;
+function say(kind, text) {
+  const m = $("msg"); m.className = "msg " + kind; m.textContent = text;
+  clearTimeout(sayTimer);
+  if (text) sayTimer = setTimeout(() => { m.textContent = ""; }, kind === "err" ? 12000 : 6000);
+}
 function sayIn(tile, kind, text) {
   const m = tile && $("msg-" + tile);
   if (!m) { say(kind, text); return; }
@@ -8168,6 +9088,90 @@ $("dev-reset").addEventListener("click", () => {
   devFilterChanged();
 });
 
+// ---- Settings > Notifications (e-mail copies of the notifications; moved here from the desktop launcher) ----
+const NT = {data: null, draft: null, pw: "", busy: false, msg: null};
+async function ntLoad() {
+  try {
+    const r = await fetch("/api/notifications/email", {cache: "no-store"});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Could not load the notification settings.");
+    NT.data = d; NT.draft = JSON.parse(JSON.stringify(d.values)); NT.pw = "";
+  } catch (e) { NT.data = null; NT.msg = {kind: "err", text: e.message}; }
+  if (SET.tab === "notifications") renderSettings();
+}
+function ntSay(kind, text) { NT.msg = text ? {kind: kind, text: text} : null; const m = $("nt-msg"); if (m) { m.className = "msg " + (kind || ""); m.textContent = text || ""; } }
+function ntEnabledState() {
+  const root = $("nt-root"); if (!root) return;
+  const on = !!(NT.draft && NT.draft.enabled);
+  root.querySelectorAll("[data-nt-dep]").forEach(el => { el.disabled = !SET_CAN_EDIT || !on; });
+}
+function ntRender() {
+  const root = $("nt-root"); if (!root) return;
+  if (!NT.data) { root.innerHTML = '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" style="margin-top:14px">' + esc(NT.msg ? NT.msg.text : "Loading ...") + "</div>"; return; }
+  const d = NT.draft, dis = SET_CAN_EDIT ? "" : " disabled";
+  const secOpts = NT.data.security_options.map(o => '<option value="' + esc(o.key) + '"' + (o.key === d.security ? " selected" : "") + ">" + esc(o.label) + "</option>").join("");
+  const kinds = NT.data.kinds.map(k => '<label><input type="checkbox" data-nt-kind="' + esc(k.key) + '" data-nt-dep' + (d.kinds.includes(k.key) ? " checked" : "") + ">" + esc(k.label) + "</label>").join("");
+  const last = NT.data.last && NT.data.last.time ? '<div class="nt-last ' + (NT.data.last.ok ? "ok" : "bad") + '">Last e-mail ' + esc(NT.data.last.time) + ": " + esc(NT.data.last.detail || "") + "</div>" : "";
+  root.innerHTML =
+    '<div class="nt-form">' +
+    '<label for="nt-enabled">Send e-mail notifications</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="nt-enabled"' + (d.enabled ? " checked" : "") + dis + "><span>" + (d.enabled ? "On" : "Off") + "</span></label>" +
+    '<label for="nt-host">SMTP server</label><input type="text" id="nt-host" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.host) + '">' +
+    '<label for="nt-port">Port / security</label><div class="nt-inline"><input type="text" id="nt-port" data-nt-dep inputmode="numeric" maxlength="5" value="' + esc(String(d.port)) + '"><select id="nt-sec" data-nt-dep>' + secOpts + "</select></div>" +
+    '<label for="nt-user">Gmail address</label><input type="text" id="nt-user" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.username) + '">' +
+    '<label for="nt-pw">App password</label><input type="password" id="nt-pw" data-nt-dep autocomplete="new-password" maxlength="200" value="' + esc(NT.pw) + '">' +
+    '<div class="nt-hint">' + (NT.data.password_saved ? "Password saved - leave empty to keep it. " : "") + "</div>" +
+    '<label for="nt-to">Send to</label><input type="text" id="nt-to" data-nt-dep autocomplete="off" spellcheck="false" maxlength="2000" value="' + esc(d.to) + '">' +
+    '<div class="nt-hint">Several recipients: separate them with commas.</div></div>' +
+    '<div class="set-sec">E-mail me about</div><div class="nt-kinds">' + kinds + "</div>" +
+    '<div class="nt-actions"><button type="button" class="btn sm" data-nt-q="all" data-nt-dep>Select All</button>' +
+    '<button type="button" class="btn sm" data-nt-q="problems" data-nt-dep>Problems Only</button>' +
+    '<button type="button" class="btn sm" data-nt-q="none" data-nt-dep>Clear</button></div>' +
+    '<div class="nt-actions"><button type="button" class="btn sm" id="nt-test" data-nt-dep>Send Test E-Mail</button>' +
+    '<button type="button" class="btn p sm" id="nt-save"' + dis + ">Save Notification Settings</button></div>" +
+    '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" id="nt-msg" role="status" aria-live="polite" style="margin:10px 0 0">' + esc(NT.msg ? NT.msg.text : "") + "</div>" + last;
+  ntEnabledState();
+}
+function ntValues() {
+  const d = NT.draft;
+  return {enabled: d.enabled, host: d.host.trim(), port: d.port, security: d.security, username: d.username.trim(),
+          to: d.to.trim(), kinds: d.kinds.slice(), password: NT.pw};
+}
+function ntCollect() {
+  const d = NT.draft, g = id => { const el = $(id); return el ? el.value : null; };
+  if (g("nt-host") !== null) { d.host = g("nt-host"); d.port = g("nt-port").trim(); d.security = g("nt-sec"); d.username = g("nt-user"); d.to = g("nt-to"); NT.pw = g("nt-pw"); }
+}
+document.addEventListener("click", async e => {
+  const root = $("nt-root"); if (!root || !root.contains(e.target) || !SET_CAN_EDIT || !NT.data) return;
+  const q = e.target.closest("[data-nt-q]");
+  if (q) {
+    ntCollect();
+    NT.draft.kinds = q.dataset.ntQ === "all" ? NT.data.kinds.map(k => k.key) : q.dataset.ntQ === "problems" ? NT.data.problem_kinds.slice() : [];
+    ntRender(); return;
+  }
+  if (e.target.id === "nt-test" || e.target.id === "nt-save") {
+    if (NT.busy) return;
+    ntCollect();
+    const test = e.target.id === "nt-test", btn = e.target;
+    NT.busy = true; btn.disabled = true; ntSay("", test ? "Sending test e-mail ..." : "Saving ...");
+    try {
+      const body = ntValues(); if (test) body.enabled = true;
+      const r = await post(test ? "/api/notifications/email/test" : "/api/notifications/email", {values: body});
+      if (!test) { NT.data = r; NT.draft = JSON.parse(JSON.stringify(r.values)); NT.pw = ""; }
+      NT.busy = false; ntRender(); ntSay("ok", r.message);
+    } catch (err) { NT.busy = false; btn.disabled = false; ntSay("err", err.message); }
+  }
+});
+document.addEventListener("change", e => {
+  const root = $("nt-root"); if (!root || !root.contains(e.target) || !SET_CAN_EDIT || !NT.data) return;
+  if (e.target.id === "nt-enabled") { ntCollect(); NT.draft.enabled = e.target.checked; e.target.parentNode.querySelector("span").textContent = e.target.checked ? "On" : "Off"; ntEnabledState(); }
+  else if (e.target.dataset.ntKind) { const k = e.target.dataset.ntKind, set = new Set(NT.draft.kinds); e.target.checked ? set.add(k) : set.delete(k); NT.draft.kinds = NT.data.kinds.map(x => x.key).filter(x => set.has(x)); }
+  else if (e.target.id === "nt-sec") {
+    ntCollect();
+    if (["", "587", "465"].includes(String(NT.draft.port))) NT.draft.port = e.target.value === "ssl" ? "465" : "587";
+    ntRender();
+  }
+});
+
 let ROLLOUT = {max_parallel: 1, stop_on_failure: true, limit: 10};   // kept up to date from the status poll; edited on the Settings page
 function applyRolloutSettings(s) { ROLLOUT = s; }
 
@@ -8181,7 +9185,7 @@ function render(d) {
   const st = $("state"); st.textContent = "Monitor " + m.state; st.className = "mstate " + m.state;
   const md = $("mon-dot"); md.className = "mdot " + m.state;
   $("meta").textContent = "Check: " + m.mode + " every " + m.interval + "s" + (m.started_at ? "  |  started " + m.started_at : "");
-  $("btn-mon").textContent = m.state === "running" ? "Stop monitoring" : "Start monitoring";
+  $("btn-mon").textContent = m.state === "running" ? "Stop Monitoring" : "Start Monitoring";
   $("btn-mon").className = "btn" + (m.state === "running" ? "" : " p");
   $("btn-mon").dataset.action = m.state === "running" ? "stop" : "start";
   if ((d.site || null) !== siteName) { applySite(d.site); loadSites(); }
@@ -8199,8 +9203,6 @@ function render(d) {
   $("c-active").textContent = d.upgrade.active;
   $("c-scheduled").textContent = d.upgrade.scheduled;
   $("c-completed").textContent = d.upgrade.completed;
-  $("device-count").textContent = d.summary.total === 0 ? "No devices loaded yet."
-    : d.summary.total + " device" + (d.summary.total === 1 ? "" : "s") + " loaded.";
 
   if (m.duration > 0) {
     $("p-bar").style.width = Math.min(100, m.elapsed / m.duration * 100) + "%";
@@ -8284,14 +9286,16 @@ function updateButtons() {
   $("sel-count").textContent = n + " selected";
   $("btn-backup").disabled = n === 0;
   $("btn-version").disabled = n === 0;
-  $("btn-test-creds").disabled = n === 0;
+  $("btn-prof-test").disabled = n === 0 || profTestBusy;
+  $("btn-prof-test").title = n === 0 ? "Select one or more switches in the Devices table first - the test logs in to them with the details typed above"
+    : "Log in on the " + n + " selected switch" + (n === 1 ? "" : "es") + " with the details above - nothing is saved or assigned";
   $("btn-prof-assign").disabled = n === 0 || !$("prof-assign").value;
   $("btn-readiness").disabled = n === 0 || anyActive;
   $("btn-delete-devices").disabled = n === 0 || anyBusy;
   $("btn-delete-devices").title = anyBusy
     ? "One or more selected devices have a backup or upgrade in progress"
     : "Remove the selected devices from the list (existing backups are not affected)";
-  $("btn-backup").textContent = "Run backup" + (n ? " (" + n + " selected)" : "");
+  $("btn-backup").textContent = "Run Backup" + (n ? " (" + n + " Selected)" : "");
   $("btn-upgrade").disabled = n === 0 || anyActive;
   $("btn-schedule").disabled = n === 0 || anyActive;
   $("btn-unschedule").disabled = n === 0 || !anyScheduled;
@@ -8319,6 +9323,12 @@ function creds() {
 
 // ---- credential profiles ----
 let profEditing = null;           // name of the profile being edited, or null for a new one
+var profTestBusy = false;         // a "Test Credentials" run is in progress
+function profProto() { const r = document.querySelector('input[name="prof-proto"]:checked'); return r && r.value === "telnet" ? "telnet" : "ssh"; }
+function setProfProto(v) { document.querySelectorAll('input[name="prof-proto"]').forEach(r => { r.checked = r.value === (v === "telnet" ? "telnet" : "ssh"); }); }
+function profPort() { return $("prof-port").value.trim(); }
+function portValid() { const v = profPort(); return v === "" || (/^\d{1,5}$/.test(v) && +v >= 1 && +v <= 65535); }
+function portBad() { sayIn(2, "err", "Enter a port number between 1 and 65535."); $("prof-port").focus(); }
 function fillProfileLists(d) {
   const names = (d.profiles || []).map(p => p.name);
   const sig = JSON.stringify(d.profiles || []);
@@ -8329,7 +9339,7 @@ function fillProfileLists(d) {
   a.innerHTML = names.length ? names.map(n => '<option value="' + esc(n) + '">' + esc(n) + "</option>").join("")
                              : '<option value="">No profiles yet - create one below</option>';
   e.innerHTML = '<option value="">New profile...</option>' + (d.profiles || []).map(p =>
-    '<option value="' + esc(p.name) + '">' + esc(p.name) + " (" + esc(p.username) + ", " + p.devices + " device" +
+    '<option value="' + esc(p.name) + '">' + esc(p.name) + " (" + esc(p.username) + ", " + (p.protocol === "telnet" ? "Telnet" : "SSH") + " " + (p.port || (p.protocol === "telnet" ? 23 : 22)) + ", " + p.devices + " device" +
     (p.devices === 1 ? "" : "s") + ")</option>").join("");
   if (names.includes(keepA)) a.value = keepA;
   if (names.includes(keepE)) e.value = keepE;
@@ -8341,6 +9351,8 @@ function loadProfileForm() {
   profEditing = p ? p.name : null;
   $("prof-name").value = p ? p.name : "";
   $("prof-user").value = p ? p.username : "";
+  setProfProto(p ? p.protocol : "ssh");
+  $("prof-port").value = p ? String(p.port || (p.protocol === "telnet" ? 23 : 22)) : "22"; protoNote();
   $("prof-pass").value = ""; $("prof-secret").value = ""; $("prof-clear").checked = false;
   $("prof-pass").placeholder = p ? "Password (leave empty to keep the saved one)" : "Password";
   $("prof-secret").placeholder = p ? (p.has_secret ? "Enable secret (saved - leave empty to keep)" : "Enable secret (optional)")
@@ -8348,17 +9360,65 @@ function loadProfileForm() {
   $("prof-clear-wrap").hidden = !(p && p.has_secret);
   $("btn-prof-delete").disabled = !p;
 }
+function protoNote() {
+  $("prof-port").placeholder = profProto() === "telnet" ? "23" : "22";
+}
+document.querySelectorAll('input[name="prof-proto"]').forEach(r => r.addEventListener("change", () => {
+  const port = profPort();                                   // follow the protocol only while the port is still a default
+  if (port === "" || port === "22" || port === "23") $("prof-port").value = profProto() === "telnet" ? "23" : "22";
+  protoNote();
+}));
 $("prof-edit").addEventListener("change", loadProfileForm);
 $("prof-assign").addEventListener("change", updateButtons);
 $("prof-show").addEventListener("change", e => {
   const t = e.target.checked ? "text" : "password";
   $("prof-pass").type = t; $("prof-secret").type = t;
 });
+function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+async function showCredsTestResult(hosts) {
+  // The login tests run in the background on the server - poll until every switch has an answer, then summarise.
+  for (let i = 0; i < 60; i++) {
+    await sleep(1500);
+    try { await refresh(); } catch (e) {}
+    const rows = last ? last.hosts.filter(h => hosts.includes(h.host)) : [];
+    if (rows.length && rows.some(h => h.creds.state === "testing")) continue;
+    const bad = rows.filter(h => h.creds.state !== "ok");
+    if (!rows.length) return;
+    if (!bad.length) {
+      sayIn(2, "ok", "Login works on " + rows.length + " of " + rows.length + " switch" + (rows.length === 1 ? "" : "es") +
+                     ". You can save this profile now.");
+    } else {
+      sayIn(2, "err", "Login failed on " + bad.length + " of " + rows.length + ": " +
+            bad.slice(0, 3).map(h => h.host + " - " + (h.creds.detail || "no answer")).join("; ") +
+            (bad.length > 3 ? " (+" + (bad.length - 3) + " more, see the Credentials column)" : ""));
+    }
+    return;
+  }
+  sayIn(2, "ok", "The test is still running - the results appear in the Credentials column of the Devices table.");
+}
+$("btn-prof-test").addEventListener("click", async () => {
+  if (profTestBusy) return;
+  if (!selected.size) { sayIn(2, "err", "Select one or more switches in the Devices table first."); return; }
+  if (!$("prof-user").value.trim()) { sayIn(2, "err", "Enter the username first."); $("prof-user").focus(); return; }
+  if (!$("prof-pass").value && !profEditing) { sayIn(2, "err", "Enter the password first."); $("prof-pass").focus(); return; }
+  if (!portValid()) { portBad(); return; }
+  const hosts = [...selected], btn = $("btn-prof-test");
+  profTestBusy = true; btn.disabled = true; btn.textContent = "Testing ...";
+  try {
+    const r = await post("/api/profile/test", {hosts: hosts, original: profEditing, username: $("prof-user").value,
+      password: $("prof-pass").value, secret: $("prof-secret").value, clear_secret: $("prof-clear").checked,
+      protocol: profProto(), port: profPort()});
+    sayIn(2, "ok", r.message);
+    await showCredsTestResult(hosts);
+  } catch (e) { sayIn(2, "err", e.message); }
+  finally { profTestBusy = false; btn.textContent = "Test Credentials"; updateButtons(); }
+});
 $("btn-prof-save").addEventListener("click", async () => {
+  if (!portValid()) { portBad(); return; }
   try {
     const r = await post("/api/profile/save", {original: profEditing, name: $("prof-name").value,
       username: $("prof-user").value, password: $("prof-pass").value, secret: $("prof-secret").value,
-      clear_secret: $("prof-clear").checked});
+      clear_secret: $("prof-clear").checked, protocol: profProto(), port: profPort()});
     sayIn(2, "ok", r.message);
     $("prof-pass").value = ""; $("prof-secret").value = "";
     fillProfileLists.sig = null; await refresh();
@@ -8421,17 +9481,6 @@ $("btn-version").addEventListener("click", async () => {
   catch (e) { say("err", e.message); }
 });
 
-$("btn-test-creds").addEventListener("click", async () => {
-  // Tries the profile picked above on the selected switches - nothing is assigned. With no profile picked,
-  // each switch's own assigned profile is used (and must exist).
-  const profile = $("prof-assign").value || "";
-  const c = profile ? {} : creds(2); if (!c) return;
-  try {
-    const r = await post("/api/test-credentials", Object.assign({hosts: [...selected], profile: profile}, c));
-    sayIn(2, "ok", r.message); setTimeout(refresh, 1500);
-  } catch (e) { sayIn(2, "err", e.message); }
-});
-
 $("btn-readiness").addEventListener("click", async () => {
   const c = creds(4); if (!c) return;
   const image = $("image-select").value || null;
@@ -8465,7 +9514,7 @@ function syncActionUI() {
   const needsImage = action !== "activate";
   $("image-select").disabled = !needsImage;
   $("image-select-label").textContent = needsImage ? "Select image to install" : "Select image (not used)";
-  const verb = action === "full" ? "Start now" : action === "distribute" ? "Distribute" : "Activate";
+  const verb = action === "full" ? "Start Now" : action === "distribute" ? "Distribute" : "Activate";
   $("btn-upgrade").textContent = verb;
   $("btn-schedule").textContent = "Schedule";
 }
@@ -8734,6 +9783,12 @@ function syncConsoles(d) {
   consolesPrimed = true;
 }
 
+// "SSH" or "Telnet": the protocol of the profile attached to this switch (the console follows it).
+function hostProto(h) {
+  const r = last && (last.hosts || []).find(x => x.host === h);
+  const p = r && (last.profiles || []).find(x => x.name === r.profile);
+  return p && p.protocol === "telnet" ? "Telnet" : "SSH";
+}
 // The Console tab has two views: the interactive SSH session, and the read-only upgrade output. While an
 // upgrade runs on the switch it is always the upgrade output (the SSH console cannot be used then).
 function termUpgradeView(h) {
@@ -8755,9 +9810,9 @@ function upPaint(h) {
   for (const id of TERM_BTNS) $(id).hidden = true;
   $("dr-term-in").disabled = true;
   const mode = $("dr-term-mode");
-  mode.hidden = active || ME.role === "viewer"; mode.textContent = "SSH session";
+  mode.hidden = active || ME.role === "viewer"; mode.textContent = hostProto(h && h.host) + " Session";
   $("dr-term-note").textContent = active
-    ? "Upgrade in progress - live output (read-only). The SSH console is available again when it finishes."
+    ? "Upgrade in progress - live output (read-only). The console is available again when it finishes."
     : (u.message || "");
   pollConsole(c);
   DR.tabsHtml = ""; drTabsRender(DR.data);
@@ -8767,7 +9822,7 @@ function termSshChrome(h) {
   for (const id of TERM_BTNS) $(id).hidden = false;
   $("dr-term-note").textContent = TERM_NOTE;
   const mode = $("dr-term-mode");
-  mode.hidden = !(h && h.upgrade && h.upgrade.job_id) || ME.role === "viewer"; mode.textContent = "Upgrade output";
+  mode.hidden = !(h && h.upgrade && h.upgrade.job_id) || ME.role === "viewer"; mode.textContent = "Upgrade Output";
 }
 const upHas = () => { const h = drHost(); return !!(h && h.upgrade && h.upgrade.job_id); };
 const upActive = () => { const h = drHost(); return !!(h && h.upgrade && ACTIVE_STATES.includes(h.upgrade.state)); };
@@ -8885,7 +9940,7 @@ $("note-clear").addEventListener("click", async () => {
 // allow audio after the page has been clicked once, so the audio engine is unlocked on first click.
 let audioCtx = null, notesSoundPrimed = false, notesSoundLastId = 0;
 function soundOn() { try { return localStorage.getItem("noteSound") !== "off"; } catch (e) { return true; } }
-function paintSoundBtn() { const b = $("note-sound"); if (b) b.textContent = soundOn() ? "Sound: on" : "Sound: off"; }
+function paintSoundBtn() { const b = $("note-sound"); if (b) b.textContent = soundOn() ? "Sound: On" : "Sound: Off"; }
 function unlockAudio() {
   try {
     if (!audioCtx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) audioCtx = new AC(); }
@@ -9032,7 +10087,7 @@ function renderSiteMenu() {
   pop.appendChild(document.createElement("hr"));
   const add = document.createElement("button");
   add.type = "button"; add.className = "newsite"; add.setAttribute("role", "menuitem");
-  add.textContent = "+ Create new site\u2026";
+  add.textContent = "+ Create New Site\u2026";
   add.addEventListener("click", () => { closeSiteMenu(); openSiteModal(); });
   pop.appendChild(add);
 }
@@ -9050,7 +10105,7 @@ async function loadSites() {
 function applySite(name) {
   siteName = name || null;
   const badge = $("site-badge");
-  badge.textContent = "Site: " + (siteName || "not assigned");
+  badge.textContent = "Site: " + (siteName || "Not Assigned");
   badge.className = "badge site-btn " + (siteName ? "accent" : "warn needed");
   $("dashboard").classList.toggle("nosite", !siteName);
   renderSiteMenu();
@@ -9165,13 +10220,15 @@ function stSay(kind, text) { const m = $("st-msg"); m.className = "msg " + kind;
 
 function showView(view, push) {
   if (view === "settings" && ME.role === "viewer") view = "home";
-  if (view !== "storage" && view !== "settings") view = "home";
-  const storage = view === "storage", settings = view === "settings";
-  if (storage || settings) { try { closeDrawer(); } catch (e) {} }
-  $("dashboard").hidden = storage || settings;
+  if (view === "diagram" && ME.role === "viewer") view = "home";
+  if (view !== "storage" && view !== "settings" && view !== "diagram") view = "home";
+  const storage = view === "storage", settings = view === "settings", diagram = view === "diagram";
+  if (storage || settings || diagram) { try { closeDrawer(); } catch (e) {} }
+  $("dashboard").hidden = storage || settings || diagram;
   $("storage").hidden = !storage;
+  $("diagram").hidden = !diagram;
   $("settings").hidden = !settings;
-  for (const [id, on] of [["tab-home", view === "home"], ["tab-storage", storage]]) {
+  for (const [id, on] of [["tab-home", view === "home"], ["tab-diagram", diagram], ["tab-storage", storage]]) {
     $(id).classList.toggle("on", on);
     $(id).setAttribute("aria-selected", String(on));
   }
@@ -9179,6 +10236,7 @@ function showView(view, push) {
   if (push !== false) { try { history.replaceState(null, "", "#" + view); } catch (e) {} }
   if (storage) openStorage();
   if (settings) openSettings();
+  if (diagram) openDiagram(); else dgStop();
 }
 document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => showView(b.dataset.view)));
 
@@ -9295,7 +10353,7 @@ function stRender() {
   const zip = $("st-zip");
   zip.hidden = !stg.site || searching;
   zip.href = stg.site ? stUrl("download", stg.path) : "#";
-  zip.textContent = stg.path ? "Download folder (.zip)" : "Download site storage (.zip)";
+  zip.textContent = stg.path ? "Download Folder (.zip)" : "Download Site Storage (.zip)";
   $("st-refresh").disabled = !stg.site;
   $("st-search").disabled = !stg.site;
   $("st-clear").hidden = !stg.query;
@@ -9422,7 +10480,8 @@ function renderSettings() {
   $("set-title").textContent = g.title;
   $("set-note").hidden = SET_CAN_EDIT;
   let html = '<div class="set-intro">' + esc(g.intro) + "</div>" +
-    (g.id === "timeouts" ? '<div id="tp-root"></div><div id="ct-root"></div>' : ""), sec = null;
+    (g.id === "timeouts" ? '<div id="tp-root"></div><div id="ct-root"></div>' : "") +
+    (g.id === "notifications" ? '<div id="nt-root"></div>' : ""), sec = null;
   for (const item of SET.data.items.filter(i => i.group === g.id)) {
     if (item.section && item.section !== sec) { html += '<div class="set-sec">' + esc(item.section) + "</div>"; }
     sec = item.section;
@@ -9430,6 +10489,9 @@ function renderSettings() {
   }
   $("set-body").innerHTML = html;
   if (g.id === "timeouts") { tpRender(); ctRender(); }
+  if (g.id === "notifications") { ntRender(); if (!NT.data && !NT.loading) { NT.loading = true; ntLoad().finally(() => { NT.loading = false; }); } }
+  const own = g.id === "notifications";            // this tab has its own Save button
+  $("set-reset").hidden = own; $("set-save").hidden = own; $("set-dirty").hidden = own;
   $("set-reset").disabled = !SET_CAN_EDIT;
   setUpdateDirty();
 }
@@ -9440,7 +10502,7 @@ async function openSettings() {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || "Could not load the settings.");
     SET.data = d; SET.draft = {...d.values}; renderSettings();
-    tpLoad();
+    tpLoad(); NT.data = null; if (SET.tab === "notifications") renderSettings(); else ntLoad();
   } catch (e) { setSay("err", e.message); }
 }
 function setRowRefresh(key) {
@@ -9555,13 +10617,13 @@ function tpRender() {
     '<div class="tp-row"><label for="tp-sel">Command duration profile<span class="tip" data-tip="A profile is a named set of the command timeouts below. Apply puts its values into the settings and saves them. Create profiles from the values on this page, or from a Command time test measured on a real switch (for example one profile per site)."></span></label>' +
     '<select id="tp-sel">' + opts + "</select>" +
     '<button type="button" class="btn p sm" data-tp="apply"' + (SET_CAN_EDIT && cur.name !== active ? "" : " disabled") + ' title="Use the values of this profile now">Apply</button>' +
-    '<button type="button" class="btn sm" data-tp="new"' + dis + ' title="Save the values shown below as a new profile">New from page values...</button>' +
-    '<button type="button" class="btn sm" data-tp="update"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ' title="Replace the values of this profile with the values shown below">Update from page values</button>' +
+    '<button type="button" class="btn sm" data-tp="new"' + dis + ' title="Save the values shown below as a new profile">New From Page Values...</button>' +
+    '<button type="button" class="btn sm" data-tp="update"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ' title="Replace the values of this profile with the values shown below">Update From Page Values</button>' +
     '<button type="button" class="btn sm" data-tp="delete"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ">Delete</button>" +
     '<span class="tp-state">' + state + "</span></div>" +
     (TP.form ? '<div class="tp-row"><input type="text" id="tp-name" maxlength="40" placeholder="Profile name, e.g. Colombo site" aria-label="New profile name">' +
       '<input type="text" id="tp-note" maxlength="300" placeholder="Note (optional)" aria-label="Note" style="min-width:260px">' +
-      '<button type="button" class="btn p sm" data-tp="create">Save profile</button><button type="button" class="btn sm" data-tp="cancel">Cancel</button></div>' : "") +
+      '<button type="button" class="btn p sm" data-tp="create">Save Profile</button><button type="button" class="btn sm" data-tp="cancel">Cancel</button></div>' : "") +
     '<div class="tp-info">' + esc(meta) + "</div>" +
     '<details class="tp-vals"><summary>Values in this profile</summary><div class="tp-grid">' + grid + "</div></details></div>";
   tipsIn("tp-root");
@@ -9724,7 +10786,7 @@ function ctDetailHtml(p, num, total) {
     : '<div class="ct-empty">Not run yet. Press Execute: the output appears here and in the console below.</div>';
   return '<div class="ct-d"><div class="ct-d-h"><div class="ct-d-id"><div class="ct-d-k">Step ' + num + " of " + total + " &middot; " + esc(p.group.replace(/^\d+\.\s*/, "")) + "</div>" +
     '<div class="ct-d-t">' + esc(p.title) + badges + '</div><code class="ct-cmd">' + esc(p.command) + "</code></div>" +
-    '<div class="ct-d-a">' + act + (nxt ? '<button type="button" class="btn" data-ct="next">Next step</button>' : "") + "</div></div>" +
+    '<div class="ct-d-a">' + act + (nxt ? '<button type="button" class="btn" data-ct="next">Next Step</button>' : "") + "</div></div>" +
     '<p class="ct-d-desc">' + esc(p.desc) + "</p>" +
     '<div class="ct-chips">Feeds: ' + chips + "</div>" +
     '<div class="ct-tiles"><div class="ct-tile"><span>Last</span><b>' + (st.lastS != null ? fmtS(st.lastS) + " s" : "-") + '</b></div><div class="ct-tile"><span>Slowest</span><b>' + (st.max != null ? fmtS(st.max) + " s" : "-") +
@@ -9749,8 +10811,8 @@ function ctRender() {
         '<div class="ct-f"><label for="ct-image">Image</label><select id="ct-image"' + (busy ? " disabled" : "") + '><option value="">- choose the image to test with -</option>' +
         images.map(n => '<option value="' + esc(n) + '"' + (n === CT.image ? " selected" : "") + ">" + esc(n) + "</option>").join("") + "</select></div>" +
         '<div class="ct-bar-r"><span class="tip" data-tip="Run the steps from top to bottom on a TEST switch: it is a real upgrade done by hand. Pick a step on the left, press Execute, read the output here and in the console, then go on with Next step. The image is needed for the copy, the MD5 check and the add step. Steps marked as changing the switch ask first; Activate RELOADS the switch. Run a step again to get a second sample - the slowest time of each step is the one that counts."></span>' +
-        '<button type="button" class="btn sm" data-ct="stages" data-v="1">Expand all</button><button type="button" class="btn sm" data-ct="stages" data-v="0">Collapse all</button>' +
-        '<button type="button" class="btn sm" data-ct="clear"' + (busy ? " disabled" : "") + ">Clear results</button></div></div>";
+        '<button type="button" class="btn sm" data-ct="stages" data-v="1">Expand All</button><button type="button" class="btn sm" data-ct="stages" data-v="0">Collapse All</button>' +
+        '<button type="button" class="btn sm" data-ct="clear"' + (busy ? " disabled" : "") + ">Clear Results</button></div></div>";
       html += '<div class="ct-wb"><nav class="ct-rail" aria-label="Steps">' + ctRailHtml(presets) + '</nav><div class="ct-main">' + ctDetailHtml(p, num, presets.length) + '<div id="cc-slot"></div></div></div>';
       html += '<div class="ct-result"><div class="ct-result-t">Results And Profile</div><div class="ct-result-g"><div id="ct-sugg-t"></div><div class="ct-side">' +
         '<div class="ct-sg-h"><label for="ct-margin">Safety margin &times;<span class="tip" data-tip="The suggested timeout is the slowest measured time multiplied by this number, rounded up to 5 seconds. A switch is slower during a busy upgrade than during your test, so keep some room (3 is a good start)."></span></label>' +
@@ -9774,8 +10836,8 @@ function ctRenderSuggest() {
   tbl.innerHTML = '<table class="ct-table"><thead><tr><th>Timeout setting</th><th class="n">Slowest (s)</th><th class="n">Default (s)</th><th class="n">Suggested (s)</th></tr></thead><tbody>' +
     sg.rows.map(r => "<tr><td>" + esc(r.item.label) + '</td><td class="n">' + fmtS(r.measured) + '</td><td class="n">' + r.def + '</td><td class="n"><b>' + r.value + "</b></td></tr>").join("") + "</tbody></table>" +
     '<div class="ct-note">' + (tmoItems().length - sg.rows.length) + " timeout(s) have no measurement and keep their default value in the profile (for example the backup commands, which this test does not run).</div>";
-  act.innerHTML = '<div class="ct-actions"><button type="button" class="btn p" data-ct="saveform"' + dis + (SET_CAN_EDIT ? "" : ' title="Only an Administrator can save profiles"') + ">Save as profile...</button>" +
-    '<button type="button" class="btn sm" data-ct="csv">Report (CSV)</button><button type="button" class="btn sm" data-ct="print">Printable report</button></div>' +
+  act.innerHTML = '<div class="ct-actions"><button type="button" class="btn p" data-ct="saveform"' + dis + (SET_CAN_EDIT ? "" : ' title="Only an Administrator can save profiles"') + ">Save As Profile...</button>" +
+    '<button type="button" class="btn sm" data-ct="csv">Report (CSV)</button><button type="button" class="btn sm" data-ct="print">Printable Report</button></div>' +
     (CT.form ? '<div class="ct-actions"><input type="text" id="ct-pname" maxlength="40" placeholder="Profile name, e.g. Production" aria-label="Profile name">' +
       '<button type="button" class="btn p sm" data-ct="save"' + dis + '>Save</button><button type="button" class="btn sm" data-ct="cancelform">Cancel</button></div>' : "");
 }
@@ -9856,7 +10918,7 @@ function ctPrint() {
     "body{font:14px/1.45 Segoe UI,Arial,sans-serif;margin:28px;color:#111}h1{font-size:21px;margin:0 0 4px}h2{font-size:15px;margin:22px 0 4px}" +
     "table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #bbb;padding:6px 9px;text-align:left}th{background:#eef1f5}" +
     ".m{color:#555;font-size:13px}button{padding:7px 14px;margin-bottom:14px}@media print{.np{display:none}}</style></head><body>" +
-    '<button class="np" onclick="window.print()">Print / Save as PDF</button><h1>Command Time Test Report</h1>' +
+    '<button class="np" onclick="window.print()">Print / Save As PDF</button><h1>Command Time Test Report</h1>' +
     '<div class="m">' + esc(d.when) + " | NetUpgrade " + esc(d.ver) + (d.site ? " | Site: " + esc(d.site) : "") + "</div>" +
     "<h2>Switch</h2><table>" + tr(["Address", d.host.host]) + tr(["Name", d.host.label || ""]) + tr(["Platform", d.host.platform || ""]) + tr(["Software version", d.host.version || ""]) + tr(["Image tested with", d.image || ""]) + "</table>" +
     "<h2>Measured Step Times</h2><table>" + th(["Stage", "Step", "Feeds this timeout", "Runs", "Last (s)", "Slowest (s)", "Average (s)", "Last result"]) +
@@ -9931,7 +10993,7 @@ function ccPaint() {
   if (out.textContent !== shown) { out.textContent = shown; if (atEnd || !c.text) out.scrollTop = out.scrollHeight; }
   $("cc-title").textContent = "Console - " + host + (h && h.label ? " - " + h.label : "");
   const st = $("cc-state");
-  st.textContent = {off: "No SSH session", connecting: "Connecting ...", on: "SSH session open", closed: "Session closed"}[c.state];
+  const px = hostProto(host); st.textContent = {off: "No " + px + " session", connecting: "Connecting ...", on: px + " session open", closed: "Session closed"}[c.state];
   st.className = "cc-st" + (c.state === "on" ? " on" : c.state === "connecting" ? " busy" : "");
   $("cc-connect").textContent = live ? "Disconnect" : "Connect";
   $("cc-connect").className = "cc-b" + (live ? "" : " go");
@@ -9945,7 +11007,7 @@ function ccPaint() {
 }
 async function ccConnect(host) {
   const c = ccGet(host);
-  c.state = "connecting"; c.offset = 0; c.text += "\n[Connecting an SSH session to " + host + " ...]\n"; ccPaint();
+  c.state = "connecting"; c.offset = 0; c.text += "\n[Connecting " + (hostProto(host) === "Telnet" ? "a Telnet" : "an SSH") + " session to " + host + " ...]\n"; ccPaint();
   try {
     const d = await post("/api/term/open", {host});
     c.sid = d.sid; c.offset = 0; ccPoll(host);
@@ -10033,7 +11095,537 @@ $("set-body").addEventListener("input", e => {
   if (v >= 1 && v <= 20) { CT.margin = v; ctPersist(); ctRenderSuggest(); }
 });
 
+// ============================================================================================
+// Diagram page: CDP topology of the active site, with live up/down and upgrade status on every switch.
+// The links come from /api/topology (read from the switches); the colours come from the same
+// /api/status poll the Home page uses, so they change while an upgrade runs.
+// ============================================================================================
+const DG_W = 240, DG_H = 76, DG_GX = 36, DG_GY = 120, DG_PAD = 40;
+const dg = {data: null, site: undefined, graphKey: "", listKey: "", detailKey: "", sel: null, picked: new Set(),
+            showOther: false, ports: true, zoom: 1, px: 0, py: 0, fitted: false, root: null, timer: null, tick: 0, busy: false, pos: {}, view: null, wasRunning: false};
+const SVGNS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs, text) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in (attrs || {})) e.setAttribute(k, attrs[k]);
+  if (text != null) e.textContent = text;
+  return e;
+}
+// Fit text into maxPx by measuring it (SVG text does not wrap), cutting it with an ellipsis only when it really does not fit.
+function dgSetText(el, text, maxPx) {
+  text = String(text == null ? "" : text);
+  const key = text + "|" + maxPx; if (el._k === key) return; el._k = key;
+  el.textContent = text;
+  let w = 0; try { w = el.getComputedTextLength(); } catch (e) {}
+  if (!w || w <= maxPx) return;                       // fits (or the page is hidden and cannot be measured)
+  let lo = 1, hi = text.length - 1, best = 1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; el.textContent = text.slice(0, mid) + "\u2026"; if (el.getComputedTextLength() <= maxPx) { best = mid; lo = mid + 1; } else hi = mid - 1; }
+  el.textContent = text.slice(0, best) + "\u2026";
+}
+const dgClip = (s, n) => { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "\u2026" : s; };
+const ifShort = s => String(s || "").replace(/^TenGigabitEthernet/i, "Te").replace(/^TwentyFiveGigE/i, "Twe")
+  .replace(/^FortyGigabitEthernet/i, "Fo").replace(/^HundredGigE/i, "Hu").replace(/^GigabitEthernet/i, "Gi")
+  .replace(/^FastEthernet/i, "Fa").replace(/^Port-channel/i, "Po").replace(/^Ethernet/i, "Eth");
+function dgSay(kind, text) { const m = $("dg-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
+const dgPosKey = () => "dg-pos:" + (dg.site || "");
+function dgLoadPos() { dg.pos = {}; try { dg.pos = JSON.parse(localStorage.getItem(dgPosKey()) || "{}") || {}; } catch (e) { dg.pos = {}; } }
+function dgSavePos() { try { localStorage.setItem(dgPosKey(), JSON.stringify(dg.pos)); } catch (e) {} }
+const dgLive = () => new Map(((last && last.hosts) || []).map(h => [h.host, h]));
+
+function openDiagram() {
+  dgStop();
+  dgLoad(true);
+  dg.timer = setInterval(dgTick, 2000);
+}
+function dgStop() { if (dg.timer) { clearInterval(dg.timer); dg.timer = null; } dgExitFull(); }
+function dgTick() {
+  if ($("diagram").hidden) { dgStop(); return; }
+  dg.tick++;
+  const running = dg.data && dg.data.run && !dg.data.run.finished;
+  if (running || dg.tick % 5 === 0 || (siteName || null) !== (dg.site || null)) dgLoad(false);
+  else { dgRenderList(); dgPaintLive(); }
+}
+
+async function dgLoad(force) {
+  if (dg.busy) return;
+  dg.busy = true;
+  try {
+    const d = await getJSON("/api/topology");
+    if (d.site !== dg.site) { dg.site = d.site; dgLoadPos(); dg.picked = new Set(); dg.sel = null; dg.graphKey = ""; dg.listKey = ""; dg.fitted = false; force = true; }
+    const running = !!(d.run && !d.run.finished);
+    if (dg.wasRunning && !running && d.run) {
+      const hs = Object.values(d.run.hosts), ok = hs.filter(x => x.state === "ok").length;
+      dgSay(ok === hs.length ? "ok" : "err", "Scan finished: " + ok + " of " + hs.length + " switch(es) read." +
+            (ok < hs.length ? " See the device list for the reason." : ""));
+    }
+    dg.wasRunning = running;
+    dg.data = d;
+    const key = JSON.stringify(d.graph) + "|" + dg.showOther;
+    if (force || key !== dg.graphKey) { dg.graphKey = key; dgDraw(); }
+    dgRenderList();
+    dgPaintLive();
+  } catch (e) { dgSay("err", e.message); }
+  finally { dg.busy = false; }
+}
+
+// ---- left side: the site's device list ----
+function dgRenderList() {
+  const d = dg.data; if (!d) return;
+  const live = dgLive(), run = d.run && !d.run.finished;
+  $("dg-site").textContent = d.site ? "Site: " + d.site + " - tick the switches to read their CDP neighbours." : "";
+  let html = "";
+  if (!d.site) html = '<div class="st-empty">No site selected. Create or select one from the Site menu on the Home page.</div>';
+  else if (!d.devices.length) html = '<div class="st-empty">This site has no devices yet. Add them on the Home page first.</div>';
+  for (const v of d.devices) {
+    const lv = live.get(v.host), st = lv ? lv.status : "PENDING", rs = d.run && d.run.hosts && d.run.hosts[v.host];
+    let line, cls = "";
+    if (!v.has_creds) { line = "No credentials profile - assign one on the Home page"; cls = "warn"; }
+    else if (rs && (rs.state === "queued" || rs.state === "running")) { line = rs.state === "queued" ? "Waiting ..." : "Reading CDP ..."; }
+    else if (rs && rs.state === "failed") { line = rs.detail; cls = "bad"; }
+    else if (rs && rs.state === "skipped") { line = rs.detail; cls = "warn"; }
+    else if (v.scan_ok === false) { line = "Last scan failed: " + v.scan_error; cls = "bad"; }
+    else if (v.scan_time) { line = "Scanned " + v.scan_time + " - " + v.neighbors + " neighbour(s)"; cls = "ok"; }
+    else { line = "Not scanned yet"; }
+    const dis = !v.has_creds || run;
+    html += '<label class="dg-dev' + (v.has_creds ? "" : " off") + '"><input type="checkbox" data-host="' + esc(v.host) + '"' +
+      (dg.picked.has(v.host) && v.has_creds ? " checked" : "") + (dis ? " disabled" : "") + '><span class="meta"><div class="t1"><i class="dot ' +
+      (st === "UP" ? "ok" : st === "DOWN" ? "bad" : "") + '"></i>' + esc(v.label) + '</div><div class="t2">' + esc(v.host) +
+      (v.platform ? " - " + esc(v.platform) : "") + '</div><div class="t2 ' + cls + '">' + esc(line) + "</div></span></label>";
+  }
+  if (html !== dg.listKey) { dg.listKey = html; $("dg-list").innerHTML = html; }
+  const n = [...dg.picked].filter(h => d.devices.some(v => v.host === h && v.has_creds)).length;
+  $("dg-png").disabled = !dg.root;
+  $("dg-run").disabled = !!run || n === 0;
+  $("dg-run").title = "Discover topology: read the CDP neighbours of the ticked switches";
+  $("dg-run").textContent = run ? "Scanning " + d.run.done + "/" + d.run.total : "Discover" + (n ? " (" + n + ")" : "");
+  const pickable = d.devices.filter(v => v.has_creds).length, all = $("dg-all");
+  const allOn = pickable > 0 && n === pickable;                 // everything ticked: the button becomes "Clear"
+  all.textContent = allOn ? "Clear" : "Select All"; all.dataset.mode = allOn ? "clear" : "all";
+  all.disabled = !!run || pickable === 0;
+}
+$("dg-list").addEventListener("change", e => {
+  const h = e.target.dataset && e.target.dataset.host; if (!h) return;
+  if (e.target.checked) dg.picked.add(h); else dg.picked.delete(h);
+  dgRenderList();
+});
+$("dg-all").addEventListener("click", () => {
+  if (!dg.data) return;
+  if ($("dg-all").dataset.mode === "clear") dg.picked.clear();
+  else for (const v of dg.data.devices) if (v.has_creds) dg.picked.add(v.host);
+  dg.listKey = ""; dgRenderList();
+});
+$("dg-run").addEventListener("click", async () => {
+  const hosts = [...dg.picked]; if (!hosts.length) return;
+  dgSay("", "");
+  try { const r = await post("/api/topology/discover", {hosts}); dgSay("ok", r.message); dg.wasRunning = true; await dgLoad(false); }
+  catch (e) { dgSay("err", e.message); }
+});
+
+// ---- layout: one band per group of connected switches, level 0 (top) first ----
+function dgLayout(g) {
+  const vis = g.nodes.filter(n => dg.showOther || n.kind !== "other");
+  const ids = new Set(vis.map(n => n.id)), nb = new Map(vis.map(n => [n.id, []]));
+  for (const e of g.edges) if (ids.has(e.a) && ids.has(e.b)) { nb.get(e.a).push(e.b); nb.get(e.b).push(e.a); }
+  const comps = new Map();
+  for (const n of vis) { if (!comps.has(n.comp)) comps.set(n.comp, []); comps.get(n.comp).push(n); }
+  const multi = [], lone = [];
+  for (const list of comps.values()) (list.length > 1 ? multi : lone).push(list);
+  multi.sort((a, b) => b.length - a.length);
+  const pos = {}; let y0 = DG_PAD;
+  const place = list => {
+    const levels = new Map();
+    for (const n of list) { if (!levels.has(n.level)) levels.set(n.level, []); levels.get(n.level).push(n); }
+    const keys = [...levels.keys()].sort((a, b) => a - b), xs = new Map();
+    const widest = Math.max(...keys.map(k => levels.get(k).length)), W = widest * (DG_W + DG_GX) - DG_GX;
+    keys.forEach((k, ri) => {
+      const row = levels.get(k);
+      const bary = n => { const p = nb.get(n.id).filter(i => xs.has(i)).map(i => xs.get(i)); return p.length ? p.reduce((a, b) => a + b, 0) / p.length : null; };
+      row.sort((a, b) => { const x = bary(a), y = bary(b);
+        if (x != null && y != null && x !== y) return x - y; if (x != null && y == null) return -1; if (x == null && y != null) return 1;
+        return a.name.localeCompare(b.name); });
+      const off = (W - (row.length * (DG_W + DG_GX) - DG_GX)) / 2;
+      row.forEach((n, i) => { const x = DG_PAD + off + i * (DG_W + DG_GX); xs.set(n.id, x + DG_W / 2); pos[n.id] = {x, y: y0 + ri * DG_GY}; });
+    });
+    y0 += keys.length * DG_GY + 24;
+  };
+  multi.forEach(place);
+  let capY = null;
+  if (lone.length) {
+    capY = y0 - 6; y0 += 18;
+    const flat = lone.map(l => l[0]).sort((a, b) => a.name.localeCompare(b.name));
+    for (let i = 0; i < flat.length; i += 6) { flat.slice(i, i + 6).forEach((n, j) => { pos[n.id] = {x: DG_PAD + j * (DG_W + DG_GX), y: y0}; }); y0 += DG_GY; }
+  }
+  for (const n of vis) { const o = dg.pos[n.id]; if (o && isFinite(o.x) && isFinite(o.y)) pos[n.id] = {x: o.x, y: o.y}; }
+  return {nodes: vis, pos, capY};
+}
+
+function dgDraw() {
+  const svg = $("dg-svg"), d = dg.data, g = d && d.graph;
+  svg.innerHTML = ""; dg.view = null;
+  let msg = "";
+  if (!d || !d.site) msg = "No site selected. Create or select a site from the Site menu on the Home page.";
+  else if (!d.devices.length) msg = "This site has no devices yet.";
+  else if (!g.nodes.length) msg = "No topology yet. Tick the switches on the left and press Discover topology.";
+  $("dg-empty").textContent = msg;
+  if (msg) { dg.root = null; dgPaintLive(); return; }
+  const lay = dgLayout(g);
+  // Everything that moves with the mouse (pan + zoom) lives in one group; its transform is the "camera".
+  const root = svgEl("g", {id: "dg-root"});
+  svg.appendChild(root); dg.root = root;
+  const edgeLayer = svgEl("g"), nodeLayer = svgEl("g");
+  root.appendChild(edgeLayer); root.appendChild(nodeLayer);
+  if (lay.capY != null) root.appendChild(svgEl("text", {class: "dg-cap", x: DG_PAD, y: lay.capY}, "No CDP links found for these switches"));
+  const nodes = new Map(), edges = [];
+  for (const n of lay.nodes) {
+    const p = {x: lay.pos[n.id].x, y: lay.pos[n.id].y};
+    const el = svgEl("g", {class: "dg-n", "data-id": n.id, tabindex: 0, transform: "translate(" + p.x + "," + p.y + ")"});
+    const title = svgEl("title", {}, "");
+    el.appendChild(title);
+    el.appendChild(svgEl("rect", {class: "bx", width: DG_W, height: DG_H, rx: 10}));
+    el.appendChild(svgEl("circle", {class: "sd", cx: 15, cy: 18, r: 5}));
+    const nm = svgEl("text", {class: "nm", x: 27, y: 22}, n.name);
+    el.appendChild(nm);
+    const stt = svgEl("text", {class: "stt", x: DG_W - 10, y: 22, "text-anchor": "end"}, "");
+    el.appendChild(stt);
+    const ipt = svgEl("text", {class: "ipt", x: 14, y: 40}, "");
+    el.appendChild(ipt);
+    const strip = svgEl("g", {class: "strip"});
+    strip.appendChild(svgEl("rect", {x: 8, y: 49, width: DG_W - 16, height: 20, rx: 6}));
+    const stripT = svgEl("text", {x: DG_W / 2, y: 63, "text-anchor": "middle"}, "");
+    strip.appendChild(stripT); el.appendChild(strip);
+    const V = {n, p, el, title, nm, stt, ipt, stripT};
+    dgWireNode(V);
+    nodeLayer.appendChild(el); nodes.set(n.id, V);
+  }
+  for (const e of g.edges) {
+    if (!nodes.has(e.a) || !nodes.has(e.b)) continue;
+    const tip = e.links.map(l => ifShort(l.a_if) + " \u2194 " + ifShort(l.b_if)).join("\n");
+    const path = svgEl("path", {class: "dg-e"}); path.appendChild(svgEl("title", {}, tip));
+    const la = svgEl("text", {class: "dg-lbl"}, ""), lb = svgEl("text", {class: "dg-lbl"}, ""), mid = svgEl("text", {class: "dg-lbl", "text-anchor": "middle"}, "");
+    edgeLayer.appendChild(path); edgeLayer.appendChild(la); edgeLayer.appendChild(lb); edgeLayer.appendChild(mid);
+    edges.push({e, path, la, lb, mid});
+  }
+  const meta = new Map(g.nodes.map(n => [n.id, n])), adj = new Map(g.nodes.map(n => [n.id, []]));
+  for (const e of g.edges) { adj.get(e.a).push(e.b); adj.get(e.b).push(e.a); }
+  dg.view = {nodes, edges, meta, adj};
+  dgPlaceEdges();
+  if (!dg.fitted && dgFitView()) dg.fitted = true; else dgApplyView();
+  dgPaintLive();
+}
+
+// Screen pointer -> diagram coordinates (takes the current pan and zoom into account).
+function dgPoint(ev) {
+  const m = dg.root && dg.root.getScreenCTM();
+  if (!m) return {x: ev.clientX, y: ev.clientY};
+  const q = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(m.inverse());
+  return {x: q.x, y: q.y};
+}
+function dgWireNode(V) {
+  const el = V.el;
+  el.addEventListener("pointerdown", ev => {
+    if (ev.button !== 0) return;
+    ev.stopPropagation();                      // do not start panning the whole diagram
+    const start = dgPoint(ev), ox = V.p.x, oy = V.p.y; let moved = false;
+    try { el.setPointerCapture(ev.pointerId); } catch (e) {}
+    const mv = e2 => {
+      const q = dgPoint(e2), nx = ox + q.x - start.x, ny = oy + q.y - start.y;
+      if (Math.abs(nx - ox) + Math.abs(ny - oy) > 4) moved = true;
+      if (!moved) return;
+      V.p.x = nx; V.p.y = ny; el.setAttribute("transform", "translate(" + nx + "," + ny + ")"); dgPlaceEdges();
+    };
+    const up = e2 => {
+      el.removeEventListener("pointermove", mv); el.removeEventListener("pointerup", up); el.removeEventListener("pointercancel", up);
+      try { el.releasePointerCapture(e2.pointerId); } catch (e) {}
+      if (moved) { dg.pos[V.n.id] = {x: V.p.x, y: V.p.y}; dgSavePos(); } else dgSelect(V.n.id);
+    };
+    el.addEventListener("pointermove", mv); el.addEventListener("pointerup", up); el.addEventListener("pointercancel", up);
+  });
+  el.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); dgSelect(V.n.id); } });
+}
+
+// Camera: apply the current pan (px, py) and zoom to the diagram group.
+function dgApplyView() {
+  if (dg.root) dg.root.setAttribute("transform", "translate(" + dg.px + "," + dg.py + ") scale(" + dg.zoom + ")");
+}
+// Scale and centre the whole diagram so every switch is visible in the window. Returns false if the window has no size yet.
+function dgFitView() {
+  const v = dg.view, wrap = $("dg-wrap"); if (!v || !dg.root) return false;
+  const W = wrap.clientWidth, H = wrap.clientHeight; if (W < 50 || H < 50) return false;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const V of v.nodes.values()) { x0 = Math.min(x0, V.p.x); y0 = Math.min(y0, V.p.y); x1 = Math.max(x1, V.p.x + DG_W); y1 = Math.max(y1, V.p.y + DG_H); }
+  const m = 36, bw = Math.max(1, x1 - x0), bh = Math.max(1, y1 - y0);
+  const z = Math.max(0.2, Math.min(1.25, (W - 2 * m) / bw, (H - 2 * m) / bh));
+  dg.zoom = z; dg.px = (W - bw * z) / 2 - x0 * z; dg.py = (H - bh * z) / 2 - y0 * z;
+  dgApplyView(); return true;
+}
+// Zoom by a factor, keeping the diagram point under (cx, cy) (window pixels) where it is.
+function dgZoomAt(factor, cx, cy) {
+  const z0 = dg.zoom, z1 = Math.max(0.2, Math.min(3, z0 * factor)); if (z1 === z0) return;
+  dg.px = cx - (cx - dg.px) * (z1 / z0); dg.py = cy - (cy - dg.py) * (z1 / z0); dg.zoom = z1; dgApplyView();
+}
+
+// Draw each link from the bottom of the upper switch to the top of the lower one (side to side within a row).
+function dgPlaceEdges() {
+  const v = dg.view; if (!v) return;
+  const att = new Map();
+  for (const E of v.edges) {
+    const A = v.nodes.get(E.e.a).p, B = v.nodes.get(E.e.b).p;
+    if (Math.abs(A.y - B.y) < DG_H * 0.6) { E.mode = "side"; continue; }
+    E.mode = "v"; E.top = A.y < B.y ? E.e.a : E.e.b; E.bot = A.y < B.y ? E.e.b : E.e.a;
+    for (const [id, k, other] of [[E.top, "down", E.bot], [E.bot, "up", E.top]]) {
+      if (!att.has(id)) att.set(id, {up: [], down: []});
+      att.get(id)[k].push({E, other});
+    }
+  }
+  for (const [id, a] of att) for (const k of ["up", "down"]) {
+    const list = a[k], P = v.nodes.get(id).p;
+    list.sort((p, q) => v.nodes.get(p.other).p.x - v.nodes.get(q.other).p.x);
+    list.forEach((it, i) => { it.E[k === "down" ? "tx" : "bx"] = P.x + DG_W * (i + 1) / (list.length + 1); it.E[k === "down" ? "ti" : "bi"] = i; });
+  }
+  for (const E of v.edges) {
+    const A = v.nodes.get(E.e.a).p, B = v.nodes.get(E.e.b).p, one = E.e.links.length === 1 && dg.ports;
+    const l0 = E.e.links[0] || {a_if: "", b_if: ""};
+    let d, mx, my, f = {};
+    if (E.mode === "side") {
+      const aLeft = A.x <= B.x, L = aLeft ? A : B, R = aLeft ? B : A;
+      const x1 = L.x + DG_W, y1 = L.y + DG_H / 2, x2 = R.x, y2 = R.y + DG_H / 2;
+      d = "M" + x1 + " " + y1 + " L" + x2 + " " + y2; mx = (x1 + x2) / 2; my = (y1 + y2) / 2 - 6;
+      f = {la: [x1 + 4, y1 - 5, "start", aLeft ? l0.a_if : l0.b_if], lb: [x2 - 4, y2 - 5, "end", aLeft ? l0.b_if : l0.a_if]};
+    } else {
+      const T = v.nodes.get(E.top).p, Bn = v.nodes.get(E.bot).p, x1 = E.tx, y1 = T.y + DG_H, x2 = E.bx, y2 = Bn.y, m = (y1 + y2) / 2;
+      d = "M" + x1 + " " + y1 + " C" + x1 + " " + m + " " + x2 + " " + m + " " + x2 + " " + y2; mx = (x1 + x2) / 2; my = m;
+      const topIf = E.top === E.e.a ? l0.a_if : l0.b_if, botIf = E.top === E.e.a ? l0.b_if : l0.a_if;
+      f = {la: [x1 + 4, y1 + 13 + ((E.ti || 0) % 2) * 11, "start", topIf], lb: [x2 + 4, y2 - 6 - ((E.bi || 0) % 2) * 11, "start", botIf]};
+    }
+    E.path.setAttribute("d", d);
+    for (const k of ["la", "lb"]) {
+      const t = E[k], s = f[k];
+      t.setAttribute("x", s[0]); t.setAttribute("y", s[1]); t.setAttribute("text-anchor", s[2]); t.textContent = one ? ifShort(s[3]) : "";
+    }
+    E.mid.setAttribute("x", mx); E.mid.setAttribute("y", my);
+    E.mid.textContent = E.e.links.length > 1 ? "\u00d7" + E.e.links.length : "";
+  }
+}
+
+// ---- live part: up/down + upgrade progress, repainted every 2 seconds from the Home page status poll ----
+function dgUpg(h) {
+  if (!h) return {cls: "none", text: ""};
+  const u = h.upgrade || {};
+  if (u.state === "starting" || u.state === "running") return {cls: "running", text: "Upgrading" + (u.phase ? ": " + String(u.phase).replace(/[_-]+/g, " ") : "")};
+  if (u.state === "completed") return {cls: "completed", text: u.action === "distribute" ? "Image distributed" : "Upgrade completed"};
+  if (u.state === "failed") return {cls: "failed", text: "Upgrade failed"};
+  if (u.state === "attention") return {cls: "attention", text: "Needs attention"};
+  if (h.scheduled) return {cls: "queued", text: h.scheduled.queued ? "Queued for upgrade" : "Scheduled " + String(h.scheduled.run_at_str || "").slice(5)};
+  return {cls: "none", text: ""};
+}
+
+function dgPaintLive() {
+  const v = dg.view, banner = $("dg-banner");
+  if (!v) { banner.hidden = true; dgRenderDetail(); return; }
+  const live = dgLive(), info = new Map(), active = [];
+  for (const [id, V] of v.nodes) {
+    const h = V.n.managed ? live.get(V.n.host) : null;
+    const status = !V.n.managed ? "EXT" : (h && h.status) || "PENDING", u = dgUpg(h);
+    info.set(id, {h, status, u});
+    if (u.cls === "running") active.push(id);
+  }
+  // Everything above a switch that is being upgraded would cut it off if it were upgraded at the same time.
+  const holds = new Map();
+  for (const a of active) {
+    const seen = new Set([a]), queue = [a];
+    while (queue.length) {
+      const cur = queue.shift(), lv = v.meta.get(cur).level;
+      for (const nx of v.adj.get(cur)) {
+        const m = v.meta.get(nx);
+        if (seen.has(nx) || !m.managed || m.kind !== "net" || m.level >= lv) continue;
+        seen.add(nx); queue.push(nx);
+        if (!holds.has(nx)) holds.set(nx, []);
+        holds.get(nx).push(v.meta.get(a).name);
+      }
+    }
+  }
+  for (const [id, V] of v.nodes) {
+    const {h, status, u} = info.get(id), n = V.n, hold = holds.get(id);
+    const ucls = u.cls === "none" && hold ? "hold" : u.cls;
+    V.el.setAttribute("class", "dg-n s-" + status + " u-" + ucls + (n.managed ? "" : " ext") + (hold ? " hold" : "") + (dg.sel === id ? " sel" : ""));
+    V.stt.textContent = status === "EXT" ? "EXT" : status;
+    let sw = 40; try { sw = V.stt.getComputedTextLength() || 40; } catch (e) {}
+    dgSetText(V.nm, n.name, DG_W - 27 - sw - 16);                       // name never runs into the UP / DOWN label
+    dgSetText(V.ipt, n.managed ? (n.host + (n.platform || (h && h.platform) ? " \u00b7 " + (h && h.platform || n.platform) : ""))
+                               : "not onboarded" + (n.platform ? " \u00b7 " + n.platform : ""), DG_W - 14 - 10);
+    dgSetText(V.stripT, u.text || (hold ? "HOLD: uplink of " + hold[0] : ""), DG_W - 16 - 14);
+    V.title.textContent = [n.name, n.host || "", n.platform || (h && h.platform) || "", n.managed ? "Status: " + status : "Not onboarded in this site",
+      h && h.version ? "Version: " + h.version : "", hold ? "HOLD: uplink of " + hold.join(", ") + " (upgrade in progress)" : "", u.text, h && h.upgrade && h.upgrade.message && u.cls !== "none" ? h.upgrade.message : ""].filter(Boolean).join("\n");
+  }
+  for (const E of v.edges) {
+    const A = info.get(E.e.a), B = info.get(E.e.b);
+    const down = A.status === "DOWN" || B.status === "DOWN";
+    const upg = A.u.cls === "running" || B.u.cls === "running";
+    const hold = (A.u.cls === "running" && holds.has(E.e.b)) || (B.u.cls === "running" && holds.has(E.e.a));
+    E.path.setAttribute("class", "dg-e" + (down ? " down" : "") + (upg ? " upg" : "") + (hold ? " hold" : ""));
+    E.path.style.strokeWidth = (2 + Math.min(E.e.links.length - 1, 3) + (upg ? 1 : 0)) + "px";
+  }
+  if (active.length) {
+    const names = a => a.map(id => v.meta.get(id).name).join(", ");
+    banner.textContent = "Upgrade in progress on " + names(active) + "." + (holds.size ? " Do not start an upgrade on its uplink (" + names([...holds.keys()]) + ") until it finishes." : "");
+    banner.hidden = false;
+  } else banner.hidden = true;
+  dgRenderDetail(info);
+}
+
+// ---- details panel for the clicked switch ----
+function dgSelect(id) { dg.sel = dg.sel === id ? null : id; dg.detailKey = ""; dgPaintLive(); }
+function dgRenderDetail(info) {
+  const box = $("dg-detail"), v = dg.view;
+  if (!dg.sel || !v || !v.nodes.has(dg.sel)) { box.hidden = true; dg.detailKey = ""; return; }
+  const live = dgLive(), n = v.nodes.get(dg.sel).n, h = n.managed ? live.get(n.host) : null, u = dgUpg(h);
+  const status = !n.managed ? "" : (h && h.status) || "PENDING";
+  const rows = [["Address", n.host || "-"], ["Platform", n.platform || (h && h.platform) || "-"]];
+  if (n.managed) {
+    rows.push(["Status", status === "UP" ? "Up" : status === "DOWN" ? "Down" : "Not checked yet"]);
+    rows.push(["Version", (h && h.version) || "-"]);
+    rows.push(["Credentials", (h && h.profile) || "-"]);
+    rows.push(["Upgrade", u.text || "No upgrade"]);
+    if (h && h.upgrade && h.upgrade.message && u.cls !== "none" && u.cls !== "queued") rows.push(["Detail", dgClip(h.upgrade.message, 120)]);
+    rows.push(["Last scan", n.scan_time ? n.scan_time + (n.scan_ok === false ? " (latest scan failed: " + n.scan_error + ")" : "") : (n.scan_error || "not scanned")]);
+  } else rows.push(["Note", "Seen by CDP but not onboarded in this site"]);
+  const peers = [];
+  for (const e of dg.data.graph.edges) {
+    if (e.a !== n.id && e.b !== n.id) continue;
+    const other = v.meta.get(e.a === n.id ? e.b : e.a); if (!other) continue;
+    const pl = live.get(other.host), ps = other.managed ? ((pl && pl.status) || "PENDING") : "";
+    peers.push('<li><i class="dot ' + (ps === "UP" ? "ok" : ps === "DOWN" ? "bad" : "") + '"></i><b>' + esc(other.name) + "</b>" +
+      e.links.map(l => '<div class="pt">' + esc(ifShort(e.a === n.id ? l.a_if : l.b_if)) + " \u2194 " + esc(ifShort(e.a === n.id ? l.b_if : l.a_if)) + "</div>").join("") + "</li>");
+  }
+  const html = '<h5><span>' + esc(n.name) + '</span><button type="button" data-dg="close" title="Close">&times;</button></h5><dl>' +
+    rows.map(r => "<dt>" + esc(r[0]) + "</dt><dd>" + esc(r[1]) + "</dd>").join("") + "</dl>" +
+    '<div class="note" style="margin:0 0 4px">Connected to (' + peers.length + ")</div><ul class=\"nbs\">" + (peers.join("") || "<li>No links found</li>") + "</ul>";
+  if (html === dg.detailKey) return;
+  dg.detailKey = html; box.innerHTML = html; box.hidden = false;
+}
+$("dg-detail").addEventListener("click", async e => {
+  const b = e.target.closest("[data-dg]"); if (!b) return;
+  if (b.dataset.dg === "close") { dg.sel = null; dgPaintLive(); return; }
+});
+
+// ---- toolbar ----
+$("dg-ports").addEventListener("change", e => { dg.ports = e.target.checked; dgPlaceEdges(); });
+$("dg-other").addEventListener("change", e => { dg.showOther = e.target.checked; dg.graphKey = ""; dgLoad(true); });
+$("dg-refresh").addEventListener("click", () => dgLoad(true));
+$("dg-reset").addEventListener("click", () => { dg.pos = {}; dgSavePos(); dg.fitted = false; dgDraw(); });
+$("dg-fit").addEventListener("click", () => { dgFitView(); });
+
+// Export the diagram as a PNG: the SVG is copied with its styles written into every element (a picture cannot use the
+// page's stylesheet), drawn onto a canvas at 2-3x for a sharp result, and saved. The whole diagram is exported, whatever
+// the current pan or zoom, with the switches where they were dragged to.
+function dgInlineStyles(src, dst) {
+  const cs = getComputedStyle(src);
+  const props = ["fill", "fill-opacity", "stroke", "stroke-width", "stroke-opacity", "stroke-dasharray", "stroke-linecap", "stroke-linejoin",
+                 "opacity", "font-family", "font-size", "font-weight", "font-style", "text-anchor", "letter-spacing", "visibility", "display",
+                 "paint-order", "stroke-miterlimit", "stroke-dashoffset", "dominant-baseline", "text-transform"];
+  dst.setAttribute("style", props.map(k => k + ":" + cs.getPropertyValue(k)).join(";"));
+  const a = src.children, b = dst.children;
+  for (let i = 0; i < a.length && i < b.length; i++) dgInlineStyles(a[i], b[i]);
+}
+function dgExportPng() {
+  if (!dg.root) { dgSay("err", "Nothing to export yet - tick some switches and click Discover."); return; }
+  let bb; try { bb = dg.root.getBBox(); } catch (e) { bb = null; }
+  if (!bb || !bb.width) { dgSay("err", "Nothing to export yet."); return; }
+  const pad = 36, head = 44, x = bb.x - pad, y = bb.y - pad - head, w = bb.width + 2 * pad, h = bb.height + 2 * pad + head;
+  const scale = Math.max(1, Math.min(3, 8000 / Math.max(w, h)));
+  const clone = dg.root.cloneNode(true);
+  dgInlineStyles(dg.root, clone);
+  clone.removeAttribute("transform"); clone.removeAttribute("id");
+  clone.querySelectorAll("title").forEach(t => t.remove());
+  const NS = "http://www.w3.org/2000/svg", mk = (n, a) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+  const bg = getComputedStyle($("dg-wrap")).backgroundColor || "#ffffff", fg = getComputedStyle(document.body).color || "#111111";
+  const font = getComputedStyle(document.body).fontFamily;
+  const when = new Date(), pad2 = n => String(n).padStart(2, "0");
+  const stamp = when.getFullYear() + "-" + pad2(when.getMonth() + 1) + "-" + pad2(when.getDate()) + " " + pad2(when.getHours()) + ":" + pad2(when.getMinutes());
+  const svg = mk("svg", {xmlns: NS, width: Math.round(w * scale), height: Math.round(h * scale), viewBox: [x, y, w, h].join(" ")});
+  svg.appendChild(mk("rect", {x: x, y: y, width: w, height: h, fill: bg}));
+  const t1 = mk("text", {x: x + pad, y: y + 28, "font-family": font, "font-size": 18, "font-weight": 700, fill: fg});
+  t1.textContent = "Topology" + (siteName ? " - " + siteName : "");
+  const t2 = mk("text", {x: x + pad, y: y + 46, "font-family": font, "font-size": 11, fill: fg, "fill-opacity": 0.65});
+  t2.textContent = "Exported " + stamp;
+  svg.appendChild(t1); svg.appendChild(t2); svg.appendChild(clone);
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement("canvas"); c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    c.toBlob(blob => {
+      if (!blob) { dgSay("err", "Could not create the PNG in this browser."); return; }
+      const url = URL.createObjectURL(blob), a = document.createElement("a");
+      a.href = url; a.download = "topology_" + (siteName || "site").replace(/[^A-Za-z0-9._-]+/g, "_") + "_" +
+        when.getFullYear() + pad2(when.getMonth() + 1) + pad2(when.getDate()) + "_" + pad2(when.getHours()) + pad2(when.getMinutes()) + ".png";
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 5000);
+      dgSay("ok", "Saved " + a.download);
+    }, "image/png");
+  };
+  img.onerror = () => dgSay("err", "Could not create the PNG in this browser.");
+  img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(new XMLSerializer().serializeToString(svg));
+}
+$("dg-png").addEventListener("click", dgExportPng);
+const dgMid = () => { const w = $("dg-wrap"); return [w.clientWidth / 2, w.clientHeight / 2]; };
+$("dg-zin").addEventListener("click", () => { const c = dgMid(); dgZoomAt(1.25, c[0], c[1]); });
+$("dg-zout").addEventListener("click", () => { const c = dgMid(); dgZoomAt(0.8, c[0], c[1]); });
+
+// Mouse wheel: zoom around the pointer.
+$("dg-svg").addEventListener("wheel", ev => {
+  if (!dg.root) return;
+  ev.preventDefault();
+  const r = $("dg-wrap").getBoundingClientRect();
+  const dy = ev.deltaMode === 1 ? ev.deltaY * 16 : ev.deltaY;
+  dgZoomAt(Math.exp(-dy * 0.0016), ev.clientX - r.left, ev.clientY - r.top);
+}, {passive: false});
+
+// Drag empty space (left or middle button): move the whole diagram freely, in any direction.
+$("dg-svg").addEventListener("pointerdown", ev => {
+  if (!dg.root || (ev.button !== 0 && ev.button !== 1) || ev.target.closest(".dg-n")) return;
+  ev.preventDefault();
+  const svg = $("dg-svg"), wrap = $("dg-wrap");
+  const sx = ev.clientX, sy = ev.clientY, ox = dg.px, oy = dg.py; let moved = false;
+  try { svg.setPointerCapture(ev.pointerId); } catch (e) {}
+  wrap.classList.add("panning");
+  const mv = e2 => {
+    const dx = e2.clientX - sx, dy = e2.clientY - sy;
+    if (!moved && Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+    if (!moved) return;
+    dg.px = ox + dx; dg.py = oy + dy; dgApplyView();
+  };
+  const up = e2 => {
+    svg.removeEventListener("pointermove", mv); svg.removeEventListener("pointerup", up); svg.removeEventListener("pointercancel", up);
+    try { svg.releasePointerCapture(e2.pointerId); } catch (e) {}
+    wrap.classList.remove("panning");
+    if (!moved && dg.sel) { dg.sel = null; dgPaintLive(); }      // a plain click on the background closes the details panel
+  };
+  svg.addEventListener("pointermove", mv); svg.addEventListener("pointerup", up); svg.addEventListener("pointercancel", up);
+});
+
+// Full screen: the whole Topology card (toolbar, canvas, legend, details) fills the screen.
+// Uses the browser's Fullscreen API and falls back to a fixed full-window layer where that is not allowed.
+function dgIsFull() { const c = $("dg-card"); return document.fullscreenElement === c || c.classList.contains("dg-full"); }
+function dgFullUI() {
+  const on = dgIsFull(), b = $("dg-full");
+  b.innerHTML = IC[on ? "shrink" : "expand"]; b.title = on ? "Exit full screen (Esc)" : "Full screen (Esc to exit)";
+  b.setAttribute("aria-label", on ? "Exit full screen" : "Full screen"); b.setAttribute("aria-pressed", on ? "true" : "false");
+  if (dg.view) setTimeout(() => { if (dgFitView()) dg.fitted = true; }, 60);   // the canvas changed size: fit the diagram to it
+}
+function dgExitFull() {
+  const c = $("dg-card"); if (!c) return;
+  if (document.fullscreenElement === c && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  if (c.classList.contains("dg-full")) { c.classList.remove("dg-full"); dgFullUI(); }
+}
+$("dg-full").addEventListener("click", async () => {
+  const c = $("dg-card");
+  if (dgIsFull()) { dgExitFull(); return; }
+  try { if (!c.requestFullscreen) throw new Error("no fullscreen api"); await c.requestFullscreen(); }
+  catch (e) { c.classList.add("dg-full"); dgFullUI(); }
+});
+document.addEventListener("fullscreenchange", dgFullUI);
+document.addEventListener("keydown", e => { if (e.key === "Escape" && $("dg-card").classList.contains("dg-full")) dgExitFull(); });
+
 if (location.hash === "#storage") showView("storage", false);
+else if (location.hash === "#diagram") showView("diagram", false);
 else if (location.hash === "#settings") showView("settings", false);
 
 // ============================================================================================
@@ -10211,7 +11803,7 @@ function drOverview(h, d) {
 
   // recent events
   const ev = d ? d.events.slice(0, 5) : [];
-  out += drSec("Recent Events", d && d.events.length > 5 ? '<button type="button" class="btn sm" data-goto="events">View all events</button>' : "",
+  out += drSec("Recent Events", d && d.events.length > 5 ? '<button type="button" class="btn sm" data-goto="events">View All Events</button>' : "",
     ev.length ? ev.map(drEventRow).join("") : '<div class="dr-empty">' + (d ? "No events for this switch yet." : "Loading ...") + "</div>");
   return out;
 }
@@ -10455,7 +12047,7 @@ function termPaint() {
   const t = termGet(h), out = $("dr-term-out"), st = $("dr-term-state");
   const live = t.state === "on" || t.state === "connecting";
   const atEnd = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
-  if (out.textContent !== t.text) { out.textContent = t.text || "Not connected. Click Connect to open an SSH session to this switch."; if (atEnd || !t.text) out.scrollTop = out.scrollHeight; }
+  if (out.textContent !== t.text) { out.textContent = t.text || ("Not connected. Click Connect to open " + (hostProto(h) === "Telnet" ? "a Telnet" : "an SSH") + " session to this switch."); if (atEnd || !t.text) out.scrollTop = out.scrollHeight; }
   st.textContent = {off: "Not connected", connecting: "Connecting ...", on: "Connected", closed: "Session closed"}[t.state];
   st.className = "tst" + (t.state === "on" ? " on" : t.state === "connecting" ? " busy" : "");
   $("dr-term-title").textContent = (drHost() && (drHost().label || h)) || h;
@@ -10711,6 +12303,8 @@ def make_handler(manager, allowed_hosts, any_host):
                     self._json(200, manager.console_read(q("host"), q("job"), q("offset")))
                 elif path == "/api/sites":
                     self._json(200, {"sites": list_site_profiles(), "current": manager.site_name})
+                elif path == "/api/topology":
+                    self._json(200, manager.topology_view())
                 elif path == "/api/storage/list":
                     self._json(200, storage_list(qv("site"), qv("path")))
                 elif path == "/api/storage/search":
@@ -10719,6 +12313,12 @@ def make_handler(manager, allowed_hosts, any_host):
                     self._json(200, storage_read(qv("site"), qv("path")))
                 elif path == "/api/storage/download":
                     self._storage_download(qv("site"), qv("path"))
+                elif path == "/api/devices/template.xlsx":
+                    self._send(200, device_list_template_xlsx(),
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               {"Content-Disposition": 'attachment; filename="device_list_template.xlsx"'})
+                elif path == "/api/notifications/email":
+                    self._json(200, manager.email_settings_view())
                 elif path == "/api/upgrade-report.csv":
                     self._send(200, manager.upgrade_report_csv().encode("utf-8"), "text/csv; charset=utf-8",
                                {"Content-Disposition": f'attachment; filename="upgrade_report_v{APP_VERSION}.csv"'})
@@ -10772,14 +12372,24 @@ def make_handler(manager, allowed_hosts, any_host):
                     result = manager.start_version_check(body.get("hosts"))
                 elif path == "/api/test-credentials":
                     result = manager.test_credentials(body.get("hosts"), body.get("profile"))
+                elif path == "/api/profile/test":
+                    result = manager.test_credentials(body.get("hosts"), None, {
+                        "username": body.get("username"), "password": body.get("password"),
+                        "secret": body.get("secret"), "protocol": body.get("protocol"),
+                        "port": body.get("port"), "original": body.get("original"),
+                        "clear_secret": bool(body.get("clear_secret"))})
                 elif path == "/api/profile/save":
                     result = manager.save_profile(body.get("name"), body.get("username"), body.get("password"),
                                                   body.get("secret"), bool(body.get("clear_secret")),
-                                                  body.get("original"))
+                                                  body.get("original"), body.get("protocol") or "ssh", body.get("port"))
                 elif path == "/api/notifications/clear":
                     result = manager.clear_notifications()
                 elif path == "/api/profile/delete":
                     result = manager.delete_profile(body.get("name"))
+                elif path == "/api/topology/discover":
+                    result = manager.start_topology_discovery(body.get("hosts"))
+                elif path == "/api/topology/root":
+                    result = manager.topology_set_root(body.get("host"), bool(body.get("on")))
                 elif path == "/api/profile/assign":
                     result = manager.assign_profile(body.get("hosts"), body.get("profile"))
                 elif path == "/api/term/open":
@@ -10806,6 +12416,10 @@ def make_handler(manager, allowed_hosts, any_host):
                     result = manager.cancel_schedule(body.get("hosts"))
                 elif path == "/api/settings":
                     result = manager.update_settings(body.get("values"), self._who())
+                elif path == "/api/notifications/email":
+                    result = manager.update_email_settings(body.get("values"), self._who())
+                elif path == "/api/notifications/email/test":
+                    result = manager.test_email_settings(body.get("values"), self._who())
                 elif path == "/api/timeout-profiles/save":
                     result = manager.timeout_profile_save(body.get("name"), body.get("values"), body.get("note"),
                                                           body.get("source"), body.get("site"), body.get("switch"),
@@ -11093,13 +12707,20 @@ def apply_access_control(base_handler, access):
            ".err{background:#fde8e8;color:#9b1c1c;padding:8px 10px;border-radius:6px;font-size:14px}"
            "@media(prefers-color-scheme:dark){body{background:#12171d;color:#e6ebf1}main{background:#1b232c}"
            "p{color:#9fb0c1}input{background:#12171d;color:#e6ebf1;border-color:#3a4654}}"
+           ".brand{display:flex;align-items:center;gap:14px;margin:0 0 18px;padding-bottom:16px;"
+           "border-bottom:1px solid #d5dce4}.brand img{width:52px;height:52px;object-fit:contain;flex:none}"
+           ".brand b{display:block;font-size:24px;font-weight:600;line-height:1.1}"
+           ".brand small{display:block;margin-top:3px;font-size:12px;color:#6b7a8c}"
            ".credit{margin:18px 0 0;padding-top:12px;border-top:1px solid #d5dce4;font-size:12px;"
            "text-align:center;color:#6b7a8c}.credit a{color:#1f6feb;text-decoration:none;font-weight:600}")
 
     def page(title, inner, script=""):
         return ("<!doctype html><html><head><meta charset='utf-8'>"
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                f"<title>{title}</title><style>{CSS}</style></head><body><main>{inner}"
+                f"<title>{title} - {APP_NAME}</title><link rel='icon' href='{APP_ICON_DATA_URI}'>"
+                f"<style>{CSS}</style></head><body><main>"
+                f"<div class='brand'><img src='{APP_ICON_DATA_URI}' alt=''>"
+                f"<div><b>{APP_NAME}</b><small>Version {APP_VERSION}</small></div></div>{inner}"
                 f"<p class='credit'>Developed by <b>{_html.escape(APP_AUTHOR)}</b> | "
                 f"<a href='{_html.escape(APP_REPO_URL, quote=True)}' target='_blank' "
                 f"rel='noopener noreferrer'>GitHub</a></p></main>"
@@ -11110,7 +12731,7 @@ def apply_access_control(base_handler, access):
     def login_page(next_url, error=""):
         err = f"<div class='err'>{_html.escape(error)}</div>" if error else ""
         return page("Sign in", (
-            "<h1>NetUpgrade</h1><p>Sign in to continue.</p>" + err +
+            "<h1>Sign in</h1><p>Enter your username and password to continue.</p>" + err +
             "<form method='post' action='/__guard/login'>"
             f"<input type='hidden' name='next' value='{_html.escape(next_url, quote=True)}'>"
             "<label>Username<input name='username' autocomplete='username' autofocus required></label>"
@@ -11198,7 +12819,7 @@ setInterval(async function(){
         who = json.dumps({"name": user, "role": role}).replace("<", "\\u003c")
         return ("<!doctype html><html><head><meta charset='utf-8'>"
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<title>NetUpgrade</title><style>"
+                f"<title>{APP_NAME}</title><link rel='icon' href='{APP_ICON_DATA_URI}'><style>"
                 "html,body{margin:0;height:100%;overflow:hidden}iframe{display:block;border:0;width:100%;height:100%}"
                 f"</style></head><body><iframe id='f' src='{src}'></iframe><script>var WHO={who};{SHELL_JS}</script></body></html>")
 
@@ -11575,13 +13196,22 @@ def gui_main(embedded=False, argv=None, access=None, tls=None):
                  "file, or choose/create a site from the dashboard and upload it there.")
         print("No site profile selected yet - choose or create one from the dashboard.")
 
+    EMAILER.cfg_provider = manager.email_live_config
+    legacy = (access or {}).get("email_legacy")          # e-mail settings the launcher's old Notifications tab saved
+    if isinstance(legacy, dict) and legacy.get("host") and not email_settings_path().exists():
+        try:
+            merged = dict(EMAIL_DEFAULTS)
+            merged.update({k: legacy[k] for k in EMAIL_DEFAULTS if k in legacy})
+            save_email_settings(merged)
+            manager.email_cfg = load_email_settings()
+            print("E-mail notification settings moved from the launcher to Settings > Notifications.", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not move the old e-mail settings: {type(exc).__name__}", flush=True)
     allowed = {"localhost", "127.0.0.1", "::1"}
     handler = make_handler(manager, allowed, any_host=not loopback)
     if access is not None:
         access["notify"] = lambda kind, title, text: manager._notify("-", kind, title, text)
         access["https"] = bool(tls)
-        EMAILER.cfg_provider = lambda: access.get("email")          # live settings from the launcher
-        access["email_last"] = lambda: dict(EMAILER.last)           # last e-mail result, for its tab
         handler = apply_access_control(handler, access)
     try:
         if tls:

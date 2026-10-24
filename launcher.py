@@ -81,7 +81,7 @@ import pystray
 from PIL import Image, ImageTk
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.10.1"          # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
+APP_VERSION = "5.10.2"          # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
 UI_FONT_SIZE = 8               # window size follows the font: 9 = the old, larger window; 8 = compact
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"
@@ -540,6 +540,22 @@ def apply_icon(window):
             traceback.print_exc()
 
 
+def brand_header(parent, size=44):
+    """Application icon + name (+ version) strip for the top of a dialog."""
+    row = ttk.Frame(parent)
+    try:
+        img = ImageTk.PhotoImage(Image.open(ICON_PATH).convert("RGBA").resize((size, size), Image.LANCZOS))
+        _icon_refs.append(img)
+        ttk.Label(row, image=img).pack(side="left", padx=(0, 10))
+    except Exception:
+        traceback.print_exc()
+    col = ttk.Frame(row)
+    col.pack(side="left")
+    ttk.Label(col, text=APP_NAME, font=("Segoe UI", UI_FONT_SIZE + 7, "bold")).pack(anchor="w")
+    ttk.Label(col, text=f"Version {APP_VERSION}", foreground="gray").pack(anchor="w")
+    return row
+
+
 # --- Admin account ---------------------------------------------------------
 def set_admin(name, password=None):
     """Create the admin account (password given) or rename it (password None)."""
@@ -574,6 +590,7 @@ def admin_dialog(first_run):
     saved = {"ok": False}
     body = ttk.Frame(dlg, padding=14)
     body.pack(fill="both", expand=True)
+    brand_header(body).pack(anchor="w", pady=(0, 10))
     if first_run:
         ttk.Label(body, text="First start: create the administrator account.\n"
                              "Everyone signs in to the tool, also on this PC.",
@@ -708,10 +725,8 @@ nb = ttk.Notebook(root)
 nb.pack(fill="both", expand=True, padx=6, pady=(6, 4))
 gen = ttk.Frame(nb, padding=6)
 sec = ttk.Frame(nb, padding=6)
-nt = ttk.Frame(nb, padding=6)
 nb.add(gen, text="  General  ")
 nb.add(sec, text="  Security  ")
-nb.add(nt, text="  Notifications  ")
 
 # ============================ GENERAL TAB ==================================
 gen.columnconfigure(1, weight=1)
@@ -1082,282 +1097,14 @@ ttk.Label(sbtn, textvariable=prot_var, foreground="gray").pack(side="left")
 ttk.Button(sbtn, text="Save", width=7, command=save_security).pack(side="right")
 ttk.Label(sec, textvariable=save_msg, foreground=GREEN).grid(row=12, column=0, sticky="e")
 
-# ============================ NOTIFICATIONS TAB ============================
-# E-mail copies of the dashboard notifications (set up for Gmail by default).
-# Settings live in settings.json (the password is stored ENCRYPTED, never as text) and are
-# pushed to the running tool through live_access["email"], so a change applies at once.
-# EMAIL_KINDS must match the categories Manager._notify sends in ios_xe_upgrade_manager.py.
-EMAIL_KINDS = [        # (key, label shown here, ticked by default)
-    ("started", "Started", False),
-    ("completed", "Completed", True),
-    ("failed", "Failed", True),
-    ("attention", "Needs attention", True),
-    ("postcheck", "Post-check result", True),
-    ("missed", "Schedule missed", True),
-    ("login", "Sign-ins", False),
-]
-EMAIL_PROBLEM_KINDS = ("failed", "attention", "missed")
-EMAIL_DEFAULTS = {"enabled": False, "host": "smtp.gmail.com", "port": 587, "security": "starttls",
-                  "username": "", "password_enc": "", "to": "",
-                  "kinds": [k for k, _label, on in EMAIL_KINDS if on]}
-EMAIL_SECURITY = {"starttls": "STARTTLS (port 587)", "ssl": "SSL (port 465)"}
-EMAIL_ADDR_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$")
-
-
-def email_settings():
-    cfg = dict(EMAIL_DEFAULTS)
-    cfg.update(settings.get("email") or {})
-    return cfg
-
-
-def sync_email_access():
-    cfg = email_settings()
-    cfg["from"] = cfg.get("username", "")
-    live_access["email"] = cfg          # read by the running tool on every notification
-
-
-def _backend():
-    """The tool module (a slow import, so only loaded when a button really needs it)."""
-    import ios_xe_upgrade_manager as backend
-    return backend
-
-
-nt.columnconfigure(0, weight=1)
-em_enabled = tk.BooleanVar()
-em_host, em_port, em_sec = tk.StringVar(), tk.StringVar(), tk.StringVar()
-em_user, em_to, em_msg = tk.StringVar(), tk.StringVar(), tk.StringVar()
-em_kinds = {key: tk.BooleanVar() for key, _label, _on in EMAIL_KINDS}
-em_pw_state = tk.StringVar()
-em_widgets = []                         # everything that is greyed out while e-mail is switched off
-
-
-def update_email_state():
-    flag = "!disabled" if em_enabled.get() else "disabled"
-    for w in em_widgets:
-        w.state([flag])
-
-
-ttk.Checkbutton(nt, text="Send e-mail notifications", variable=em_enabled,
-                command=update_email_state).grid(row=0, column=0, sticky="w")
-ttk.Label(nt, foreground="gray", wraplength=360, justify="left",
-          text="Gmail: smtp.gmail.com, port 587 (STARTTLS) and an App password "
-               "(2-Step Verification > App passwords). Your normal password will not work."
-          ).grid(row=1, column=0, sticky="w", pady=(0, 4))
-
-em_form = ttk.Frame(nt)
-em_form.grid(row=2, column=0, sticky="ew")
-em_form.columnconfigure(1, weight=1)
-for i, text in enumerate(("SMTP server", "Port / security", "Gmail address", "App password", "Send to")):
-    ttk.Label(em_form, text=text).grid(row=i, column=0, sticky="w", pady=1)
-e_host = ttk.Entry(em_form, textvariable=em_host)
-e_host.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=1)
-ps_row = ttk.Frame(em_form)
-ps_row.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=1)
-e_port = ttk.Entry(ps_row, textvariable=em_port, width=6)
-e_port.pack(side="left")
-c_sec = ttk.Combobox(ps_row, textvariable=em_sec, values=list(EMAIL_SECURITY.values()), state="readonly", width=20)
-c_sec.pack(side="left", padx=(6, 0))
-e_user = ttk.Entry(em_form, textvariable=em_user)
-e_user.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=1)
-pw_row = ttk.Frame(em_form)
-pw_row.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=1)
-e_pw = ttk.Entry(pw_row, show="*")
-e_pw.pack(side="left", fill="x", expand=True)
-c_show = make_show_check(pw_row, [e_pw])
-c_show.pack(side="left", padx=(6, 0))
-e_to = ttk.Entry(em_form, textvariable=em_to)
-e_to.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=1)
-ttk.Label(em_form, textvariable=em_pw_state, foreground="gray").grid(row=5, column=1, sticky="w", padx=(8, 0))
-
-
-def on_security_change(_e=None):
-    """Keep the port in step with the security choice (only if it is still a standard port)."""
-    if em_port.get().strip() in ("", "587", "465"):
-        em_port.set("465" if em_sec.get() == EMAIL_SECURITY["ssl"] else "587")
-
-
-c_sec.bind("<<ComboboxSelected>>", on_security_change)
-
-ttk.Separator(nt).grid(row=3, column=0, sticky="ew", pady=3)
-ttk.Label(nt, text="E-mail me about", font=("Segoe UI", UI_FONT_SIZE, "bold")).grid(row=4, column=0, sticky="w")
-em_kind_frame = ttk.Frame(nt)
-em_kind_frame.grid(row=5, column=0, sticky="ew", pady=(2, 0))
-for i, (key, label, _on) in enumerate(EMAIL_KINDS):
-    cb = ttk.Checkbutton(em_kind_frame, text=label, variable=em_kinds[key])
-    cb.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 12), pady=0)
-    em_widgets.append(cb)
-
-
-def set_kinds(keys):
-    for key, var in em_kinds.items():
-        var.set(key in keys)
-
-
-quick = ttk.Frame(nt)
-quick.grid(row=6, column=0, sticky="w", pady=(3, 0))
-b_all = ttk.Button(quick, text="Select all", command=lambda: set_kinds([k for k, _l, _o in EMAIL_KINDS]))
-b_prob = ttk.Button(quick, text="Problems only", command=lambda: set_kinds(EMAIL_PROBLEM_KINDS))
-b_none = ttk.Button(quick, text="Clear", command=lambda: set_kinds(()))
-for b in (b_all, b_prob, b_none):
-    b.pack(side="left", padx=(0, 4))
-
-
-def collect_email(strict):
-    """(settings dict, problems). strict=True also checks that the form is complete."""
-    sec_key = next((k for k, v in EMAIL_SECURITY.items() if v == em_sec.get()), "starttls")
-    kinds = [k for k, _label, _on in EMAIL_KINDS if em_kinds[k].get()]
-    cfg = {"enabled": bool(em_enabled.get()), "host": em_host.get().strip(), "port": em_port.get().strip(),
-           "security": sec_key, "username": em_user.get().strip(), "to": em_to.get().strip(), "kinds": kinds}
-    problems = []
-    if strict:
-        if not cfg["host"]:
-            problems.append("Enter the SMTP server (for Gmail: smtp.gmail.com).")
-        try:
-            port = int(cfg["port"])
-            if not 1 <= port <= 65535:
-                raise ValueError
-            cfg["port"] = port
-        except ValueError:
-            problems.append("The port must be a number (587 for STARTTLS, 465 for SSL).")
-        if not EMAIL_ADDR_RE.match(cfg["username"]):
-            problems.append("Enter the e-mail address used to sign in to the mail server.")
-        recipients = [r for r in re.split(r"[,;\s]+", cfg["to"]) if r]
-        bad = [r for r in recipients if not EMAIL_ADDR_RE.match(r)]
-        if not recipients:
-            problems.append("Enter at least one address under 'Send to'.")
-        elif bad:
-            problems.append("Not a valid e-mail address: " + ", ".join(bad[:3]))
-        if not e_pw.get() and not (settings.get("email") or {}).get("password_enc"):
-            problems.append("Enter the App password.")
-    return cfg, problems
-
-
-def update_pw_state():
-    saved = bool((settings.get("email") or {}).get("password_enc"))
-    em_pw_state.set(("Password saved - leave empty to keep it.  " if saved else "") + "Several recipients: use commas.")
-
-
-def save_email():
-    cfg, problems = collect_email(strict=em_enabled.get())
-    if problems:
-        messagebox.showerror("Notifications", "\n".join(problems))
-        return
-    if cfg["enabled"] and not cfg["kinds"] and not messagebox.askyesno(
-            "Notifications", "No notification type is ticked, so no e-mail would ever be sent.\n\nSave anyway?"):
-        return
-    cfg["password_enc"] = (settings.get("email") or {}).get("password_enc", "")
-    if e_pw.get():
-        try:
-            cfg["password_enc"] = _backend().protect_secret(e_pw.get())
-        except (Exception, SystemExit) as exc:
-            messagebox.showerror("Notifications", f"Could not encrypt the password:\n{exc}")
-            return
-    was_on = bool((settings.get("email") or {}).get("enabled"))
-    settings["email"] = cfg
-    save_settings()
-    sync_email_access()                                  # applied immediately, no restart
-    e_pw.delete(0, "end")
-    update_pw_state()
-    audit_event("e-mail notification settings saved: " + (
-        f"ON ({len(cfg['kinds'])} type(s), {cfg['host']})" if cfg["enabled"]
-        else ("switched OFF" if was_on else "OFF")))
-    em_msg_lbl.config(foreground=GREEN)
-    em_msg.set("Saved - applied now." if cfg["enabled"] else "Saved - e-mail notifications are OFF.")
-    root.after(4000, lambda: em_msg.set(""))
-
-
-em_test_result = []
-
-
-def test_email():
-    cfg, problems = collect_email(strict=True)
-    if problems:
-        messagebox.showerror("Notifications", "\n".join(problems))
-        return
-    cfg["from"] = cfg["username"]
-    if e_pw.get():
-        cfg["password"] = e_pw.get()                     # only used for this test, not stored
-    else:
-        cfg["password_enc"] = (settings.get("email") or {}).get("password_enc", "")
-    b_test.state(["disabled"])
-    em_msg_lbl.config(foreground="gray")
-    em_msg.set("Sending test e-mail ...")
-    del em_test_result[:]
-
-    def work():
-        try:
-            n = _backend().send_test_email(cfg)
-            em_test_result.append((True, f"Test e-mail sent to {n} address(es). Check the inbox."))
-        except (Exception, SystemExit) as exc:
-            try:
-                reason = _backend().describe_email_error(exc)
-            except Exception:
-                reason = type(exc).__name__
-            em_test_result.append((False, reason))
-
-    def poll():
-        if not em_test_result:
-            root.after(300, poll)
-            return
-        ok, text = em_test_result[0]
-        em_msg_lbl.config(foreground=GREEN if ok else RED)
-        em_msg.set(text)
-        b_test.state(["!disabled"])
-        update_email_state()
-
-    threading.Thread(target=work, daemon=True).start()
-    root.after(300, poll)
-
-
-em_btns = ttk.Frame(nt)
-em_btns.grid(row=8, column=0, sticky="ew", pady=(5, 0))
-b_test = ttk.Button(em_btns, text="Send test e-mail", command=test_email)
-b_test.pack(side="left")
-ttk.Button(em_btns, text="Save", width=7, command=save_email).pack(side="right")
-em_msg_lbl = ttk.Label(nt, textvariable=em_msg, foreground=GREEN, wraplength=360, justify="left")
-em_msg_lbl.grid(row=9, column=0, sticky="w", pady=(2, 0))
-em_last = tk.StringVar()
-em_last_lbl = ttk.Label(nt, textvariable=em_last, foreground="gray", wraplength=360, justify="left")
-em_last_lbl.grid(row=10, column=0, sticky="w")
-em_widgets += [e_host, e_port, c_sec, e_user, e_pw, c_show, e_to, b_all, b_prob, b_none, b_test]
-
-
-def load_email_fields():
-    cfg = email_settings()
-    em_enabled.set(bool(cfg.get("enabled")))
-    em_host.set(cfg.get("host") or "")
-    em_port.set(str(cfg.get("port") or ""))
-    em_sec.set(EMAIL_SECURITY.get(cfg.get("security"), EMAIL_SECURITY["starttls"]))
-    em_user.set(cfg.get("username") or "")
-    em_to.set(cfg.get("to") or "")
-    set_kinds(cfg.get("kinds") or [])
-    e_pw.delete(0, "end")
-    update_pw_state()
-    update_email_state()
-
-
-def poll_email_status():
-    """Show the result of the latest real notification e-mail (sent / why it failed)."""
-    try:
-        fn = live_access.get("email_last")
-        last = fn() if callable(fn) else None
-        if last:
-            em_last_lbl.config(foreground=GREEN if last.get("ok") else RED)
-            em_last.set(("Last e-mail %s: " % last.get("time", "")) + str(last.get("detail", "")))
-        else:
-            em_last.set("")
-    except Exception:
-        pass
-    root.after(3000, poll_email_status)
-
-
 # ---- start-up -------------------------------------------------------------
 # Restore the saved interface (falls back to "This PC only" if it's gone)
 saved = next((o for o in options if o["key"] == settings.get("interface")), options[0])
 combo.set(saved["label"])
 load_security_fields()
-sync_email_access()
-load_email_fields()
+# E-mail notifications now live in the web dashboard (Settings > Notifications). Settings saved by the old
+# Notifications tab are handed over once; the tool imports them if it has no e-mail settings of its own yet.
+live_access["email_legacy"] = settings.get("email")
 update_share_text()
 update_admin_label()
 update_protection_text()
@@ -1368,6 +1115,5 @@ root.protocol("WM_DELETE_WINDOW", quit_app)
 
 make_tray()
 root.after(2000, tick)
-root.after(3000, poll_email_status)
 root.after(400, startup_admin)          # first start: ask for the admin account
 root.mainloop()
