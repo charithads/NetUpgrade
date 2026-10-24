@@ -2,7 +2,7 @@
 
 NetUpgrade is a Windows desktop application for monitoring Cisco Catalyst switches, managing device inventories, collecting configuration backups, and running or scheduling IOS-XE upgrades. The desktop launcher runs in the Windows notification area and opens a local web dashboard.
 
-The current application version is **5.6.1**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
+The current application version is **5.11.0**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
 
 ## Screenshots
 
@@ -20,10 +20,11 @@ The dashboard shows switch availability, backup and upgrade state, events, and l
 - Back up running configuration, version, boot, inventory, and optional additional commands.
 - Run readiness checks before upgrading, distribute IOS-XE images, activate upgrades, and verify the version after reload.
 - Check each IOS-XE image against Cisco's MD5 checksum during upload; images with missing or mismatched checksums are rejected.
-- Configure the maximum concurrent reloads per site (1–10); additional switches wait in a queue, with an administrator-selectable stop-on-failure policy.
-- Start upgrades immediately or schedule them for a later date and time; view each worker's live progress in the dashboard.
-- Review device events, backups, and per-device command history. Command logs record commands and results metadata, not switch command output.
-- Use role-based dashboard accounts, access controls, and optional HTTPS from the desktop launcher.
+- Set the dashboard-wide upgrade limit (1–10 switches at a time). Extra switches wait in a queue, and an Administrator can choose whether a failure stops queued upgrades.
+- Start upgrades now or schedule them for later; view each switch's live progress and console output in the dashboard.
+- Adjust command timeouts, save named timeout profiles, and run command-time checks on a switch before a rollout. Review device events, backups, and per-device command history.
+- Get optional email alerts for upgrade starts, completion, failures, attention items, post-check results, missed schedules, and sign-ins. Configure SMTP and test delivery in **Settings > Notifications**.
+- Use Administrator, Operator, and Viewer dashboard roles, access controls, and optional HTTPS from the desktop launcher.
 - Run the interactive command-line upgrade flow with `--cli`.
 
 ## Requirements
@@ -73,9 +74,7 @@ py launcher.py --cli
 
 The CLI prompts for the inventory, credentials, and image. It upgrades one switch at a time by default;
 pass `--parallel N` to process up to N switches in waves. By default, a failed wave stops later waves;
-add `--continue-on-failure` to continue. Dashboard rollout concurrency is configured per site by an
-Administrator, from 1 to 10. Queued devices start as slots become available, and the rollout can stop
-starting queued devices after a failure.
+add `--continue-on-failure` to continue. In the dashboard, an Administrator sets a global rollout limit from 1 to 10 and chooses whether a failure stops queued upgrades. Queued devices start as slots become available.
 
 ### Direct manager options
 
