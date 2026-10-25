@@ -2,7 +2,7 @@
 
 NetUpgrade is a Windows desktop application for monitoring Cisco Catalyst switches, managing device inventories, collecting configuration backups, and running or scheduling IOS-XE upgrades. The desktop launcher runs in the Windows notification area and opens a local web dashboard.
 
-The current application version is **5.12.1**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
+The current application version is **5.13.0**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
 
 ## Screenshots
 
@@ -93,7 +93,7 @@ Monitoring starts when requested from the dashboard. The direct manager listens 
 
 ## Install the Windows app
 
-Download `NetUpgrade-Setup-v<version>.exe` from the [GitHub Releases page](https://github.com/charithads/NetUpgrade/releases) and run it. The installer installs NetUpgrade for the current Windows user and can add a desktop shortcut. The first installation must be done with the setup file; after that, use **About > Check for updates** in the app. NetUpgrade checks GitHub, asks before an update, verifies the installer checksum published by GitHub, installs it, and starts the app again. It will not install an update while a switch upgrade is running.
+Download `NetUpgrade-Setup-v<version>.exe` from the [GitHub Releases page](https://github.com/charithads/NetUpgrade/releases) and run it. The installer installs NetUpgrade for the current Windows user, can add a desktop shortcut, and asks you to choose separate folders for IOS images and switch configuration backups. The default folders are under `%LOCALAPPDATA%\NetUpgrade`, and you can choose another drive or folder during setup. Existing image and backup folders beside an older installation are copied to the selected locations the first time the updated app uses them. The first installation must be done with the setup file; after that, use **About > Check for updates** in the app. NetUpgrade checks GitHub, asks before an update, verifies the installer checksum published by GitHub, installs it, and starts the app again. It will not install an update while a switch upgrade is running.
 
 The installer is not code-signed yet, so Windows may show a SmartScreen warning. Releases are built by the Windows GitHub Actions workflow after tests, dependency audit, and executable packaging succeed. Publishing a GitHub release automatically attaches its version-matched Windows installer.
 
