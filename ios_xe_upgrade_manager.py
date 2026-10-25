@@ -2471,7 +2471,7 @@ SITE_BACKUPS_SUBDIR = "Switch Backups"
 SITE_REPORTS_SUBDIR = "Reports"
 SITE_RUNS_SUBDIR = "Runs"
 
-STORAGE_REGISTRY_KEY = r"Software\\Innovate Nexus\\NetUpgrade"
+STORAGE_REGISTRY_KEY = r"Software\Innovate Nexus\NetUpgrade"
 
 
 def _configured_storage_path(value_name, legacy_dirname):
