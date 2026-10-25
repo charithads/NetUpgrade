@@ -2471,6 +2471,34 @@ SITE_BACKUPS_SUBDIR = "Switch Backups"
 SITE_REPORTS_SUBDIR = "Reports"
 SITE_RUNS_SUBDIR = "Runs"
 
+STORAGE_REGISTRY_KEY = r"Software\\Innovate Nexus\\NetUpgrade"
+
+
+def _configured_storage_path(value_name, legacy_dirname):
+    """Resolve an installer-selected data folder and retain data from older installs."""
+    env_names = {
+        "ImagesPath": "NETUPGRADE_IMAGES_DIR",
+        "BackupsPath": "NETUPGRADE_BACKUPS_DIR",
+    }
+    configured = os.environ.get(env_names[value_name])
+    if not configured and sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STORAGE_REGISTRY_KEY) as key:
+                configured, _ = winreg.QueryValueEx(key, value_name)
+        except (ImportError, OSError):
+            configured = None
+
+    legacy_path = this_program_path().parent / legacy_dirname
+    if not configured:
+        return legacy_path
+
+    selected_path = Path(os.path.expandvars(os.path.expanduser(str(configured)))).resolve()
+    if selected_path != legacy_path.resolve() and not selected_path.exists() and legacy_path.is_dir():
+        # Copy once so an installer-selected location change does not hide existing user data.
+        shutil.copytree(legacy_path, selected_path)
+    return selected_path
+
 
 # --------------------------------------------------------------------------- #
 # Global settings (the gear icon page). One settings.json next to the program, shared by every site.
@@ -2771,7 +2799,7 @@ SITE = SiteContext()
 
 
 def sites_root():
-    d = this_program_path().parent / SITES_ROOT_DIRNAME
+    d = _configured_storage_path("BackupsPath", SITES_ROOT_DIRNAME)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -2934,8 +2962,8 @@ def save_known_version(ip, hostname, version, model=None, boot=None):
 
 
 def images_dir():
-    """The 'IOS Images' folder the GUI uploads into and lists from, next to the program."""
-    d = this_program_path().parent / IMAGES_DIRNAME
+    """The installer-selected folder for uploaded IOS images."""
+    d = _configured_storage_path("ImagesPath", IMAGES_DIRNAME)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -8881,7 +8909,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </aside>
   <main>
     <div class="card img-card" id="img-card">
-      <h4>IOS-XE Images<span class="tip" data-tip="Images are saved in the IOS Images folder next to the program and used by Firmware upgrade. Paste the MD5 checksum from Cisco's download page: the upload is rejected if the file does not match it."></span>
+      <h4>IOS-XE Images<span class="tip" data-tip="Images are saved in the folder selected during installation and used by Firmware upgrade. Paste the MD5 checksum from Cisco's download page: the upload is rejected if the file does not match it."></span>
         <span class="a"><button type="button" class="btn sm" id="img-refresh">Refresh</button></span></h4>
       <div class="img-body">
         <div class="img-form">
