@@ -2,7 +2,7 @@
 
 NetUpgrade is a Windows desktop application for monitoring Cisco Catalyst switches, managing device inventories, collecting configuration backups, and running or scheduling IOS-XE upgrades. The desktop launcher runs in the Windows notification area and opens a local web dashboard.
 
-The current application version is **5.11.0**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
+The current application version is **5.12.1**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
 
 ## Screenshots
 
@@ -26,6 +26,7 @@ The dashboard shows switch availability, backup and upgrade state, events, and l
 - Get optional email alerts for upgrade starts, completion, failures, attention items, post-check results, missed schedules, and sign-ins. Configure SMTP and test delivery in **Settings > Notifications**.
 - Use Administrator, Operator, and Viewer dashboard roles, access controls, and optional HTTPS from the desktop launcher.
 - Run the interactive command-line upgrade flow with `--cli`.
+- Check for releases from **About**. The installed Windows app verifies the installer, asks before installing, then closes and restarts. Updates are blocked while a switch upgrade is running.
 
 ## Requirements
 
@@ -90,16 +91,23 @@ py ios_xe_upgrade_manager.py --mode tcp --port 22 --web-port 9000 --open
 
 Monitoring starts when requested from the dashboard. The direct manager listens on `127.0.0.1` by default and cannot be exposed remotely. Remote access must be enabled through the desktop launcher, with configured users and HTTPS.
 
-## Build the Windows executable
+## Install the Windows app
 
-Install PyInstaller and the application dependencies, then build the launcher:
+Download `NetUpgrade-Setup-v<version>.exe` from the [GitHub Releases page](https://github.com/charithads/NetUpgrade/releases) and run it. The installer installs NetUpgrade for the current Windows user and can add a desktop shortcut. The first installation must be done with the setup file; after that, use **About > Check for updates** in the app. NetUpgrade checks GitHub, asks before an update, verifies the installer checksum published by GitHub, installs it, and starts the app again. It will not install an update while a switch upgrade is running.
+
+The installer is not code-signed yet, so Windows may show a SmartScreen warning. Releases are built by the Windows GitHub Actions workflow after tests, dependency audit, and executable packaging succeed. Publishing a GitHub release automatically attaches its version-matched Windows installer.
+
+## Build from source
+
+Install PyInstaller and the application dependencies, then build from PowerShell:
 
 ```powershell
 py -m pip install -r requirements.txt pyinstaller==6.22.3
 py -m PyInstaller --noconsole --onefile --name NetUpgrade --icon app.ico --add-data "app.ico;." --hidden-import ios_xe_upgrade_manager --collect-all netmiko --collect-all cryptography launcher.py
+py -m PyInstaller --noconsole --onefile --name NetUpgradeUpdater --hidden-import psutil updater_helper.py
 ```
 
-The executable is created at `dist\NetUpgrade.exe`. Keep `ios_xe_upgrade_manager.py` available to the build process; the launcher packages it as a hidden import and invokes its worker mode for device upgrades.
+The Windows installer is compiled from `NetUpgrade.iss` with Inno Setup 6 after both executables exist in `dist`. CI performs the complete build and release upload.
 
 ## Security and local data
 

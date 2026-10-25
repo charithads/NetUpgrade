@@ -22,3 +22,7 @@ settings.json
 # Local logs and backups
 *.log
 *.bak
+
+# Local test dependencies
+.deps/
+.pip-temp/
