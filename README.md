@@ -2,7 +2,7 @@
 
 NetUpgrade is a Windows desktop application for monitoring Cisco Catalyst switches, managing device inventories, collecting configuration backups, and running or scheduling IOS-XE upgrades. The desktop launcher runs in the Windows notification area and opens a local web dashboard.
 
-The current application version is **5.12.1**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
+The current application version is **5.13.0**. The upgrade workflow is designed for Cisco Catalyst 9200/9300 switches and uses IOS-XE INSTALL mode.
 
 ## Screenshots
 
