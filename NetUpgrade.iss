@@ -48,7 +48,8 @@ Root: HKCU; Subkey: "Software\Innovate Nexus\NetUpgrade"; ValueType: string; Val
 [Run]
 Filename: "{app}\NetUpgrade.exe"; Description: "Launch NetUpgrade"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
 
-\n[Code]
+
+[Code]
 var
   IOSStoragePage: TInputDirWizardPage;
   BackupsStoragePage: TInputDirWizardPage;
