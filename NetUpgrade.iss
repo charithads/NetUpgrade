@@ -1,7 +1,7 @@
 #define MyAppName "NetUpgrade"
 #define MyAppPublisher "Innovate Nexus"
 #ifndef AppVersion
-  #define AppVersion "5.13.0"
+  #define AppVersion "5.14.0"
 #endif
 
 [Setup]
@@ -42,8 +42,7 @@ Name: "{autoprograms}\NetUpgrade"; Filename: "{app}\NetUpgrade.exe"; WorkingDir:
 Name: "{autodesktop}\NetUpgrade"; Filename: "{app}\NetUpgrade.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\Innovate Nexus\NetUpgrade"; ValueType: string; ValueName: "ImagesPath"; ValueData: "{code:GetImagesPath}"; Flags: uninsdeletevalue
-Root: HKCU; Subkey: "Software\Innovate Nexus\NetUpgrade"; ValueType: string; ValueName: "BackupsPath"; ValueData: "{code:GetBackupsPath}"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Innovate Nexus\NetUpgrade"; ValueType: string; ValueName: "StoragePath"; ValueData: "{code:GetStoragePath}"; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\NetUpgrade.exe"; Description: "Launch NetUpgrade"; WorkingDir: "{app}"; Flags: postinstall nowait skipifsilent
@@ -51,43 +50,37 @@ Filename: "{app}\NetUpgrade.exe"; Description: "Launch NetUpgrade"; WorkingDir: 
 
 [Code]
 var
-  IOSStoragePage: TInputDirWizardPage;
-  BackupsStoragePage: TInputDirWizardPage;
+  StoragePage: TInputDirWizardPage;
 
 procedure InitializeWizard;
 begin
-  IOSStoragePage := CreateInputDirPage(wpWelcome,
-    'Choose IOS image folder',
-    'Select where IOS image files will be stored.',
-    'NetUpgrade stores uploaded Cisco IOS-XE image files in this folder.',
-    False, '');
-  IOSStoragePage.Add('IOS image folder:');
-  IOSStoragePage.Values[0] := ExpandConstant('{localappdata}\NetUpgrade\IOS Images');
-
-  BackupsStoragePage := CreateInputDirPage(IOSStoragePage.ID,
-    'Choose switch backup folder',
-    'Select where switch configuration backups will be stored.',
-    'NetUpgrade stores switch backups, reports, and upgrade run logs in this folder.',
-    False, '');
-  BackupsStoragePage.Add('Switch backup folder:');
-  BackupsStoragePage.Values[0] := ExpandConstant('{localappdata}\NetUpgrade\Switch Configuration Backups');
+  StoragePage := CreateInputDirPage(wpWelcome,
+    'Choose storage location',
+    'Select one location for NetUpgrade files.',
+    'Images, switch backups, reports, and upgrade logs will be kept under a NetUpgrade folder here. Use Make New Folder in Browse to create that folder if needed.',
+    False, 'NetUpgrade');
+  StoragePage.Add('Storage location:');
+  StoragePage.Values[0] := ExpandConstant('{localappdata}');
 end;
 
-function GetImagesPath(Param: String): String;
+function GetStoragePath(Param: String): String;
+var
+  SelectedPath: String;
 begin
-  Result := ExpandConstant(IOSStoragePage.Values[0]);
-end;
-
-function GetBackupsPath(Param: String): String;
-begin
-  Result := ExpandConstant(BackupsStoragePage.Values[0]);
+  SelectedPath := ExpandConstant(Trim(StoragePage.Values[0]));
+  while (Length(SelectedPath) > 3) and (Copy(SelectedPath, Length(SelectedPath), 1) = '\') do
+    Delete(SelectedPath, Length(SelectedPath), 1);
+  if CompareText(ExtractFileName(SelectedPath), 'NetUpgrade') = 0 then
+    Result := SelectedPath
+  else
+    Result := AddBackslash(SelectedPath) + 'NetUpgrade';
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  if not ForceDirectories(IOSStoragePage.Values[0]) then
-    Result := 'NetUpgrade could not create the selected IOS image folder.';
-  if (Result = '') and not ForceDirectories(BackupsStoragePage.Values[0]) then
-    Result := 'NetUpgrade could not create the selected switch backup folder.';
+  if Trim(StoragePage.Values[0]) = '' then
+    Result := 'Select a storage location before continuing.'
+  else if not ForceDirectories(GetStoragePath('')) then
+    Result := 'NetUpgrade could not create the selected storage folder.';
 end;
