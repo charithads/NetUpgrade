@@ -97,13 +97,15 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.12.1"          # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "5.13.0"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # What each release added, newest first - shown under Settings > About. Add one entry here for every release
 # (keep APP_VERSION above and APP_VERSION in launcher.py equal to the newest entry).
 CHANGELOG = [
+    {"version": "5.13.0", "date": "2026-10-25", "features": [
+        "Choose separate folders during installation for IOS images and switch configuration backups." ]},
     {"version": "5.12.1", "date": "2026-10-25", "features": [
         "About page under Settings with the application details and the new features of every version.",
         "The Windows application has an About tab with a Check for new updates button; new releases are downloaded from the GitHub repository.",
