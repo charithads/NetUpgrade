@@ -66,11 +66,14 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import queue
 import re
 import socket
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import webbrowser
 import tkinter as tk
 import tkinter.font as tkfont
@@ -81,7 +84,7 @@ import pystray
 from PIL import Image, ImageTk
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.11.0"          # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
+APP_VERSION = "5.12.1"          # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
 UI_FONT_SIZE = 8               # window size follows the font: 9 = the old, larger window; 8 = compact
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"
@@ -727,6 +730,8 @@ gen = ttk.Frame(nb, padding=6)
 sec = ttk.Frame(nb, padding=6)
 nb.add(gen, text="  General  ")
 nb.add(sec, text="  Security  ")
+about = ttk.Frame(nb, padding=6)
+nb.add(about, text="  About  ")
 
 # ============================ GENERAL TAB ==================================
 gen.columnconfigure(1, weight=1)
@@ -1096,6 +1101,223 @@ sbtn.grid(row=11, column=0, sticky="ew", pady=(8, 0))
 ttk.Label(sbtn, textvariable=prot_var, foreground="gray").pack(side="left")
 ttk.Button(sbtn, text="Save", width=7, command=save_security).pack(side="right")
 ttk.Label(sec, textvariable=save_msg, foreground=GREEN).grid(row=12, column=0, sticky="e")
+
+
+# ============================ ABOUT TAB ====================================
+# Application details + "Check for new updates". The release check and the download use the public GitHub
+# Releases API of APP_REPO_URL. Nothing is contacted until the button is pressed, and a download only ever
+# goes to the Downloads folder: installing it (closing this app and running the new one) stays a manual step.
+GITHUB_REPO = "/".join(APP_REPO_URL.rstrip("/").split("/")[-2:])
+GITHUB_LATEST_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_DIR = os.path.join(os.path.expanduser("~"), "Downloads")
+update_q = queue.Queue()          # worker threads -> the Tk thread (Tk is only touched from the main thread)
+update_state = {"busy": False, "release": None, "file": None}
+
+
+def version_tuple(text):
+    """'v5.12.1' -> (5, 12, 1); anything without digits -> ()."""
+    nums = re.findall(r"\d+", str(text or ""))[:4]
+    return tuple(int(n) for n in nums)
+
+
+def github_get_latest():
+    """-> release dict from GitHub. Raises RuntimeError with a message that is fit to show."""
+    req = urllib.request.Request(GITHUB_LATEST_API, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise RuntimeError("No release has been published in the GitHub repository yet.")
+        if exc.code in (403, 429):
+            raise RuntimeError("GitHub refused the request (rate limit). Try again in a few minutes.")
+        raise RuntimeError(f"GitHub answered with error {exc.code}.")
+    except (urllib.error.URLError, OSError, TimeoutError):
+        raise RuntimeError("Could not reach GitHub. Check the internet connection / proxy of this PC.")
+    except ValueError:
+        raise RuntimeError("GitHub sent an answer this application could not read.")
+
+
+def pick_release_asset(release):
+    """The file to download: the Windows .exe if there is one, else a .zip. None if the release has no files."""
+    assets = [a for a in release.get("assets") or [] if a.get("browser_download_url")]
+    for ext in (".exe", ".zip"):
+        for a in assets:
+            if a.get("name", "").lower().endswith(ext):
+                return a
+    return None
+
+
+def free_path(folder, name):
+    base, ext = os.path.splitext(name)
+    path, n = os.path.join(folder, name), 1
+    while os.path.exists(path):
+        path = os.path.join(folder, f"{base} ({n}){ext}")
+        n += 1
+    return path
+
+
+def update_check_worker():
+    try:
+        rel = github_get_latest()
+        update_q.put(("checked", rel))
+    except RuntimeError as exc:
+        update_q.put(("error", str(exc)))
+    except Exception as exc:      # noqa: BLE001 - a check must never take the launcher down
+        traceback.print_exc()
+        update_q.put(("error", f"Unexpected error ({type(exc).__name__})."))
+
+
+def update_download_worker(asset):
+    dest = None
+    try:
+        os.makedirs(UPDATE_DIR, exist_ok=True)
+        dest = free_path(UPDATE_DIR, os.path.basename(asset["name"]))
+        part = dest + ".part"
+        total = int(asset.get("size") or 0)
+        sha = hashlib.sha256()
+        done = 0
+        req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=30) as resp, open(part, "wb") as out:
+            while True:
+                chunk = resp.read(262144)
+                if not chunk:
+                    break
+                out.write(chunk)
+                sha.update(chunk)
+                done += len(chunk)
+                update_q.put(("progress", (done, total)))
+        want = str(asset.get("digest") or "")          # GitHub lists "sha256:<hex>" for uploaded assets
+        if want.startswith("sha256:") and want[7:].lower() != sha.hexdigest():
+            os.remove(part)
+            raise RuntimeError("The downloaded file does not match the checksum published by GitHub, so it was deleted.")
+        if total and done != total:
+            os.remove(part)
+            raise RuntimeError("The download was incomplete and was deleted. Try again.")
+        os.replace(part, dest)
+        update_q.put(("downloaded", dest))
+    except RuntimeError as exc:
+        update_q.put(("error", str(exc)))
+    except Exception as exc:      # noqa: BLE001
+        traceback.print_exc()
+        update_q.put(("error", f"The download failed ({type(exc).__name__}). Try again."))
+        try:
+            if dest and os.path.exists(dest + ".part"):
+                os.remove(dest + ".part")
+        except OSError:
+            pass
+
+
+brand_header(about, 40).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+about.columnconfigure(1, weight=1)
+for _r, (_k, _v) in enumerate((("Version", APP_VERSION), ("Developed by", APP_AUTHOR)), 1):
+    ttk.Label(about, text=_k).grid(row=_r, column=0, sticky="nw", pady=1)
+    ttk.Label(about, text=_v, wraplength=330, justify="left").grid(row=_r, column=1, sticky="w", padx=(8, 0), pady=1)
+ttk.Label(about, text="Project").grid(row=3, column=0, sticky="w", pady=1)
+_ab_link = ttk.Label(about, text=APP_REPO_URL, foreground="#0969da", cursor="hand2",
+                     font=("Segoe UI", UI_FONT_SIZE, "underline"))
+_ab_link.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=1)
+_ab_link.bind("<Button-1>", lambda _e: webbrowser.open(APP_REPO_URL))
+
+ttk.Separator(about).grid(row=5, column=0, columnspan=2, sticky="ew", pady=6)
+upd_var = tk.StringVar(value="Press the button to look for a newer release on GitHub.")
+upd_lbl = ttk.Label(about, textvariable=upd_var, wraplength=380, justify="left")
+upd_lbl.grid(row=6, column=0, columnspan=2, sticky="w")
+upd_bar = ttk.Progressbar(about, mode="determinate", maximum=100)
+upd_bar.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+upd_bar.grid_remove()
+upd_btns = ttk.Frame(about)
+upd_btns.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+upd_check_btn = ttk.Button(upd_btns, text="Check for new updates")
+upd_check_btn.pack(side="left")
+upd_dl_btn = ttk.Button(upd_btns, text="Download update")
+upd_notes_btn = ttk.Button(upd_btns, text="Release notes",
+                           command=lambda: update_state["release"] and webbrowser.open(update_state["release"].get("html_url") or APP_REPO_URL))
+upd_open_btn = ttk.Button(upd_btns, text="Open folder",
+                          command=lambda: update_state["file"] and subprocess.Popen(["explorer", "/select,", update_state["file"]]))
+
+
+def update_set_busy(busy):
+    update_state["busy"] = busy
+    st = "disabled" if busy else "normal"
+    upd_check_btn.config(state=st)
+    upd_dl_btn.config(state=st)
+
+
+def update_check():
+    if update_state["busy"]:
+        return
+    update_state.update(release=None, file=None)
+    for b in (upd_dl_btn, upd_notes_btn, upd_open_btn):
+        b.pack_forget()
+    upd_bar.grid_remove()
+    upd_var.set("Checking GitHub ...")
+    update_set_busy(True)
+    threading.Thread(target=update_check_worker, daemon=True).start()
+    root.after(150, update_poll)
+
+
+def update_download():
+    rel = update_state["release"]
+    asset = rel and pick_release_asset(rel)
+    if update_state["busy"] or not asset:
+        return
+    upd_var.set(f"Downloading {asset['name']} ...")
+    upd_bar.config(value=0)
+    upd_bar.grid()
+    update_set_busy(True)
+    threading.Thread(target=update_download_worker, args=(asset,), daemon=True).start()
+    root.after(150, update_poll)
+
+
+def update_poll():
+    """Runs on the Tk thread while a check / download is going on."""
+    try:
+        while True:
+            kind, data = update_q.get_nowait()
+            if kind == "progress":
+                done, total = data
+                if total:
+                    upd_bar.config(value=100.0 * done / total)
+                    upd_var.set(f"Downloading ... {done / 1048576:.1f} of {total / 1048576:.1f} MB")
+                else:
+                    upd_var.set(f"Downloading ... {done / 1048576:.1f} MB")
+                continue
+            update_set_busy(False)
+            upd_bar.grid_remove()
+            if kind == "error":
+                upd_var.set(data)
+                audit_event(f"update check/download failed: {data}")
+            elif kind == "checked":
+                rel = data
+                update_state["release"] = rel
+                tag = rel.get("tag_name") or rel.get("name") or "?"
+                if version_tuple(tag) > version_tuple(APP_VERSION):
+                    asset = pick_release_asset(rel)
+                    upd_notes_btn.pack(side="left", padx=(6, 0))
+                    if asset:
+                        upd_dl_btn.pack(side="left", padx=(6, 0))
+                        upd_var.set(f"New version available: {tag}  (you have {APP_VERSION}).\n"
+                                    f"File: {asset['name']} ({int(asset.get('size') or 0) / 1048576:.1f} MB)")
+                    else:
+                        upd_var.set(f"New version available: {tag}  (you have {APP_VERSION}), but the release has no "
+                                    "downloadable file. Open the release notes page to get it.")
+                else:
+                    upd_var.set(f"You are up to date - version {APP_VERSION} is the latest release.")
+            elif kind == "downloaded":
+                update_state["file"] = data
+                upd_open_btn.pack(side="left", padx=(6, 0))
+                upd_var.set(f"Downloaded to:\n{data}\nClose this application, then run the new file to finish the update.")
+                audit_event(f"update downloaded: {os.path.basename(data)}")
+    except queue.Empty:
+        pass
+    if update_state["busy"]:
+        root.after(150, update_poll)
+
+
+upd_check_btn.config(command=update_check)
+upd_dl_btn.config(command=update_download)
 
 # ---- start-up -------------------------------------------------------------
 # Restore the saved interface (falls back to "This PC only" if it's gone)

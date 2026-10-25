@@ -60,6 +60,7 @@ Security notes
 # ---- Standard library ----
 import argparse
 import csv
+import difflib
 import functools
 import getpass
 import hashlib
@@ -96,9 +97,37 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.11.0"          # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "5.12.1"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
+
+# What each release added, newest first - shown under Settings > About. Add one entry here for every release
+# (keep APP_VERSION above and APP_VERSION in launcher.py equal to the newest entry).
+CHANGELOG = [
+    {"version": "5.12.1", "date": "2026-10-25", "features": [
+        "About page under Settings with the application details and the new features of every version.",
+        "The Windows application has an About tab with a Check for new updates button; new releases are downloaded from the GitHub repository.",
+        "Custom Checks removed from Settings (the built-in pre-checks and post-checks are unchanged).",
+        "The 'Before you upgrade' section removed from the Overview tab of the device window."]},
+    {"version": "5.12.0", "date": "2026-10-23", "features": [
+        "Download template (.xlsx) in the device-list upload section.",
+        "Notifications settings moved from the Windows application into Settings > Notifications of this dashboard."]},
+    {"version": "5.11.0", "date": "2026-10-23", "features": [
+        "One guided Upgrade button, with distribute and activate under Advanced.",
+        "Timeout presets (Standard / Slow switch / Stack) with an automatic suggestion.",
+        "CSV / Excel device import with a template and credential validation.",
+        "A red readiness result blocks the upgrade.",
+        "Maintenance window with stop-on-first-failure.",
+        "Plain next-step guidance after a failed upgrade.",
+        "Batch summary with an automatic report.",
+        "Teams / Slack alerts."]},
+    {"version": "5.10.1 and earlier", "date": "", "features": [
+        "Availability monitoring, configuration backup and scheduled firmware upgrades for Catalyst 9200 / 9300 switches from one dashboard.",
+        "Install-mode upgrades following Cisco's guides, with a boot-variable check and a flash-space check that includes the expansion room.",
+        "Upgrade output in the Console tab of the device drawer; image stage view and repeat-distribute warning.",
+        "Settings page with editable wait times and Command duration profiles; Storage page with MD5 image verification.",
+        "Device-list search, filters and a column chooser; light and dark mode; read-only public access option."]},
+]
 APP_ICON_DATA_URI = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAA"
@@ -1109,6 +1138,7 @@ def probe_device_readiness(host, device_type, username, password, secret, image_
             checks["_outputs"] = outputs               # saved to a file by the caller, then dropped
         except Exception:  # noqa: BLE001
             pass
+
     return checks
 
 
@@ -2463,6 +2493,9 @@ SETTINGS_GROUPS = [
      "intro": "E-mail copies of the notifications shown under the bell icon. Off until you switch it on. Gmail: "
               "smtp.gmail.com, port 587 (STARTTLS) and an App password (2-Step Verification > App passwords) - "
               "your normal password will not work. The password is stored encrypted and is never shown again."},
+    {"id": "about", "title": "About",
+     "intro": "Details of this installation and what each version added. The application is updated only from the "
+              "Windows application (About tab > Check for new updates), never from this page."},
 ]
 
 
@@ -3016,7 +3049,7 @@ def read_multipart_file(rfile, content_length, content_type, max_bytes, dest_pat
 #   * Any site can be browsed without making it the active site, so looking at another
 #     site's backups never stops monitoring or reloads the device list.
 # --------------------------------------------------------------------------- #
-STORAGE_PREVIEW_BYTES = 512 * 1024            # how much of a file the "View" pop-up loads
+STORAGE_PREVIEW_BYTES = 8 * 1024 * 1024       # how much of a file the "View" pop-up loads (a big stack's show run is >500 KB)
 STORAGE_SEARCH_LIMIT = 500                    # max search hits returned
 STORAGE_MAX_ZIP_BYTES = 1024 * 1024 * 1024    # refuse to zip more than 1 GB of backups
 STORAGE_CHUNK = 1024 * 1024
@@ -3149,8 +3182,8 @@ def storage_search(site, query):
     return {"site": name, "query": query, "entries": _storage_order(hits), "truncated": truncated}
 
 
-def storage_read(site, rel):
-    """First STORAGE_PREVIEW_BYTES of a text file, for the in-page viewer."""
+def storage_read(site, rel, tail=False):
+    """First STORAGE_PREVIEW_BYTES of a text file (or the LAST ones when tail is set), for the in-page viewer."""
     name, root = storage_root(site)
     path, rel = storage_resolve(root, rel)
     if not path.is_file():
@@ -3158,14 +3191,41 @@ def storage_read(site, rel):
     try:
         with open(path, "rb") as fh:
             size = os.fstat(fh.fileno()).st_size
+            skipped = bool(tail) and size > STORAGE_PREVIEW_BYTES
+            if skipped:
+                fh.seek(size - STORAGE_PREVIEW_BYTES)
             data = fh.read(STORAGE_PREVIEW_BYTES + 1)
     except OSError as exc:
         raise ApiError(f"Could not read that file ({type(exc).__name__}).", 500)
     if b"\x00" in data[:8192]:
         raise ApiError("This looks like a binary file and cannot be previewed - use Download.", 415)
-    truncated = len(data) > STORAGE_PREVIEW_BYTES
+    truncated = skipped or len(data) > STORAGE_PREVIEW_BYTES
     text = data[:STORAGE_PREVIEW_BYTES].decode("utf-8", errors="replace")
-    return {"name": path.name, "rel": rel, "size": size, "truncated": truncated, "text": text}
+    if skipped and "\n" in text:
+        text = text.split("\n", 1)[1]              # the cut usually lands mid-line: start at a whole line
+    return {"name": path.name, "rel": rel, "size": size, "truncated": truncated, "tail": skipped,
+            "limit": STORAGE_PREVIEW_BYTES, "text": text}
+
+
+def _storage_backup_folder(site, rel):
+    """The folder of ONE switch inside 'Switch Backups' (the only place backups can be compared)."""
+    name, root = storage_root(site)
+    path, rel = storage_resolve(root, rel)
+    parts = rel.split("/") if rel else []
+    if len(parts) != 2 or parts[0] != SITE_BACKUPS_SUBDIR or not path.is_dir():
+        raise ApiError("Open a switch's folder under Switch Backups to compare its backups.")
+    return path
+
+
+def storage_backup_runs(site, rel):
+    """The backup runs (newest first) saved in one switch's backup folder."""
+    path = _storage_backup_folder(site, rel)
+    return {"runs": [{"stamp": r["stamp"], "time": r["time"], "files": len(r["files"])}
+                     for r in list_device_backups(path, limit=200)]}
+
+
+def storage_compare(site, rel, a, b, ignore_volatile=True, cmd=None):
+    return compare_backup_dir(_storage_backup_folder(site, rel), a, b, ignore_volatile, cmd)
 
 
 def storage_zip_folder(site, rel):
@@ -4138,7 +4198,7 @@ def save_site_profiles(name, profiles, assignments):
 # upgrade. Read-only: it never connects to the switch.
 # --------------------------------------------------------------------------- #
 STAMP_RE = re.compile(r"_(\d{8}_\d{6})\.[A-Za-z0-9]+$")
-DEVICE_FILE_MAX_BYTES = 400_000          # the most of one file the drawer will show
+DEVICE_FILE_MAX_BYTES = 8_000_000        # the most of one file the drawer will show
 _FACTS_CACHE = {}                        # (path, mtime) -> parsed facts, so a poll does not re-read files
 
 
@@ -4188,6 +4248,149 @@ def list_device_backups(device_dir, limit=12):
     for stamp in sorted(runs, reverse=True)[:limit]:
         out.append({"stamp": stamp, "time": _stamp_to_time(stamp), "files": sorted(runs[stamp], key=lambda f: f["name"])})
     return out
+
+
+BACKUP_STAMP_ONLY_RE = re.compile(r"^\d{8}_\d{6}$")
+BACKUP_COMPARE_MAX_FILE = 3_000_000       # most of one backup file read for a comparison
+BACKUP_COMPARE_MAX_LINES = 3000           # diff lines kept per command
+# Lines that change on every backup without meaning anything: skipped when "ignore changing lines" is on.
+VOLATILE_LINE_RE = re.compile(
+    r"^\s*(Building configuration|Current configuration\s*:|! ?Last configuration change|! ?NVRAM config last updated|"
+    r"! ?No configuration change since last restart|!Time:|ntp clock-period|.*\buptime is\b|"
+    r"System restarted at|System returned to ROM by|Last reload|Configuration register is|"
+    r"\w{3} \w{3}\s+\d+ \d\d:\d\d:\d\d)", re.I)
+
+
+def backup_run_sections(device_dir, stamp):
+    """All the saved output of ONE backup run of a device as {command: text}. A run is one file holding every
+    command (the '!===== COMMAND: x =====' format) or, in older backups, one file per command."""
+    sections = {}
+    try:
+        names = sorted(e.name for e in os.scandir(device_dir)
+                       if e.is_file() and (STAMP_RE.search(e.name) or [None, ""])[1] == stamp)
+    except OSError:
+        return sections
+    for name in names:
+        try:
+            with open(Path(device_dir) / name, "rb") as fh:
+                text = fh.read(BACKUP_COMPARE_MAX_FILE).decode("utf-8", "replace")
+        except OSError:
+            continue
+        parts = split_command_sections(text)
+        if parts:
+            for cmd, out in parts.items():
+                sections.setdefault(cmd, out)
+        else:
+            sections.setdefault(backup_file_command(name, device_dir) or name, text)
+    return sections
+
+
+def diff_backup_sections(a, b, ignore_volatile=True):
+    """Compare two {command: text} dicts -> (summary, per-command results). Each result:
+    {command, status: same|changed|added|removed, added, removed, diff: [unified-diff lines], truncated}."""
+    def lines(text):
+        rows = (text or "").replace("\r", "").split("\n")
+        rows = [r.rstrip() for r in rows]
+        while rows and not rows[-1]:
+            rows.pop()
+        return [r for r in rows if not (ignore_volatile and VOLATILE_LINE_RE.match(r))]
+    results = []
+    summary = {"same": 0, "changed": 0, "added": 0, "removed": 0, "lines_added": 0, "lines_removed": 0}
+    for cmd in list(a) + [c for c in b if c not in a]:
+        la, lb = lines(a.get(cmd)), lines(b.get(cmd))
+        if cmd not in b:
+            status = "removed"
+        elif cmd not in a:
+            status = "added"
+        else:
+            status = "same" if la == lb else "changed"
+        diff, add, rem = [], 0, 0
+        if status != "same":
+            for ln in difflib.unified_diff(la, lb, "", "", lineterm="", n=3):
+                if ln.startswith(("---", "+++")):
+                    continue
+                if ln.startswith("+"):
+                    add += 1
+                elif ln.startswith("-"):
+                    rem += 1
+                diff.append(ln)
+        truncated = len(diff) > BACKUP_COMPARE_MAX_LINES
+        summary[status] += 1
+        summary["lines_added"] += add
+        summary["lines_removed"] += rem
+        results.append({"command": cmd, "status": status, "added": add, "removed": rem,
+                        "diff": diff[:BACKUP_COMPARE_MAX_LINES], "truncated": truncated})
+    order = {"changed": 0, "added": 1, "removed": 2, "same": 3}
+    results.sort(key=lambda r: order[r["status"]])
+    return summary, results
+
+
+BACKUP_SIDE_MAX_LINES = 30000             # lines per side kept for the side-by-side view of ONE command
+
+
+def side_by_side_rows(text_a, text_b, ignore_volatile=True):
+    """Align two outputs line by line for a left/right view -> (rows, added, removed, truncated).
+    Row: [line no. left (0 = none), left text, line no. right, right text, kind]; kind is '=' same,
+    '~' changed, '-' only on the left (older), '+' only on the right (newer)."""
+    def raw(text):
+        rows = [r.rstrip() for r in (text or "").replace("\r", "").split("\n")]
+        while rows and not rows[-1]:
+            rows.pop()
+        return rows
+    ra, rb = raw(text_a), raw(text_b)
+    cut = len(ra) > BACKUP_SIDE_MAX_LINES or len(rb) > BACKUP_SIDE_MAX_LINES
+    ra, rb = ra[:BACKUP_SIDE_MAX_LINES], rb[:BACKUP_SIDE_MAX_LINES]
+    key = lambda r: "\x00" if (ignore_volatile and VOLATILE_LINE_RE.match(r)) else r      # noqa: E731
+    ka, kb = [key(r) for r in ra], [key(r) for r in rb]
+    pre = 0                                    # identical start / end are skipped before the (slow) matcher runs
+    while pre < len(ka) and pre < len(kb) and ka[pre] == kb[pre]:
+        pre += 1
+    suf = 0
+    while suf < len(ka) - pre and suf < len(kb) - pre and ka[-1 - suf] == kb[-1 - suf]:
+        suf += 1
+    rows, add, rem = [], 0, 0
+    for k in range(pre):
+        rows.append([k + 1, ra[k], k + 1, rb[k], "="])
+    ea, eb = len(ka) - suf, len(kb) - suf
+    sm = difflib.SequenceMatcher(None, ka[pre:ea], kb[pre:eb], autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        i1, i2, j1, j2 = i1 + pre, i2 + pre, j1 + pre, j2 + pre
+        if tag == "equal":
+            for k in range(i2 - i1):
+                rows.append([i1 + k + 1, ra[i1 + k], j1 + k + 1, rb[j1 + k], "="])
+            continue
+        for k in range(max(i2 - i1, j2 - j1)):
+            has_a, has_b = k < i2 - i1, k < j2 - j1
+            kind = "~" if has_a and has_b else ("-" if has_a else "+")
+            add += 1 if has_b else 0
+            rem += 1 if has_a else 0
+            rows.append([i1 + k + 1 if has_a else 0, ra[i1 + k] if has_a else "",
+                         j1 + k + 1 if has_b else 0, rb[j1 + k] if has_b else "", kind])
+    for k in range(suf):
+        rows.append([ea + k + 1, ra[ea + k], eb + k + 1, rb[eb + k], "="])
+    return rows, add, rem, cut
+
+
+def compare_backup_dir(folder, a, b, ignore_volatile=True, cmd=None):
+    """Compare two backup runs (by timestamp) found in ONE device's backup folder, command by command."""
+    a, b = str(a or ""), str(b or "")
+    if not (BACKUP_STAMP_ONLY_RE.match(a) and BACKUP_STAMP_ONLY_RE.match(b)):
+        raise ApiError("Pick two backups to compare.")
+    if a == b:
+        raise ApiError("Pick two different backups.")
+    sec_a, sec_b = backup_run_sections(folder, a), backup_run_sections(folder, b)
+    if not sec_a or not sec_b:
+        raise ApiError("One of the backups was not found.", 404)
+    if cmd:                                    # left/right view of ONE command's full output
+        if cmd not in sec_a and cmd not in sec_b:
+            raise ApiError("That command is not in either backup.", 404)
+        rows, add, rem, cut = side_by_side_rows(sec_a.get(cmd), sec_b.get(cmd), bool(ignore_volatile))
+        return {"a": {"stamp": a, "time": _stamp_to_time(a)}, "b": {"stamp": b, "time": _stamp_to_time(b)},
+                "command": cmd, "in_a": cmd in sec_a, "in_b": cmd in sec_b, "rows": rows,
+                "added": add, "removed": rem, "truncated": cut}
+    summary, results = diff_backup_sections(sec_a, sec_b, bool(ignore_volatile))
+    return {"a": {"stamp": a, "time": _stamp_to_time(a)}, "b": {"stamp": b, "time": _stamp_to_time(b)},
+            "ignore_volatile": bool(ignore_volatile), "summary": summary, "commands": results}
 
 
 def parse_show_version_facts(text):
@@ -5224,7 +5427,9 @@ class Manager:
 
     def settings_view(self):
         return {"values": dict(self.settings), "defaults": settings_defaults(), "groups": SETTINGS_GROUPS,
-                "items": SETTINGS_ITEMS, "limit": MAX_PARALLEL_LIMIT}
+                "items": SETTINGS_ITEMS, "limit": MAX_PARALLEL_LIMIT,
+                "about": {"name": APP_NAME, "version": APP_VERSION, "author": APP_AUTHOR, "repo": APP_REPO_URL,
+                          "changelog": CHANGELOG}}
 
     def update_settings(self, values, who=None):
         if not isinstance(values, dict):
@@ -7157,7 +7362,7 @@ class Manager:
                     pc.get("detail") or "Not run")
         return items
 
-    def device_file(self, host, kind, name):
+    def device_file(self, host, kind, name, tail_wanted=False):
         """Text of one saved file for the drawer's 'View' button. Only files that belong to this
         device are served (a name is matched against the device's own listing / file-name pattern)."""
         host = str(host or "")
@@ -7182,13 +7387,17 @@ class Manager:
         if not is_file:
             raise ApiError("File not found.", 404)
         size = real.stat().st_size
-        tail = name.endswith((".log", ".console.txt"))              # long logs: the end is what matters
+        tail = bool(tail_wanted) or name.endswith((".log", ".console.txt"))   # long logs: the end is what matters
+        cut = tail and size > DEVICE_FILE_MAX_BYTES
         with open(real, "rb") as fh:
-            if tail and size > DEVICE_FILE_MAX_BYTES:
+            if cut:
                 fh.seek(size - DEVICE_FILE_MAX_BYTES)
             data = fh.read(DEVICE_FILE_MAX_BYTES)
-        return {"name": name, "size": size, "truncated": size > DEVICE_FILE_MAX_BYTES, "tail": tail and size > DEVICE_FILE_MAX_BYTES,
-                "text": data.decode("utf-8", "replace")}
+        text = data.decode("utf-8", "replace")
+        if cut and "\n" in text:
+            text = text.split("\n", 1)[1]              # start at a whole line
+        return {"name": name, "size": size, "truncated": size > DEVICE_FILE_MAX_BYTES, "tail": cut,
+                "limit": DEVICE_FILE_MAX_BYTES, "text": text}
 
     UPGRADE_REPORT_FIELDS = ["hostname", "ip_address", "previous_image", "current_image",
                              "upgrade_started_at", "upgrade_duration", "status", "finished_at",
@@ -7856,15 +8065,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dr-banner.ok { background:var(--t-gn); color:var(--gr); }
   .dr-banner.warn { background:var(--t-a); color:var(--c-a); }
   .dr-banner.bad { background:var(--t-r); color:var(--c-r); }
-  .ck-row { display:flex; gap:9px; padding:7px 0; border-bottom:1px solid var(--bd); }
-  .ck-ic { flex:none; width:20px; height:20px; border-radius:50%; display:grid; place-items:center; font-size:11px; font-weight:700; margin-top:1px; }
-  .ck-ic.ok { background:var(--t-gn); color:var(--gr); }
-  .ck-ic.warn { background:var(--t-a); color:var(--c-a); }
-  .ck-ic.bad { background:var(--t-r); color:var(--c-r); }
-  .ck-ic.todo { background:var(--t-g); color:var(--mu); box-shadow:inset 0 0 0 1px var(--mu); opacity:.85; }
-  .ck-ic.run { background:var(--t-a); color:var(--c-a); animation:pulse 1.4s ease-in-out infinite; }
-  .ck-t { font-weight:600; font-size:12.5px; }
-  .ck-d { color:var(--mu); font-size:11.5px; overflow-wrap:anywhere; }
   .steps { display:flex; align-items:flex-start; margin:4px 0 12px; }
   .step { flex:1; display:flex; flex-direction:column; align-items:center; position:relative; font-size:10.5px; color:var(--mu); text-align:center; }
   .step .c { width:24px; height:24px; border-radius:50%; display:grid; place-items:center; font-size:11.5px; font-weight:700;
@@ -7911,7 +8111,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dr-view[hidden] { display:none; }
   .dr-view .vh { display:flex; align-items:center; gap:8px; padding:10px 12px; border-bottom:1px solid var(--bd); font-weight:600; font-size:12.5px; }
   .dr-view .vh .nm { flex:1; min-width:0; overflow-wrap:anywhere; }
-  .dr-view pre { margin:0; padding:10px 12px; flex:1; overflow:auto; font:11.5px/1.45 ui-monospace,Consolas,"Courier New",monospace; background:var(--pn2); white-space:pre; }
+  .dr-view pre { margin:0; padding:10px 12px 56px; flex:1; min-height:0; overflow:auto; font:11.5px/1.45 ui-monospace,Consolas,"Courier New",monospace; background:var(--pn2); white-space:pre; }
   .dr-view .vn { padding:6px 12px; font-size:11.5px; color:var(--c-a); background:var(--t-a); }
 
   /* ---- device drawer > Console (interactive SSH) ---- */
@@ -8105,8 +8305,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .st-loc { color:var(--mu); font-size:12px; }
   .st-foot { padding:7px 14px; border-top:1px solid var(--bd); color:var(--mu); font-size:12px; flex:none; }
   .st-none { padding:34px 14px; text-align:center; color:var(--mu); }
-  .modal-card.wide { max-width:min(980px, 100%); max-height:calc(100vh - 32px); display:flex; flex-direction:column; }
-  #st-pre { margin:8px 0 0; padding:10px 12px; overflow:auto; flex:1; min-height:120px; background:var(--pn2);
+  .modal-card.wide { max-width:min(1200px, 100%); height:calc(100vh - 32px); max-height:calc(100vh - 32px); display:flex; flex-direction:column; min-height:0; }
+  #st-pre { margin:8px 0 0; padding:10px 12px 48px; overflow:auto; flex:1; min-height:0; background:var(--pn2);
             border:1px solid var(--bd); border-radius:8px; white-space:pre; font:12px/1.5 ui-monospace,Consolas,monospace; }
 
   @media (max-width:1000px) {
@@ -8162,6 +8362,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .set-card { flex:none; }
   .set-body { padding:2px 18px 16px; }
   .set-intro { color:var(--mu); font-size:12.5px; margin:12px 0 2px; max-width:780px; line-height:1.5; }
+  .ab-card { border:1px solid var(--bd); border-radius:10px; padding:12px 14px; margin-top:12px; max-width:780px; }
+  .ab-kv { display:grid; grid-template-columns:150px minmax(0,1fr); gap:6px 12px; font-size:13px; }
+  .ab-kv span:nth-child(odd) { color:var(--mu); }
+  .ab-ver { margin-top:16px; max-width:780px; border-top:1px solid var(--bd); padding-top:10px; }
+  .ab-ver h4 { margin:0 0 4px; font-size:14px; display:flex; gap:8px; align-items:center; }
+  .ab-ver small { color:var(--mu); font-weight:400; }
+  .ab-cur { font-size:10.5px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; padding:1px 8px; border-radius:999px; background:var(--sel); color:var(--ac); }
+  .ab-ver ul { margin:4px 0 0; padding-left:20px; font-size:12.5px; line-height:1.55; }
   .set-sec { margin:20px 0 2px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--mu); font-weight:700; }
   .set-row { display:flex; gap:24px; align-items:center; justify-content:space-between; padding:11px 0; border-top:1px solid var(--bd); }
   .set-sec + .set-row { margin-top:4px; }
@@ -8297,6 +8505,98 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ct-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; }
   .ct-note { font-size:12px; color:var(--mu); margin-top:8px; line-height:1.5; }
   .btn.dg { border-color:var(--rd); color:var(--rd); }
+  /* Colour-coded function buttons: green = run / save / add, blue = check / read / refresh, amber = schedule / reset,
+     red = delete / cancel / stop. They reuse the theme colours, so light and dark mode both match. */
+  .btn.ok, .btn.in, .btn.wn, .btn.dg, #btn-backup, #btn-upgrade, #btn-add-device, #btn-upload-devices, #btn-prof-save,
+  #btn-upload-image, #btn-site-create, #set-save, #nt-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
+  [data-ct="saveform"], #ck-save, #btn-prof-assign, #btn-prof-test, #btn-readiness, #btn-version, #dg-run, #st-refresh,
+  #img-refresh, #dg-refresh, [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test, #btn-schedule, #set-reset,
+  [data-tp="update"], #btn-delete-devices, #btn-prof-delete, #btn-unschedule, [data-tp="delete"], [data-ct="stop"],
+  #ck-add-pre, #ck-add-post { font-weight:600; }
+  .btn.ok, #btn-backup, #btn-upgrade, #btn-add-device, #btn-upload-devices, #btn-prof-save, #btn-upload-image,
+  #btn-site-create, #set-save, #nt-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
+  [data-ct="saveform"], #ck-save, #ck-add-pre, #ck-add-post { background:var(--t-gn); border-color:var(--gr); color:var(--gr); }
+  .btn.in, #btn-prof-assign, #btn-prof-test, #btn-readiness, #btn-version, #dg-run, #st-refresh, #img-refresh, #dg-refresh,
+  [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test { background:var(--acs); border-color:var(--ac); color:var(--ac); }
+  .btn.wn, #btn-schedule, #set-reset, [data-tp="update"] { background:var(--t-a); border-color:var(--am); color:var(--c-a); }
+  .btn.dg, #btn-delete-devices, #btn-prof-delete, #btn-unschedule, [data-tp="delete"], [data-ct="stop"] { background:var(--t-r); border-color:var(--rd); color:var(--rd); }
+  .btn.ok:hover:not(:disabled), #btn-backup:hover:not(:disabled), #btn-upgrade:hover:not(:disabled), #btn-add-device:hover:not(:disabled),
+  #btn-upload-devices:hover:not(:disabled), #btn-prof-save:hover:not(:disabled), #btn-upload-image:hover:not(:disabled),
+  #btn-site-create:hover:not(:disabled), #set-save:hover:not(:disabled), #nt-save:hover:not(:disabled), #rep-go:hover:not(:disabled),
+  [data-tp="create"]:hover:not(:disabled), [data-ct="run"]:hover:not(:disabled), [data-ct="save"]:hover:not(:disabled),
+  [data-ct="saveform"]:hover:not(:disabled), #ck-save:hover:not(:disabled), #ck-add-pre:hover:not(:disabled), #ck-add-post:hover:not(:disabled)
+    { border-color:var(--gr); box-shadow:0 0 0 3px color-mix(in srgb, var(--gr) 22%, transparent); }
+  .btn.in:hover:not(:disabled), #btn-prof-assign:hover:not(:disabled), #btn-prof-test:hover:not(:disabled), #btn-readiness:hover:not(:disabled),
+  #btn-version:hover:not(:disabled), #dg-run:hover:not(:disabled), #st-refresh:hover:not(:disabled), #img-refresh:hover:not(:disabled),
+  #dg-refresh:hover:not(:disabled), [data-verify]:hover:not(:disabled), [data-tp="apply"]:hover:not(:disabled),
+  #cmp-go, #st-compare:hover:not(:disabled), #nt-test:hover:not(:disabled) { box-shadow:0 0 0 3px color-mix(in srgb, var(--ac) 22%, transparent); }
+  .btn.wn:hover:not(:disabled), #btn-schedule:hover:not(:disabled), #set-reset:hover:not(:disabled), [data-tp="update"]:hover:not(:disabled)
+    { border-color:var(--am); box-shadow:0 0 0 3px color-mix(in srgb, var(--am) 22%, transparent); }
+  .btn.dg:hover:not(:disabled), #btn-delete-devices:hover:not(:disabled), #btn-prof-delete:hover:not(:disabled), #btn-unschedule:hover:not(:disabled),
+  [data-tp="delete"]:hover:not(:disabled), [data-ct="stop"]:hover:not(:disabled)
+    { border-color:var(--rd); box-shadow:0 0 0 3px color-mix(in srgb, var(--rd) 22%, transparent); }
+  /* backup comparison */
+  .cmp-box { border:1px solid var(--bd); background:var(--pn2); border-radius:8px; padding:8px 10px; margin-bottom:8px; }
+  .cmp-box .cmp-row { display:flex; align-items:center; gap:6px; margin:4px 0; }
+  .cmp-box .cmp-row > span { width:42px; flex:none; font-size:11.5px; color:var(--mu); }
+  .cmp-box select { flex:1; min-width:0; }
+  .cmp-box .cmp-opt { display:flex; align-items:center; gap:6px; margin:6px 0; font-size:12px; color:var(--tx); }
+  .cmp-bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; margin:10px 0 6px; }
+  .cmp-bar label { margin:0; }
+  .cmp-bar select { width:auto; min-width:170px; }
+  .cmp-opt { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--tx); }
+  .cmp-diff { flex:1; overflow:auto; min-height:160px; padding:8px 10px; background:var(--pn2); border:1px solid var(--bd); border-radius:8px; }
+  .df-sum { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:8px; font-size:12px; }
+  .df-sum .pill { margin:0; }
+  .df-cmd { border:1px solid var(--bd); border-radius:8px; margin:6px 0; background:var(--pn); }
+  .df-cmd > summary { cursor:pointer; padding:6px 10px; font:600 12px ui-monospace,Consolas,monospace; display:flex; gap:8px; align-items:center; }
+  .df-cmd > summary .st { margin-left:auto; font:600 11px system-ui,sans-serif; }
+  .df-cmd pre { margin:0; padding:0; background:transparent; overflow:auto; font:11.5px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
+  .df-cmd pre div { padding:0 10px; white-space:pre; }
+  .df-a { background:var(--t-gn); color:var(--gr); }
+  .df-r { background:var(--t-r); color:var(--rd); }
+  .df-h { background:var(--t-b); color:var(--c-b); }
+  .df-same { color:var(--mu); font-size:12px; padding:2px 4px; }
+
+  /* backup comparison: full screen, left (older) / right (newer) */
+  .modal.cmp-full { padding:0; align-items:stretch; background:var(--pn); }
+  .cmp-card { max-width:none; width:100%; height:100%; border-radius:0; border:0; box-shadow:none; display:flex; flex-direction:column; min-height:0; padding:10px 14px 12px; }
+  .cmp-top { display:flex; align-items:center; gap:10px; flex:none; }
+  .cmp-top h2 { flex:1; min-width:0; margin:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cmp-seg { display:inline-flex; border:1px solid var(--bd); border-radius:7px; overflow:hidden; flex:none; }
+  .cmp-seg button { background:var(--pn2); border:0; color:var(--tx); padding:5px 12px; font:inherit; cursor:pointer; }
+  .cmp-seg button.on { background:var(--acs); color:var(--ac); font-weight:600; }
+  .cmp-bar { flex:none; }
+  .cmp-main { flex:1; min-height:0; display:flex; gap:10px; }
+  .cmp-list { width:280px; flex:none; display:flex; flex-direction:column; min-height:0; border:1px solid var(--bd); border-radius:8px; background:var(--pn2); }
+  .cmp-list .lh { padding:7px 10px; border-bottom:1px solid var(--bd); font-size:12px; flex:none; }
+  .cmp-list .lb { flex:1; min-height:0; overflow:auto; }
+  .cmp-item { display:block; width:100%; text-align:left; background:none; border:0; border-bottom:1px solid var(--bd); color:var(--tx); padding:7px 10px; cursor:pointer; font:inherit; }
+  .cmp-item:hover { background:var(--sel); }
+  .cmp-item.on { background:var(--acs); box-shadow:inset 3px 0 0 var(--ac); }
+  .cmp-item .c { font:600 12px ui-monospace,Consolas,"Courier New",monospace; overflow-wrap:anywhere; }
+  .cmp-item .s { font-size:11px; margin-top:2px; }
+  .cmp-pane { flex:1; min-width:0; display:flex; flex-direction:column; min-height:0; }
+  .cmp-pane .df-sum { flex:none; }
+  .cmp-diff { min-height:0; padding:0; }
+  .cmp-diff > .cmp-msg { padding:12px 14px; color:var(--mu); }
+  table.sbs { width:100%; border-collapse:collapse; table-layout:fixed; font:12px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
+  table.sbs th { position:sticky; top:0; z-index:2; background:var(--pn); padding:7px 10px; font:600 12px system-ui,sans-serif; color:var(--tx);
+                 text-transform:none; letter-spacing:0; border-bottom:1px solid var(--bd); text-align:left; }
+  table.sbs th + th { border-left:2px solid var(--bd); }
+  table.sbs td { padding:0 8px; vertical-align:top; border:0; }
+  table.sbs td.ln { text-align:right; color:var(--mu); user-select:none; -webkit-user-select:none; font-size:11px; padding-right:6px; background:var(--pn2); }
+  table.sbs td.ln + td.tx + td.ln { border-left:2px solid var(--bd); }
+  table.sbs td.tx { white-space:pre-wrap; overflow-wrap:anywhere; }
+  table.sbs td.l-r { background:var(--t-r); } table.sbs td.l-a { background:var(--t-gn); } table.sbs td.emp { background:var(--pn2); }
+  table.sbs td.ln.l-r { background:var(--t-r); color:var(--rd); } table.sbs td.ln.l-a { background:var(--t-gn); color:var(--gr); }
+  table.sbs mark { background:color-mix(in srgb, currentColor 28%, transparent); color:inherit; border-radius:2px; }
+  table.sbs td.vol { color:var(--mu); }
+  table.sbs tr.gap td { text-align:center; padding:3px 8px; background:var(--t-b); color:var(--c-b); cursor:pointer; font:11.5px system-ui,sans-serif; }
+  table.sbs tr.gap:hover td { filter:brightness(1.15); }
+  pre.uni { margin:0; padding:8px 0 40px; font:12px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
+  pre.uni div { padding:0 12px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  @media (max-width:860px) { .cmp-main { flex-direction:column; } .cmp-list { width:auto; max-height:32%; } }
   /* console under the step detail */
   .cc { height:340px; min-height:220px; max-height:85vh; resize:vertical; display:flex; flex-direction:column; background:#0b1020; color:#d6e2ff; border:1px solid #2a3558; border-radius:10px; overflow:hidden; }
   .cc-h { display:flex; align-items:center; gap:6px; padding:6px 8px 6px 11px; background:#151c33; flex:none; flex-wrap:wrap; }
@@ -8340,7 +8640,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <span class="lost" id="lost"></span>
   <span class="mdot" id="mon-dot" role="img" aria-label="Monitoring status" title="Monitoring status"></span>
   <span id="state" class="mstate">Monitor starting</span>
-  <button class="btn p" id="btn-mon" style="padding:7px 14px">Start Monitoring</button>
+  <button class="btn p ok" id="btn-mon" style="padding:7px 14px">Start Monitoring</button>
   <span class="notemenu"><button class="ib" id="btn-bell" title="Notifications - upgrades started and completed" aria-haspopup="true" aria-expanded="false" style="position:relative"><span data-i="bell"></span><span class="nbadge" id="bell-count" hidden>0</span></button><div class="note-pop" id="note-pop" role="dialog" aria-label="Notifications" hidden><div class="nh"><span>Notifications</span><span><button type="button" id="note-sound" title="Play a sound for new alerts (not for logins)">Sound: On</button> <button type="button" id="note-clear">Clear All</button></span></div><div class="nl" id="note-list"></div></div></span>
   <button class="ib" id="btn-settings" title="Settings" aria-label="Settings"><span data-i="gear"></span></button>
   <button class="ib" id="btn-theme" title="Switch between light and dark mode"></button>
@@ -8607,6 +8907,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <input type="text" id="st-search" placeholder="Search backups, reports and runs in this site..." autocomplete="off" spellcheck="false" aria-label="Search files and folders">
           <button type="button" class="st-clear" id="st-clear" title="Clear search" hidden>&times;</button>
         </div>
+        <button type="button" class="btn sm in" id="st-compare" title="Compare two backups of this switch" hidden>Compare Backups</button>
         <a class="btn sm" id="st-zip" href="#" title="Download this folder as a ZIP file">Download Folder (.zip)</a>
         <button type="button" class="btn sm" id="st-refresh">Refresh</button>
       </div>
@@ -8652,11 +8953,44 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="modal-card wide" role="dialog" aria-labelledby="st-modal-title">
     <div style="display:flex; align-items:center; gap:10px;">
       <h2 id="st-modal-title" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></h2>
+      <button type="button" class="btn sm" id="st-modal-top" title="Jump to the start of the file">Top</button>
+      <button type="button" class="btn sm" id="st-modal-end" title="Jump to the end of the file">End</button>
       <a class="btn sm p" id="st-modal-dl" href="#">Download</a>
       <button type="button" class="btn sm" id="st-modal-close">Close</button>
     </div>
     <div class="hint" id="st-modal-meta" style="margin-top:2px"></div>
     <pre id="st-pre"></pre>
+  </div>
+</div>
+
+<div id="cmp-modal" class="modal cmp-full" hidden>
+  <div class="modal-card cmp-card" role="dialog" aria-labelledby="cmp-title">
+    <div class="cmp-top">
+      <h2 id="cmp-title">Compare backups</h2>
+      <div class="cmp-seg" id="cmp-view" role="group" aria-label="Comparison layout">
+        <button type="button" data-v="side" class="on">Side by side</button><button type="button" data-v="uni">Unified</button>
+      </div>
+      <button type="button" class="btn sm" id="cmp-close">Close</button>
+    </div>
+    <div class="cmp-bar">
+      <label for="cmp-a">Left (older)</label><select id="cmp-a"></select>
+      <label for="cmp-b">Right (newer)</label><select id="cmp-b"></select>
+      <label class="cmp-opt"><input type="checkbox" id="cmp-ign" checked> Ignore lines that change every time (timestamps, uptime, byte counts)</label>
+      <label class="cmp-opt"><input type="checkbox" id="cmp-all"> Show all lines</label>
+      <button type="button" class="btn sm" id="cmp-prev" title="Previous change">&#9650; Prev</button>
+      <button type="button" class="btn sm" id="cmp-next" title="Next change">&#9660; Next</button>
+      <button type="button" class="btn sm in" id="cmp-go">Compare</button>
+    </div>
+    <div class="cmp-main">
+      <div class="cmp-list">
+        <div class="lh"><label class="cmp-opt"><input type="checkbox" id="cmp-same"> Show unchanged commands</label></div>
+        <div class="lb" id="cmp-list"></div>
+      </div>
+      <div class="cmp-pane">
+        <div class="df-sum" id="cmp-sum"></div>
+        <div class="cmp-diff" id="cmp-diff"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -8697,7 +9031,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
   <div id="dr-term-bd" hidden></div>
   <div class="dr-view" id="dr-view" hidden>
-    <div class="vh"><button type="button" class="btn sm" id="dr-view-back">&larr; Back</button><span class="nm" id="dr-view-name"></span></div>
+    <div class="vh"><button type="button" class="btn sm" id="dr-view-back">&larr; Back</button><span class="nm" id="dr-view-name"></span><button type="button" class="btn sm" id="dr-view-top" title="Jump to the start of the file">Top</button><button type="button" class="btn sm" id="dr-view-end" title="Jump to the end of the file">End</button></div>
     <div class="vn" id="dr-view-note" hidden></div>
     <pre id="dr-view-text"></pre>
   </div>
@@ -9264,7 +9598,7 @@ function render(d) {
   const md = $("mon-dot"); md.className = "mdot " + m.state;
   $("meta").textContent = "Check: " + m.mode + " every " + m.interval + "s" + (m.started_at ? "  |  started " + m.started_at : "");
   $("btn-mon").textContent = m.state === "running" ? "Stop Monitoring" : "Start Monitoring";
-  $("btn-mon").className = "btn" + (m.state === "running" ? "" : " p");
+  $("btn-mon").className = "btn " + (m.state === "running" ? "dg" : "p ok");
   $("btn-mon").dataset.action = m.state === "running" ? "stop" : "start";
   if ((d.site || null) !== siteName) { applySite(d.site); loadSites(); }
   const upBusy = d.upgrade.active > 0;
@@ -10401,6 +10735,167 @@ function stRenderCrumbs() {
   parts.forEach((p, i) => { sep(); acc = acc ? acc + "/" + p : p; add(p, acc, i === parts.length - 1); });
 }
 
+// ---- Compare two backups of one switch (shown while a switch's folder under Switch Backups is open) ----
+// Full-screen, command list on the left, the selected command shown LEFT (older) / RIGHT (newer), or unified.
+const CMP = {cmd: "", view: "side", show: false, all: false, last: null, cache: {}, open: new Set(), tok: 0, folder: ""};
+const CMP_ST = {changed: ["CHANGED", "var(--c-a)"], added: ["ONLY IN NEWER", "var(--gr)"], removed: ["ONLY IN OLDER", "var(--rd)"], same: ["no changes", "var(--mu)"]};
+const stCompareFolder = () => { const p = (stg.path || "").split("/").filter(Boolean); return p.length === 2 && p[0] === "Switch Backups"; };
+function cmpMsg(text) { $("cmp-diff").innerHTML = '<div class="cmp-msg">' + esc(text) + "</div>"; }
+function cmpSumHtml(d) {
+  const s = d.summary;
+  return "<b>" + esc(d.a.time) + "</b> &rarr; <b>" + esc(d.b.time) + "</b> " +
+    (s.changed + s.added + s.removed === 0 ? pill("NO DIFFERENCES", "OK") :
+      pill(s.changed + " CHANGED", "WARN") + (s.added ? pill(s.added + " ADDED", "OK") : "") + (s.removed ? pill(s.removed + " REMOVED", "DOWN") : "") +
+      '<span class="muted">+' + s.lines_added + " / &minus;" + s.lines_removed + " lines</span>");
+}
+function cmpListHtml() {
+  if (!CMP.last) return "";
+  const list = CMP.last.commands.filter(c => c.status !== "same" || CMP.show);
+  if (!list.length) return '<div class="cmp-msg" style="padding:10px;color:var(--mu)">No changed commands.</div>';
+  return list.map(c => {
+    const st = CMP_ST[c.status];
+    return '<button type="button" class="cmp-item' + (c.command === CMP.cmd ? " on" : "") + '" data-cmp-cmd="' + esc(c.command) + '"><div class="c">' + esc(c.command) +
+      '</div><div class="s" style="color:' + st[1] + '">' + st[0] + (c.status === "same" ? "" : " &middot; +" + c.added + " &minus;" + c.removed) + "</div></button>";
+  }).join("");
+}
+function cmpHl(a, b) {                 // wrap the part of each line that differs (common start / end are left plain)
+  if (a.length > 2000 || b.length > 2000) return [esc(a), esc(b)];
+  let p = 0; while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let q = 0; while (q < a.length - p && q < b.length - p && a[a.length - 1 - q] === b[b.length - 1 - q]) q++;
+  const w = (t) => { const mid = t.slice(p, t.length - q); return esc(t.slice(0, p)) + (mid ? "<mark>" + esc(mid) + "</mark>" : "") + esc(t.slice(t.length - q)); };
+  return [w(a), w(b)];
+}
+function cmpRowHtml(r, first) {
+  const k = r[4], at = first && k !== "=" ? " data-chg" : "";
+  const t = x => esc(x) || " ";
+  if (k === "=") return "<tr><td class=\"ln\">" + r[0] + '</td><td class="tx' + (r[1] !== r[3] ? " vol" : "") + '">' + t(r[1]) + '</td><td class="ln">' + r[2] + '</td><td class="tx' + (r[1] !== r[3] ? " vol" : "") + '">' + t(r[3]) + "</td></tr>";
+  if (k === "-") return "<tr" + at + '><td class="ln l-r">' + r[0] + '</td><td class="tx l-r">' + t(r[1]) + '</td><td class="ln emp"></td><td class="tx emp"> </td></tr>';
+  if (k === "+") return "<tr" + at + '><td class="ln emp"></td><td class="tx emp"> </td><td class="ln l-a">' + r[2] + '</td><td class="tx l-a">' + t(r[3]) + "</td></tr>";
+  const h = cmpHl(r[1], r[3]);
+  return "<tr" + at + '><td class="ln l-r">' + r[0] + '</td><td class="tx l-r">' + (h[0] || " ") + '</td><td class="ln l-a">' + r[2] + '</td><td class="tx l-a">' + (h[1] || " ") + "</td></tr>";
+}
+function cmpSideHtml(d) {
+  const rows = d.rows, n = rows.length;
+  let keep = null;
+  if (!CMP.all) {                      // changed lines with 3 lines of context; the rest folds into a clickable gap
+    keep = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (rows[i][4] !== "=") for (let k = Math.max(0, i - 3); k <= Math.min(n - 1, i + 3); k++) keep[k] = 1;
+  }
+  const na = d.in_a ? "" : " \u2014 command not in this backup", nb = d.in_b ? "" : " \u2014 command not in this backup";
+  let out = '<table class="sbs"><colgroup><col style="width:56px"><col><col style="width:56px"><col></colgroup><thead><tr><th colspan="2">Left &middot; older &middot; ' +
+    esc(d.a.time + na) + '</th><th colspan="2">Right &middot; newer &middot; ' + esc(d.b.time + nb) + "</th></tr></thead><tbody>";
+  let i = 0;
+  while (i < n) {
+    if (keep && !keep[i]) {
+      let j = i; while (j < n && !keep[j]) j++;
+      if (CMP.open.has(i)) { for (let k = i; k < j; k++) out += cmpRowHtml(rows[k], false); }
+      else out += '<tr class="gap" data-gap="' + i + '"><td colspan="4">&hellip; ' + (j - i) + " unchanged line" + (j - i === 1 ? "" : "s") + " &mdash; click to show</td></tr>";
+      i = j; continue;
+    }
+    out += cmpRowHtml(rows[i], i === 0 || rows[i - 1][4] === "=");
+    i++;
+  }
+  if (!n) out += '<tr><td colspan="4" class="cmp-msg" style="padding:12px 14px;color:var(--mu)">Both outputs are empty.</td></tr>';
+  if (d.truncated) out += '<tr class="gap"><td colspan="4">Only the first ' + BACKUP_SIDE_MAX_LINES_JS + " lines of each side are compared.</td></tr>";
+  return out + "</tbody></table>";
+}
+const BACKUP_SIDE_MAX_LINES_JS = 30000;
+function cmpUniHtml(c) {
+  if (!c || c.status === "same") return '<div class="cmp-msg">No changes in this command.</div>';
+  return '<pre class="uni">' + c.diff.map(l => '<div class="' + (l[0] === "+" ? "df-a" : l[0] === "-" ? "df-r" : l[0] === "@" ? "df-h" : "") + '">' + esc(l || " ") + "</div>").join("") +
+    (c.truncated ? '<div class="df-h">... difference is longer than shown ...</div>' : "") + "</pre>";
+}
+async function cmpPaint(keepScroll) {
+  const box = $("cmp-diff"), d = CMP.last;
+  if (!d) return;
+  $("cmp-list").innerHTML = cmpListHtml();
+  const c = d.commands.find(x => x.command === CMP.cmd);
+  if (!c) { cmpMsg("Select a command on the left."); return; }
+  const top = keepScroll ? box.scrollTop : 0;
+  if (CMP.view === "uni") { box.innerHTML = cmpUniHtml(c); box.scrollTop = top; return; }
+  const key = [CMP.folder, d.a.stamp, d.b.stamp, d.ignore_volatile ? 1 : 0, c.command].join("|"), tok = ++CMP.tok;
+  let sd = CMP.cache[key];
+  if (!sd) {
+    cmpMsg("Loading " + c.command + " ...");
+    try {
+      sd = await getJSON(stUrl("compare", CMP.folder) + "&a=" + encodeURIComponent(d.a.stamp) + "&b=" + encodeURIComponent(d.b.stamp) +
+        "&ignore=" + (d.ignore_volatile ? "1" : "0") + "&cmd=" + encodeURIComponent(c.command));
+    } catch (e) { if (tok === CMP.tok) cmpMsg("Could not load this command: " + e.message); return; }
+    CMP.cache[key] = sd;
+  }
+  if (tok !== CMP.tok || $("cmp-modal").hidden) return;
+  box.innerHTML = cmpSideHtml(sd); box.scrollTop = top;
+}
+function cmpPickDefault() {
+  const cs = CMP.last.commands;
+  if (cs.some(c => c.command === CMP.cmd)) return;
+  const ch = cs.filter(c => c.status !== "same");
+  CMP.cmd = (ch.find(c => /running-config/i.test(c.command)) || ch[0] || cs.find(c => /running-config/i.test(c.command)) || cs[0] || {command: ""}).command;
+}
+async function cmpOpen() {
+  const folder = stg.path;
+  CMP.folder = folder; CMP.last = null; CMP.cache = {}; CMP.open = new Set(); CMP.cmd = "";
+  $("cmp-title").textContent = "Compare backups \u2014 " + folder.split("/").pop();
+  $("cmp-modal").hidden = false; cmpMsg("Loading ..."); $("cmp-list").innerHTML = ""; $("cmp-sum").innerHTML = "";
+  $("cmp-a").innerHTML = $("cmp-b").innerHTML = ""; $("cmp-go").disabled = true;
+  try {
+    const d = await getJSON(stUrl("backups", folder));
+    if ($("cmp-modal").hidden || folder !== stg.path) return;
+    if (d.runs.length < 2) { cmpMsg("This switch has fewer than two backups, so there is nothing to compare yet."); return; }
+    const opts = d.runs.map(r => '<option value="' + esc(r.stamp) + '">' + esc(r.time) + "</option>").join("");
+    $("cmp-a").innerHTML = opts; $("cmp-b").innerHTML = opts;
+    $("cmp-b").value = d.runs[0].stamp; $("cmp-a").value = d.runs[1].stamp;     // newest against the one before it
+    $("cmp-go").disabled = false;
+    cmpRun();
+  } catch (e) { cmpMsg("Could not load the backups: " + e.message); }
+}
+async function cmpRun() {
+  const folder = stg.path, a = $("cmp-a").value, b = $("cmp-b").value;
+  cmpMsg("Comparing ...");
+  try {
+    const d = await getJSON(stUrl("compare", folder) + "&a=" + encodeURIComponent(a) + "&b=" + encodeURIComponent(b) + "&ignore=" + ($("cmp-ign").checked ? "1" : "0"));
+    if ($("cmp-modal").hidden) return;
+    CMP.last = d; CMP.cache = {}; CMP.open = new Set(); CMP.folder = folder;
+    $("cmp-sum").innerHTML = cmpSumHtml(d);
+    cmpPickDefault(); cmpPaint(false);
+  } catch (e) { CMP.last = null; $("cmp-list").innerHTML = ""; $("cmp-sum").innerHTML = ""; cmpMsg("Could not compare: " + e.message); }
+}
+function cmpJump(dir) {                // next / previous block of changed lines in the side-by-side view
+  const box = $("cmp-diff"), bl = box.querySelectorAll("tr[data-chg]");
+  if (!bl.length) return;
+  const base = box.getBoundingClientRect().top + 40;
+  let t = null;
+  if (dir > 0) { for (const x of bl) if (x.getBoundingClientRect().top > base + 4) { t = x; break; } t = t || bl[0]; }
+  else { for (let i = bl.length - 1; i >= 0; i--) if (bl[i].getBoundingClientRect().top < base - 4) { t = bl[i]; break; } t = t || bl[bl.length - 1]; }
+  box.scrollTop += t.getBoundingClientRect().top - base;
+}
+$("st-compare").addEventListener("click", cmpOpen);
+$("cmp-go").addEventListener("click", cmpRun);
+$("cmp-a").addEventListener("change", () => { if (!$("cmp-go").disabled) cmpRun(); });
+$("cmp-b").addEventListener("change", () => { if (!$("cmp-go").disabled) cmpRun(); });
+$("cmp-ign").addEventListener("change", () => { if (!$("cmp-go").disabled) cmpRun(); });
+$("cmp-all").addEventListener("change", e => { CMP.all = e.target.checked; cmpPaint(true); });
+$("cmp-same").addEventListener("change", e => { CMP.show = e.target.checked; if (CMP.last) $("cmp-list").innerHTML = cmpListHtml(); });
+$("cmp-prev").addEventListener("click", () => cmpJump(-1));
+$("cmp-next").addEventListener("click", () => cmpJump(1));
+$("cmp-view").addEventListener("click", e => {
+  const b = e.target.closest("button[data-v]"); if (!b) return;
+  CMP.view = b.dataset.v;
+  $("cmp-view").querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b));
+  $("cmp-all").disabled = $("cmp-prev").disabled = $("cmp-next").disabled = CMP.view === "uni";
+  cmpPaint(false);
+});
+$("cmp-list").addEventListener("click", e => {
+  const it = e.target.closest(".cmp-item"); if (!it) return;
+  CMP.cmd = it.dataset.cmpCmd; CMP.open = new Set(); cmpPaint(false);
+});
+$("cmp-diff").addEventListener("click", e => {
+  const g = e.target.closest("tr.gap[data-gap]"); if (!g) return;
+  CMP.open.add(Number(g.dataset.gap)); cmpPaint(true);
+});
+$("cmp-close").addEventListener("click", () => { $("cmp-modal").hidden = true; $("cmp-diff").textContent = ""; $("cmp-list").innerHTML = ""; CMP.last = null; CMP.cache = {}; });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("cmp-modal").hidden) $("cmp-close").click(); });
+
 function stOpen(path) {
   stg.path = path || ""; stg.query = ""; $("st-search").value = ""; $("st-clear").hidden = true;
   stRefresh();
@@ -10433,6 +10928,7 @@ function stRender() {
   zip.href = stg.site ? stUrl("download", stg.path) : "#";
   zip.textContent = stg.path ? "Download Folder (.zip)" : "Download Site Storage (.zip)";
   $("st-refresh").disabled = !stg.site;
+  $("st-compare").hidden = !stg.site || searching || !stCompareFolder() || ME.role === "viewer";
   $("st-search").disabled = !stg.site;
   $("st-clear").hidden = !stg.query;
 
@@ -10485,23 +10981,34 @@ function stRender() {
     : "";
 }
 
-async function stView(e) {
+const STV = {e: null, tail: false, truncated: false};
+async function stLoad(tail) {
+  const e = STV.e, pre = $("st-pre");
+  $("st-modal-meta").textContent = "Loading...";
+  try {
+    const d = await getJSON(stUrl("read", e.rel) + (tail ? "&tail=1" : ""));
+    if ($("st-modal").hidden || STV.e !== e) return;
+    STV.tail = !!d.tail; STV.truncated = !!d.truncated;
+    $("st-modal-meta").textContent = fmtSize(d.size) + " - " + (e.parent || e.rel.split("/").slice(0, -1).join("/") || "/")
+      + (d.truncated ? " - showing the " + (d.tail ? "last " : "first ") + fmtSize(d.limit || 0) + " of the file; use " + (d.tail ? "Top" : "End") + " for the other part, or download the full file" : "");
+    pre.textContent = d.text;
+    pre.scrollTop = tail ? pre.scrollHeight : 0;
+  } catch (err) {
+    $("st-modal-meta").textContent = "";
+    pre.textContent = err.message;
+  }
+}
+function stView(e) {
   $("st-modal-title").textContent = e.name;
   $("st-modal-title").title = e.name;
   $("st-modal-dl").href = stUrl("download", e.rel);
-  $("st-modal-meta").textContent = "Loading...";
   $("st-pre").textContent = "";
+  STV.e = e; STV.tail = false; STV.truncated = false;
   $("st-modal").hidden = false;
-  try {
-    const d = await getJSON(stUrl("read", e.rel));
-    $("st-modal-meta").textContent = fmtSize(d.size) + " - " + (e.parent || e.rel.split("/").slice(0, -1).join("/") || "/")
-      + (d.truncated ? " - showing the first " + fmtSize(512 * 1024) + "; download for the full file" : "");
-    $("st-pre").textContent = d.text;
-  } catch (err) {
-    $("st-modal-meta").textContent = "";
-    $("st-pre").textContent = err.message;
-  }
+  return stLoad(false);
 }
+$("st-modal-top").addEventListener("click", () => { if (STV.tail) stLoad(false); else $("st-pre").scrollTop = 0; });
+$("st-modal-end").addEventListener("click", () => { if (STV.truncated && !STV.tail) stLoad(true); else $("st-pre").scrollTop = $("st-pre").scrollHeight; });
 function closeStModal() { $("st-modal").hidden = true; $("st-pre").textContent = ""; }
 $("st-modal-close").addEventListener("click", closeStModal);
 $("st-modal").addEventListener("click", e => { if (e.target === $("st-modal")) closeStModal(); });
@@ -10549,6 +11056,17 @@ function setRow(item) {
     '</div><div class="set-help">' + esc(item.help) + '</div></div><div class="set-ctl">' + ctl +
     '<button type="button" class="set-def" data-sdef="' + k + '" title="Use the default value"' + dis + ">Default: " + esc(setUnit(item, def)) + "</button></div></div>";
 }
+function aboutRender() {
+  const root = $("ab-root"), a = SET.data && SET.data.about; if (!root || !a) return;
+  const link = /^https:\/\//.test(a.repo) ? '<a href="' + esc(a.repo) + '" target="_blank" rel="noopener noreferrer">' + esc(a.repo) + "</a>" : esc(a.repo);
+  root.innerHTML = '<div class="ab-card"><div class="ab-kv"><span>Application</span><span>' + esc(a.name) + "</span>" +
+    "<span>Version</span><span><b>" + esc(a.version) + "</b></span><span>Developed by</span><span>" + esc(a.author) + "</span>" +
+    "<span>Project page</span><span>" + link + "</span></div></div>" +
+    '<div class="set-sec">New features in each version</div>' +
+    a.changelog.map(v => '<div class="ab-ver"><h4>' + (/^\d/.test(v.version) && !v.version.includes(" ") ? "Version " : "") + esc(v.version) +
+      (v.date ? " <small>" + esc(v.date) + "</small>" : "") + (v.version === a.version ? ' <span class="ab-cur">Installed</span>' : "") + "</h4><ul>" +
+      v.features.map(f => "<li>" + esc(f) + "</li>").join("") + "</ul></div>").join("");
+}
 function renderSettings() {
   if (!SET.data) return;
   if (!SET.data.groups.some(g => g.id === SET.tab)) SET.tab = SET.data.groups[0].id;
@@ -10559,7 +11077,8 @@ function renderSettings() {
   $("set-note").hidden = SET_CAN_EDIT;
   let html = '<div class="set-intro">' + esc(g.intro) + "</div>" +
     (g.id === "timeouts" ? '<div id="tp-root"></div><div id="ct-root"></div>' : "") +
-    (g.id === "notifications" ? '<div id="nt-root"></div>' : ""), sec = null;
+    (g.id === "notifications" ? '<div id="nt-root"></div>' : "") +
+    (g.id === "about" ? '<div id="ab-root"></div>' : ""), sec = null;
   for (const item of SET.data.items.filter(i => i.group === g.id)) {
     if (item.section && item.section !== sec) { html += '<div class="set-sec">' + esc(item.section) + "</div>"; }
     sec = item.section;
@@ -10568,7 +11087,8 @@ function renderSettings() {
   $("set-body").innerHTML = html;
   if (g.id === "timeouts") { tpRender(); ctRender(); }
   if (g.id === "notifications") { ntRender(); if (!NT.data && !NT.loading) { NT.loading = true; ntLoad().finally(() => { NT.loading = false; }); } }
-  const own = g.id === "notifications";            // this tab has its own Save button
+  if (g.id === "about") aboutRender();
+  const own = g.id === "notifications" || g.id === "about";            // these tabs have their own Save button
   $("set-reset").hidden = own; $("set-save").hidden = own; $("set-dirty").hidden = own;
   $("set-reset").disabled = !SET_CAN_EDIT;
   setUpdateDirty();
@@ -11720,7 +12240,6 @@ const PHASE_PCT = {waiting_backup: 3, starting: 5, connecting: 8, connected: 12,
                    space_check: 28, uploading: 40, md5: 52, installing: 65, reloading: 75, waiting_down: 78,
                    waiting_up: 85, waiting_ssh: 91, committing: 94, postcheck: 96, skipped: 100};
 const READY_PILL = {checking: ["CHECKING", "RUN"], ready: ["READY", "OK"], warning: ["WARNING", "CHECK"], not_ready: ["NOT READY", "DOWN"]};
-const CK_MARK = {ok: "\u2713", warn: "!", bad: "\u2715", todo: "\u2013", run: "\u2026"};
 
 const drDash = v => (v == null || v === "") ? DASH : esc(v);
 const drSize = n => n < 1024 ? n + " B" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(1) + " MB";
@@ -11837,21 +12356,6 @@ function drOverview(h, d) {
     drCard("Preflight Check (readiness)", rm ? pill(rm[0], rm[1]) : pill("NOT RUN", "PENDING"),
            esc(r.time || (rm ? "" : "Run the readiness check"))) +
     "</div>";
-
-  // what is still missing before an upgrade
-  if (d) {
-    const miss = d.missing, warn = d.warnings, blocked = d.checklist.some(c => c.state === "bad");
-    const cls = miss ? (blocked ? "bad" : "warn") : (warn ? "warn" : "ok");
-    const msg = miss ? miss + " step" + (miss === 1 ? "" : "s") + " missing before the upgrade"
-              : warn ? "Ready to upgrade \u2014 " + warn + " warning" + (warn === 1 ? "" : "s") : "Ready to upgrade";
-    const hp = miss ? pill(miss + " missing", blocked ? "DOWN" : "CHECK") : warn ? pill(warn + " warning" + (warn === 1 ? "" : "s"), "CHECK") : pill("READY", "OK");
-    out += drFold("checklist", "Before you upgrade", hp,
-      '<div class="dr-banner ' + cls + '">' + esc(msg) + "</div>" +
-      d.checklist.map(c => '<div class="ck-row"><span class="ck-ic ' + c.state + '">' + CK_MARK[c.state] + '</span><div><div class="ck-t">' +
-        esc(c.title) + '</div><div class="ck-d">' + esc(c.detail) + "</div></div></div>").join(""), true);
-  } else if (!DR.err) {
-    out += drFold("checklist", "Before you upgrade", "", '<div class="dr-empty">Loading ...</div>', true);
-  }
 
   // device information
   const m = d ? d.monitor : {};
@@ -12058,27 +12562,34 @@ function drawerSync() {
   drRender();
 }
 function closeViewer() { DR.viewing = false; $("dr-view").hidden = true; $("dr-view-text").textContent = ""; }
-async function drView(kind, name) {
+const DRV = {kind: "", name: "", tail: false, truncated: false};
+async function drView(kind, name, tail) {
   const host = DR.host;
+  DRV.kind = kind; DRV.name = name;
   DR.viewing = true;
   $("dr-view").hidden = false;
   $("dr-view-name").textContent = name;
   $("dr-view-text").textContent = "Loading ...";
   $("dr-view-note").hidden = true;
   try {
-    const r = await fetch("/api/device/file?host=" + encodeURIComponent(host) + "&kind=" + encodeURIComponent(kind) + "&name=" + encodeURIComponent(name), {cache: "no-store"});
+    const r = await fetch("/api/device/file?host=" + encodeURIComponent(host) + "&kind=" + encodeURIComponent(kind) + "&name=" + encodeURIComponent(name) + (tail ? "&tail=1" : ""), {cache: "no-store"});
     let d = {}; try { d = await r.json(); } catch (e) {}
     if (!DR.viewing || host !== DR.host) return;
     if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
-    $("dr-view-text").textContent = d.text || "(empty file)";
+    const pre = $("dr-view-text");
+    DRV.tail = !!d.tail; DRV.truncated = !!d.truncated;
+    pre.textContent = d.text || "(empty file)";
+    pre.scrollTop = tail || d.tail ? pre.scrollHeight : 0;
     if (d.truncated) {
-      $("dr-view-note").textContent = "Large file (" + drSize(d.size) + ") \u2014 showing the " + (d.tail ? "last" : "first") + " 400 KB.";
+      $("dr-view-note").textContent = "Large file (" + drSize(d.size) + ") \u2014 showing the " + (d.tail ? "last" : "first") + " " + drSize(d.limit || 0) + ". Use " + (d.tail ? "Top" : "End") + " for the other part.";
       $("dr-view-note").hidden = false;
     }
   } catch (e) {
     if (DR.viewing) $("dr-view-text").textContent = "Could not open the file: " + e.message;
   }
 }
+$("dr-view-top").addEventListener("click", () => { if (DRV.tail && !/\.(log|console\.txt)$/.test(DRV.name)) drView(DRV.kind, DRV.name, false); else $("dr-view-text").scrollTop = 0; });
+$("dr-view-end").addEventListener("click", () => { if (DRV.truncated && !DRV.tail) drView(DRV.kind, DRV.name, true); else $("dr-view-text").scrollTop = $("dr-view-text").scrollHeight; });
 function drConsole() {
   const h = drHost();
   if (h && h.upgrade.job_id) { UP.pref[h.host] = "upgrade"; drSetTab("console"); }
@@ -12373,7 +12884,7 @@ def make_handler(manager, allowed_hosts, any_host):
                 elif path == "/api/device":
                     self._json(200, manager.device_detail(qv("host"), qv("image"), shared_target=self._me()["role"] == ROLE_VIEWER))
                 elif path == "/api/device/file":
-                    self._json(200, manager.device_file(qv("host"), qv("kind"), qv("name")))
+                    self._json(200, manager.device_file(qv("host"), qv("kind"), qv("name"), qv("tail") == "1"))
                 elif path == "/api/term/read":
                     self._json(200, manager.term_read(qv("host"), qv("sid"), qv("offset")))
                 elif path == "/api/console":
@@ -12387,8 +12898,12 @@ def make_handler(manager, allowed_hosts, any_host):
                     self._json(200, storage_list(qv("site"), qv("path")))
                 elif path == "/api/storage/search":
                     self._json(200, storage_search(qv("site"), qv("q")))
+                elif path == "/api/storage/backups":
+                    self._json(200, storage_backup_runs(qv("site"), qv("path")))
+                elif path == "/api/storage/compare":
+                    self._json(200, storage_compare(qv("site"), qv("path"), qv("a"), qv("b"), qv("ignore") != "0", qv("cmd") or None))
                 elif path == "/api/storage/read":
-                    self._json(200, storage_read(qv("site"), qv("path")))
+                    self._json(200, storage_read(qv("site"), qv("path"), qv("tail") == "1"))
                 elif path == "/api/storage/download":
                     self._storage_download(qv("site"), qv("path"))
                 elif path == "/api/devices/template.xlsx":
