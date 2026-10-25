@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v5.10.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v5.14.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -97,13 +97,16 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.13.0"          # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "5.14.0"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # What each release added, newest first - shown under Settings > About. Add one entry here for every release
 # (keep APP_VERSION above and APP_VERSION in launcher.py equal to the newest entry).
 CHANGELOG = [
+    {"version": "5.14.0", "date": "2026-10-25", "features": [
+        "Choose one storage location for IOS images and switch backups, stored under a NetUpgrade folder.",
+        "Create the NetUpgrade storage folder directly from the installer folder picker."]},
     {"version": "5.13.0", "date": "2026-10-25", "features": [
         "Choose separate folders during installation for IOS images and switch configuration backups." ]},
     {"version": "5.12.1", "date": "2026-10-25", "features": [
@@ -2469,6 +2472,9 @@ _VERSION_STORE_LOCK = threading.Lock()
 # across every site, since the same image is often used on more than one site's switches.
 # --------------------------------------------------------------------------- #
 SITES_ROOT_DIRNAME = "Switch Configuration Backups"
+STORAGE_DIRNAME = "NetUpgrade"
+LEGACY_IMAGES_DIRNAME = IMAGES_DIRNAME
+LEGACY_BACKUPS_DIRNAME = SITES_ROOT_DIRNAME
 SITE_BACKUPS_SUBDIR = "Switch Backups"
 SITE_REPORTS_SUBDIR = "Reports"
 SITE_RUNS_SUBDIR = "Runs"
@@ -2476,35 +2482,66 @@ SITE_RUNS_SUBDIR = "Runs"
 STORAGE_REGISTRY_KEY = r"Software\Innovate Nexus\NetUpgrade"
 
 
-def _configured_storage_path(value_name, legacy_dirname):
-    """Resolve an installer-selected data folder and retain data from older installs."""
-    env_names = {
+def _storage_setting(value_name):
+    """Read a current or legacy storage setting from the environment or user registry."""
+    env_name = {
+        "StoragePath": "NETUPGRADE_STORAGE_DIR",
         "ImagesPath": "NETUPGRADE_IMAGES_DIR",
         "BackupsPath": "NETUPGRADE_BACKUPS_DIR",
-    }
-    configured = os.environ.get(env_names[value_name])
-    if not configured and sys.platform == "win32":
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STORAGE_REGISTRY_KEY) as key:
-                configured, _ = winreg.QueryValueEx(key, value_name)
-        except (ImportError, OSError):
-            configured = None
+    }[value_name]
+    configured = os.environ.get(env_name)
+    if configured or sys.platform != "win32":
+        return configured
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, STORAGE_REGISTRY_KEY) as key:
+            configured, _ = winreg.QueryValueEx(key, value_name)
+        return configured
+    except (ImportError, OSError):
+        return None
 
-    legacy_path = this_program_path().parent / legacy_dirname
-    if not configured:
-        return legacy_path
 
-    selected_path = Path(os.path.expandvars(os.path.expanduser(str(configured)))).resolve()
-    if selected_path != legacy_path.resolve() and legacy_path.is_dir():
-        if not selected_path.exists():
-            # Copy once so an installer-selected location change does not hide existing user data.
-            shutil.copytree(legacy_path, selected_path)
-        elif selected_path.is_dir() and not any(selected_path.iterdir()):
-            # The installer pre-creates its selected folders, so migrate into an empty one.
-            shutil.copytree(legacy_path, selected_path, dirs_exist_ok=True)
-    return selected_path
+def _migrate_storage_folder(source, destination):
+    """Copy old data into a missing or empty destination without overwriting user files."""
+    source, destination = Path(source).expanduser(), Path(destination)
+    try:
+        if source.resolve() == destination.resolve() or not source.is_dir():
+            return True
+        if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
+            return True
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+        return True
+    except OSError as exc:
+        print(f"Could not migrate storage folder '{source}': {exc}", flush=True)
+        return False
 
+
+def common_storage_root():
+    """Return the shared NetUpgrade data root and preserve folders from older installs."""
+    configured = _storage_setting("StoragePath")
+    root = (Path(os.path.expandvars(os.path.expanduser(str(configured)))).resolve()
+            if configured else (this_program_path().parent / STORAGE_DIRNAME).resolve())
+    root.mkdir(parents=True, exist_ok=True)
+    migration_marker = root / ".storage-migrated-v1"
+    if not migration_marker.exists():
+        old_images = _storage_setting("ImagesPath")
+        old_backups = _storage_setting("BackupsPath")
+        image_sources = [Path(old_images)] if old_images else []
+        backup_sources = [Path(old_backups)] if old_backups else []
+        image_sources.append(this_program_path().parent / LEGACY_IMAGES_DIRNAME)
+        backup_sources.append(this_program_path().parent / LEGACY_BACKUPS_DIRNAME)
+        succeeded = True
+        for source in dict.fromkeys(image_sources):
+            succeeded = _migrate_storage_folder(source, root / IMAGES_DIRNAME) and succeeded
+        for source in dict.fromkeys(backup_sources):
+            succeeded = _migrate_storage_folder(source, root / SITES_ROOT_DIRNAME) and succeeded
+        if succeeded:
+            try:
+                migration_marker.write_text("1\n", encoding="ascii")
+            except OSError as exc:
+                print(f"Could not record storage migration status: {exc}", flush=True)
+    return root
 
 # --------------------------------------------------------------------------- #
 # Global settings (the gear icon page). One settings.json next to the program, shared by every site.
@@ -2805,7 +2842,7 @@ SITE = SiteContext()
 
 
 def sites_root():
-    d = _configured_storage_path("BackupsPath", SITES_ROOT_DIRNAME)
+    d = common_storage_root() / SITES_ROOT_DIRNAME
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -2968,8 +3005,8 @@ def save_known_version(ip, hostname, version, model=None, boot=None):
 
 
 def images_dir():
-    """The installer-selected folder for uploaded IOS images."""
-    d = _configured_storage_path("ImagesPath", IMAGES_DIRNAME)
+    """The installer-selected shared storage root's IOS image folder."""
+    d = common_storage_root() / IMAGES_DIRNAME
     d.mkdir(parents=True, exist_ok=True)
     return d
 
