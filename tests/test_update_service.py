@@ -22,7 +22,7 @@ class UpdateServiceTests(unittest.TestCase):
         return {"tag_name": "v5.12.2", "assets": [asset]}, asset, data
 
     def test_version_parser_only_accepts_stable_three_part_versions(self):
-        self.assertEqual(update_service.parse_version("v5.12.2"), (5, 13, 0))
+        self.assertEqual(update_service.parse_version("v5.12.2"), (5, 12, 2))
         self.assertIsNone(update_service.parse_version("v5.12.2-rc1"))
         self.assertIsNone(update_service.parse_version("latest"))
 
@@ -94,3 +94,4 @@ class UpdateServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
