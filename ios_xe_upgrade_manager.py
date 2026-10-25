@@ -2494,9 +2494,13 @@ def _configured_storage_path(value_name, legacy_dirname):
         return legacy_path
 
     selected_path = Path(os.path.expandvars(os.path.expanduser(str(configured)))).resolve()
-    if selected_path != legacy_path.resolve() and not selected_path.exists() and legacy_path.is_dir():
-        # Copy once so an installer-selected location change does not hide existing user data.
-        shutil.copytree(legacy_path, selected_path)
+    if selected_path != legacy_path.resolve() and legacy_path.is_dir():
+        if not selected_path.exists():
+            # Copy once so an installer-selected location change does not hide existing user data.
+            shutil.copytree(legacy_path, selected_path)
+        elif selected_path.is_dir() and not any(selected_path.iterdir()):
+            # The installer pre-creates its selected folders, so migrate into an empty one.
+            shutil.copytree(legacy_path, selected_path, dirs_exist_ok=True)
     return selected_path
 
 
