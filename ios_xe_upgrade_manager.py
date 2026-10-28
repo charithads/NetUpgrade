@@ -98,13 +98,17 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.16.0"          # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "5.17.0"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # What each release added, newest first - shown under Settings > About. Add one entry here for every release
 # (keep APP_VERSION above and APP_VERSION in launcher.py equal to the newest entry).
 CHANGELOG = [
+    {"version": "5.17.0", "date": "2026-10-28", "features": [
+        "Diagnosis: Run Commands and Log Analysis now keep completely separate results, files and status - nothing from one tab shows up in the other.",
+        "Diagnosis > Log Analysis: download a CSV, Excel or PDF report for the ticked switches once their analysis has finished.",
+        "Pre-check, post-check and readiness check now also read the stack status (show switch), the stack ports (show switch stack-ports) and the stack power (show stack-power), save them in the check files and flag members that go missing or are no longer Ready, stack ports that go down, and power-stack changes."]},
     {"version": "5.16.0", "date": "2026-10-28", "features": [
         "New Diagnosis tab between Diagram and Storage. Run Commands: type read-only commands, run them on several switches at once and keep every output in Storage under Diagnosis.",
         "Diagnosis > Log Analysis: reads each switch's log and checks it locally against built-in rules (stack, power/fan/temperature, flash, crashes, reloads, failed installs, flapping ports) and gives a green / amber / red advisory verdict with the evidence. It never blocks or starts an upgrade.",
@@ -1190,6 +1194,11 @@ def compute_readiness_verdict(checks):
         down_po = [n for n, v in sorted(snap["po"].items()) if "U" not in v["flags"]]
         if down_po:
             warnings.append(f"port-channel(s) down: {_names(down_po)}")
+        if len(snap.get("stack_members") or {}) > 1:      # a stack cable that is down splits the stack when a member reloads
+            down_sp = [f"switch {sw} port {i}" for sw, p in sorted((snap.get("stack_ports") or {}).items(), key=lambda kv: int(kv[0]))
+                       for i, x in enumerate(p, 1) if x.lower() == "down"]
+            if down_sp:
+                warnings.append(f"stack port(s) down: {_names(down_sp)}")
 
     if problems:
         return "not_ready", "; ".join(problems)
@@ -1214,10 +1223,34 @@ SNAPSHOT_COMMANDS = [
     ("vlan_brief", "show vlan brief"),
     ("int_trunk", "show interfaces trunk"),
     ("etherchannel", "show etherchannel summary"),
+    ("stack_members", "show switch"),                  # stack member status (role / state)
+    ("stack_ports", "show switch stack-ports"),        # stack cables / ports
+    ("stack_power", "show stack-power"),               # power-stack status (not on every platform - then it is skipped)
 ]
 POSTCHECK_SETTLE = 90         # seconds to let ports/port-channels come up after the reload
 POSTCHECK_RETRIES = 3         # extra tries when something still differs from before the upgrade
 POSTCHECK_RETRY_WAIT = 60
+
+
+def parse_stack_ports(text):
+    """{stack member number (text): [status of port 1, status of port 2]} from 'show switch stack-ports'; {} when not usable."""
+    out = {}
+    if not text or re.search(r"(?im)^\s*%\s*(invalid|ambiguous|incomplete)", text):
+        return out
+    for m in re.finditer(r"(?m)^\s*(\d+)\s+(\S+)\s+(\S+)\s*$", text):
+        out[m.group(1)] = [m.group(2), m.group(3)]
+    return out
+
+
+def parse_stack_power(text):
+    """{power stack name: {mode, topology, total, sw, ps}} from 'show stack-power'; {} when not usable / no power stack."""
+    out = {}
+    if not text or re.search(r"(?im)^\s*%\s*(invalid|ambiguous|incomplete)", text):
+        return out
+    for m in re.finditer(r"(?m)^(\S+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", text):
+        out[m.group(1)] = {"mode": m.group(2), "topology": m.group(3), "total": int(m.group(4)),
+                           "sw": int(m.group(8)), "ps": int(m.group(9))}
+    return out
 
 
 def parse_snapshot(outputs):
@@ -1253,12 +1286,18 @@ def parse_snapshot(outputs):
         po[m.group(1)] = {"flags": m.group(2), "members": len(members),
                           "bundled": sum(1 for f in members if f == "P")}
     ec_text = outputs.get("etherchannel", "")
+    members = {str(r["switch"]): {"role": r["role"], "state": r["state"]}
+               for r in (parse_show_switch(outputs.get("stack_members", "")) or [])}
+    stack_ports = parse_stack_ports(outputs.get("stack_ports", "")) if len(members) > 1 else {}
+    stack_power = parse_stack_power(outputs.get("stack_power", ""))
     return {"ip_up": sorted(ip_up), "connected": sorted(connected), "err_disabled": sorted(err_disabled),
             "vlans": sorted(vlans, key=int), "trunks": sorted(trunks), "po": po,
+            "stack_members": members, "stack_ports": stack_ports, "stack_power": stack_power,
             "ok": {"ip_int_brief": ip_rows, "int_status": st_rows > 0,
                    "vlan_brief": bool(vlans),
                    "int_trunk": tr_rows > 0 or "Port" in outputs.get("int_trunk", ""),
-                   "etherchannel": "channel-groups" in ec_text or bool(po)}}
+                   "etherchannel": "channel-groups" in ec_text or bool(po),
+                   "stack_members": bool(members), "stack_ports": bool(stack_ports), "stack_power": bool(stack_power)}}
 
 
 def summarize_snapshot(snap):
@@ -1269,6 +1308,18 @@ def summarize_snapshot(snap):
         parts.append(f"{po_up}/{len(snap['po'])} port-channel(s) up")
     if snap["err_disabled"]:
         parts.append(f"{len(snap['err_disabled'])} err-disabled")
+    members = snap.get("stack_members") or {}            # .get: snapshots saved by older versions have no stack data
+    if len(members) > 1:
+        ready = sum(1 for v in members.values() if v["state"].lower() == "ready")
+        parts.append(f"stack {ready}/{len(members)} member(s) Ready")
+        ports = snap.get("stack_ports") or {}
+        if ports:
+            down = sum(1 for p in ports.values() for x in p if x.lower() == "down")
+            parts.append(f"{down} stack port(s) down" if down else "stack ports OK")
+    power = snap.get("stack_power") or {}
+    if power:
+        parts.append("stack-power: " + ", ".join(f"{n} {v['topology']} ({v['sw']} switch(es), {v['ps']} PSU)"
+                                                  for n, v in list(power.items())[:2]))
     return ", ".join(parts)
 
 
@@ -1300,6 +1351,33 @@ def compare_snapshots(pre, post):
         lost = sorted(set(pre["trunks"]) - set(post["trunks"]))
         if lost:
             issues.append(f"trunk(s) not trunking any more: {_names(lost)}")
+    if both("stack_members"):
+        pm, qm = pre["stack_members"], post["stack_members"]
+        gone = sorted(set(pm) - set(qm), key=int)
+        if gone:
+            issues.append(f"stack member(s) missing: {_names('switch ' + n for n in gone)}")
+        worse = [n for n in sorted(set(pm) & set(qm), key=int)
+                 if pm[n]["state"].lower() == "ready" and qm[n]["state"].lower() != "ready"]
+        if worse:
+            issues.append("stack member(s) no longer Ready: " + _names(f"switch {n} ({qm[n]['state']})" for n in worse))
+    if both("stack_ports"):
+        bad = [f"switch {sw} port {i}" for sw, was in sorted(pre["stack_ports"].items(), key=lambda kv: int(kv[0]))
+               for i, (a, b) in enumerate(zip(was, post["stack_ports"].get(sw, was)), 1)
+               if a.lower() == "ok" and b.lower() != "ok"]
+        if bad:
+            issues.append(f"stack port(s) not OK any more: {_names(bad)}")
+    if both("stack_power"):
+        for name, was in sorted(pre["stack_power"].items()):
+            now = post["stack_power"].get(name)
+            if now is None:
+                issues.append(f"power stack {name} is missing")
+                continue
+            if now["topology"] != was["topology"]:
+                issues.append(f"power stack {name}: topology {was['topology']} -> {now['topology']}")
+            if now["sw"] < was["sw"]:
+                issues.append(f"power stack {name} has {now['sw']} switch(es), had {was['sw']}")
+            if now["ps"] < was["ps"]:
+                issues.append(f"power stack {name} has {now['ps']} power supply(ies), had {was['ps']}")
     if both("etherchannel"):
         for name, was in sorted(pre["po"].items()):
             now = post["po"].get(name)
@@ -1406,6 +1484,11 @@ def evaluate_postcheck(conn, expected_version, pre):
             warnings.append(health["stack"] + (" (before the upgrade: {})".format(PRE_STACK)
                                                if PRE_STACK else ""))
     issues = compare_snapshots(pre, snap) if pre else []
+    if snap.get("stack_ports") and not (pre and (pre.get("ok") or {}).get("stack_ports")):
+        down = [f"switch {sw} port {i}" for sw, p in sorted(snap["stack_ports"].items(), key=lambda kv: int(kv[0]))
+                for i, x in enumerate(p, 1) if x.lower() == "down"]
+        if down:
+            issues.append(f"stack port(s) down: {_names(down)} (no earlier snapshot to compare)")
     warnings += issues
     checks = {"version": version, "cpu_pct": health["cpu_pct"], "mem_free_pct": health["mem_free_pct"],
               "stack": health["stack"], "summary": summarize_snapshot(snap), "issues": issues,
@@ -5576,6 +5659,276 @@ def format_analysis_report(a, files=None):
     return "\n".join(out) + "\n"
 
 
+
+# ---- Log-analysis reports for the ticked switches: CSV, Excel, PDF ----
+DIAG_REPORT_FORMATS = {"csv": ("text/csv; charset=utf-8", "csv"),
+                       "xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"),
+                       "pdf": ("application/pdf", "pdf")}
+_REPORT_FINDING_HEAD = ["Switch", "IP address", "Verdict", "Analyzed", "Look-back", "Level", "Category", "Finding", "Count",
+                        "First seen", "Last seen", "What to do", "Evidence"]
+_REPORT_SUMMARY_HEAD = ["Switch", "IP address", "Verdict", "Advice", "Analyzed", "Look-back", "Critical", "Warnings", "Info",
+                        "Log lines", "Log from", "Log to", "Version", "Uptime", "Last reload", "Stack", "Err-disabled ports", "Notes",
+                        "Raw output file", "Report file"]
+
+
+def _report_lookback(a):
+    return "whole log buffer" if not a.get("lookback_hours") else f"{a['lookback_hours']} hours"
+
+
+def _report_counts(a):
+    c = collections.Counter(f["level"] for f in a["findings"])
+    return c["crit"], c["warn"], c["info"]
+
+
+def diag_summary_rows(analyses):
+    rows = []
+    for a in analyses:
+        crit, warn, info = _report_counts(a)
+        f = a.get("facts") or {}
+        stack = "; ".join(f"switch {r['switch']} {r['role']} {r['state']}" for r in f.get("stack", []))
+        rows.append([a["label"], a["host"], a["verdict"].upper(), a["verdict_text"], a["time"], _report_lookback(a), crit, warn, info,
+                     a["buffer"]["lines"], a["buffer"]["first"], a["buffer"]["last"], f.get("version", ""), f.get("uptime", ""),
+                     f.get("reload_reason", ""), stack, f.get("err_disabled", ""), " | ".join(a.get("notes", [])),
+                     (a.get("files") or {}).get("logs", ""), (a.get("files") or {}).get("report", "")])
+    return rows
+
+
+def diag_finding_rows(analyses):
+    rows = []
+    for a in analyses:
+        base = [a["label"], a["host"], a["verdict"].upper(), a["time"], _report_lookback(a)]
+        if not a["findings"]:
+            rows.append(base + ["-", "-", "No findings", 0, "", "", "", ""])
+        for f in a["findings"]:
+            rows.append(base + [_LEVEL_LABEL[f["level"]], f["category"], f["title"], f["count"], f["first"], f["last"], f["advice"],
+                                "\n".join(f["examples"])])
+    return rows
+
+
+def build_diag_csv(analyses):
+    buf = io.StringIO(newline="")
+    w = csv.writer(buf)
+    w.writerow(_REPORT_FINDING_HEAD)
+    for r in diag_finding_rows(analyses):
+        w.writerow([_csv_safe(c) for c in r])
+    return ("\ufeff" + buf.getvalue()).encode("utf-8")           # BOM so Excel opens the UTF-8 file correctly
+
+
+def _csv_safe(v):
+    """Stop spreadsheet programs from running a CSV cell that starts with = + - @ as a formula."""
+    if isinstance(v, str) and v and (v[0] in "=+@" or (v[0] == "-" and len(v) > 1)):
+        return "'" + v
+    return v
+
+
+def build_diag_xlsx(analyses):
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    head_fill, head_font = PatternFill("solid", fgColor="1F4E78"), Font(bold=True, color="FFFFFF")
+    verdict_fill = {"GREEN": "C6EFCE", "AMBER": "FFEB9C", "RED": "FFC7CE"}
+    level_fill = {"CRITICAL": "FFC7CE", "WARNING": "FFEB9C", "INFO": "DDEBF7"}
+
+    def sheet(ws, head, rows, widths, verdict_col=None, level_col=None):
+        ws.append(head)
+        for c in ws[1]:
+            c.fill, c.font, c.alignment = head_fill, head_font, Alignment(vertical="center", wrap_text=True)
+        for r in rows:
+            ws.append(list(r))
+        for row in ws.iter_rows(min_row=2):
+            for c in row:
+                c.alignment = Alignment(vertical="top", wrap_text=True)
+                if isinstance(c.value, str) and c.value.startswith("="):
+                    c.data_type = "s"                      # keep text that starts with = as text, never as a formula
+            if verdict_col is not None and row[verdict_col].value in verdict_fill:
+                row[verdict_col].fill = PatternFill("solid", fgColor=verdict_fill[row[verdict_col].value])
+            if level_col is not None and row[level_col].value in level_fill:
+                row[level_col].fill = PatternFill("solid", fgColor=level_fill[row[level_col].value])
+        for i, wdt in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = wdt
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+    ws = wb.active
+    ws.title = "Summary"
+    sheet(ws, _REPORT_SUMMARY_HEAD, diag_summary_rows(analyses),
+          [22, 16, 10, 46, 19, 16, 9, 9, 7, 10, 16, 16, 14, 28, 26, 34, 12, 50, 34, 34], verdict_col=2)
+    sheet(wb.create_sheet("Findings"), _REPORT_FINDING_HEAD, diag_finding_rows(analyses),
+          [22, 16, 10, 19, 16, 10, 12, 38, 8, 16, 16, 60, 70], verdict_col=2, level_col=5)
+    top = []
+    for a in analyses:
+        for t in a.get("top", []):
+            top.append([a["label"], a["host"], t["count"], t["key"], t["example"]])
+    sheet(wb.create_sheet("Top messages"), ["Switch", "IP address", "Count", "Message ID", "Example"], top, [22, 16, 8, 30, 110])
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+# --- a tiny PDF writer (text + coloured boxes), so no extra library is needed ---
+_HELV = [278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278] + [556] * 10 + [278, 278, 584, 584, 584, 556, 1015,
+        667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611,
+        278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, 556, 556, 333, 500, 278,
+        556, 500, 722, 500, 500, 500, 334, 260, 334, 584]
+
+
+def _pdf_width(text, size, font):
+    if font == "F3":
+        return len(text) * size * 0.6
+    w = sum(_HELV[ord(c) - 32] if 32 <= ord(c) < 127 else 556 for c in text) * size / 1000.0
+    return w * (1.06 if font == "F2" else 1.0)
+
+
+def _pdf_wrap(text, width, size, font):
+    lines = []
+    for para in str(text).split("\n"):
+        words, cur = para.split(" "), ""
+        for w in words:
+            while font == "F3" and _pdf_width(w, size, font) > width:       # a long unbroken token (monospace evidence)
+                k = max(1, int(width // (size * 0.6)))
+                if cur:
+                    lines.append(cur)
+                    cur = ""
+                lines.append(w[:k])
+                w = w[k:]
+            trial = (cur + " " + w) if cur else w
+            if cur and _pdf_width(trial, size, font) > width:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = trial
+        lines.append(cur)
+    return lines
+
+
+class _MiniPdf:
+    W, H, M = 595.0, 842.0, 40.0
+
+    def __init__(self, title):
+        self.title, self.pages, self.cur, self.y = title, [], None, 0.0
+        self._new_page()
+
+    def _new_page(self):
+        self.cur = []
+        self.pages.append(self.cur)
+        self.y = self.H - self.M
+
+    def _need(self, h):
+        if self.y - h < self.M + 14:
+            self._new_page()
+
+    @staticmethod
+    def _enc(t):
+        return t.encode("cp1252", "replace").decode("latin-1").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    def rect(self, x, y, w, h, rgb):
+        self.cur.append(f"{rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} rg {x:.1f} {y:.1f} {w:.1f} {h:.1f} re f")
+
+    def line(self, text, font="F1", size=9.5, indent=0.0, rgb=(0, 0, 0), after=2.0, bg=None):
+        width = self.W - 2 * self.M - indent
+        for ln in _pdf_wrap(text, width, size, font):
+            lh = size * 1.28
+            self._need(lh)
+            if bg:
+                self.rect(self.M + indent - 3, self.y - lh + 2, width + 6, lh, bg)
+            self.cur.append(f"BT /{font} {size:.1f} Tf {rgb[0]:.3f} {rgb[1]:.3f} {rgb[2]:.3f} rg {self.M + indent:.1f} {self.y - size:.1f} Td ({self._enc(ln)}) Tj ET")
+            self.y -= lh
+        self.y -= after
+
+    def gap(self, h):
+        self.y -= h
+
+    def bar(self, text, rgb, fg=(0, 0, 0)):
+        self._need(20)
+        self.rect(self.M, self.y - 17, self.W - 2 * self.M, 18, rgb)
+        self.cur.append(f"BT /F2 11 Tf {fg[0]:.3f} {fg[1]:.3f} {fg[2]:.3f} rg {self.M + 6:.1f} {self.y - 13:.1f} Td ({self._enc(text[:95])}) Tj ET")
+        self.y -= 24
+
+    def build(self):
+        import zlib
+        n = len(self.pages)
+        objs = [None] * (4 + n * 2 + 1)                      # 1 catalog, 2 pages, 3.. fonts, then page + stream pairs
+        objs[0] = b"<< /Type /Catalog /Pages 2 0 R >>"
+        kids = " ".join(f"{5 + i * 2} 0 R" for i in range(n))
+        objs[1] = f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode()
+        objs[2] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+        objs[3] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"
+        courier = b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>"
+        for i, ops in enumerate(self.pages):
+            foot = f"BT /F1 8 Tf 0.4 0.4 0.4 rg {self.M:.1f} 22 Td ({self._enc(self.title)}) Tj ET BT /F1 8 Tf 0.4 0.4 0.4 rg {self.W - self.M - 50:.1f} 22 Td (Page {i + 1} of {n}) Tj ET"
+            data = zlib.compress(("\n".join(ops) + "\n" + foot).encode("latin-1"))
+            objs[4 + i * 2 + 1] = b"<< /Filter /FlateDecode /Length %d >>\nstream\n" % len(data) + data + b"\nendstream"
+            objs[4 + i * 2] = (f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {self.W:.0f} {self.H:.0f}] /Contents {6 + i * 2} 0 R "
+                               f"/Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 {5 + n * 2} 0 R >> >> >>").encode()
+        objs[4 + n * 2] = courier
+        out, offs = bytearray(b"%PDF-1.4\n"), []
+        for i, o in enumerate(objs):
+            offs.append(len(out))
+            out += f"{i + 1} 0 obj\n".encode() + o + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+        for o in offs:
+            out += f"{o:010d} 00000 n \n".encode()
+        out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+        return bytes(out)
+
+
+def build_diag_pdf(analyses, site=""):
+    title = "Log analysis report" + (f" - {site}" if site else "")
+    pdf = _MiniPdf(title)
+    pdf.line(title, "F2", 17, after=4)
+    pdf.line(f"Generated {now_str()}  |  {len(analyses)} switch(es)  |  advisory results of built-in rules - read the evidence and decide yourself.",
+             "F1", 9, rgb=(0.35, 0.35, 0.35), after=8)
+    colors = {"green": (0.78, 0.94, 0.81), "amber": (1.0, 0.92, 0.61), "red": (1.0, 0.78, 0.81)}
+    pdf.line("Summary", "F2", 12, after=3)
+    for a in analyses:
+        crit, warn, info = _report_counts(a)
+        pdf.line(f"{a['verdict'].upper():<6} {a['label']} ({a['host']})  -  critical {crit}, warnings {warn}, info {info}",
+                 "F1", 9.5, bg=colors[a["verdict"]], after=1.5)
+    pdf.gap(8)
+    for a in analyses:
+        pdf._need(70)
+        pdf.bar(f"{a['label']}  ({a['host']})  -  {a['verdict'].upper()}", colors[a["verdict"]])
+        pdf.line(a["verdict_text"], "F2", 10, after=2)
+        b = a["buffer"]
+        pdf.line(f"Analyzed {a['time']}  |  {_report_lookback(a)}  |  {b['lines']} log message(s)" + (f", {b['first']} to {b['last']}" if b["first"] else ""),
+                 "F1", 8.5, rgb=(0.35, 0.35, 0.35), after=1)
+        f = a.get("facts") or {}
+        facts = [f"version {f['version']}" if f.get("version") else "", f"uptime {f['uptime']}" if f.get("uptime") else "",
+                 f"last reload: {f['reload_reason']}" if f.get("reload_reason") else "",
+                 ("stack: " + ", ".join(f"{r['switch']} {r['state']}" for r in f["stack"])) if f.get("stack") else "",
+                 f"{f['err_disabled']} err-disabled port(s)" if isinstance(f.get("err_disabled"), int) else ""]
+        facts = [x for x in facts if x]
+        if facts:
+            pdf.line(" | ".join(facts), "F1", 8.5, rgb=(0.35, 0.35, 0.35), after=1)
+        for n in a.get("notes", []):
+            pdf.line("Note: " + n, "F1", 8.5, rgb=(0.35, 0.35, 0.35), after=1)
+        pdf.gap(3)
+        if not a["findings"]:
+            pdf.line("No findings.", "F1", 9.5, after=6)
+        for fd in a["findings"]:
+            span = f"  {fd['first']} to {fd['last']}" if fd["first"] and fd["last"] != fd["first"] else (f"  {fd['first']}" if fd["first"] else "")
+            col = {"crit": (0.78, 0.16, 0.23), "warn": (0.6, 0.4, 0.0), "info": (0.04, 0.42, 0.66)}[fd["level"]]
+            pdf.line(f"[{_LEVEL_LABEL[fd['level']]}] {fd['title']}  ({fd['category']}, {fd['count']}x{span})", "F2", 9.5, rgb=col, after=1)
+            pdf.line("What to do: " + fd["advice"], "F1", 9, indent=10, after=1)
+            for ex in fd["examples"]:
+                pdf.line(ex, "F3", 7.5, indent=10, rgb=(0.25, 0.25, 0.25), after=0.5)
+            pdf.gap(4)
+        pdf.gap(8)
+    return pdf.build()
+
+
+def build_diag_report(fmt, analyses, site=""):
+    if fmt == "csv":
+        return build_diag_csv(analyses)
+    if fmt == "xlsx":
+        return build_diag_xlsx(analyses)
+    if fmt == "pdf":
+        return build_diag_pdf(analyses, site)
+    raise ValueError("format")
+
+
 # ---- optional cloud AI second opinion (Settings > AI Analysis). Off by default; the local rules never need it. ----
 AI_SETTINGS_FILENAME = "ai_settings.json"
 AI_PROVIDERS = {"anthropic": "Anthropic (Claude)", "openai": "OpenAI-compatible (any server with /chat/completions)"}
@@ -5800,7 +6153,7 @@ class Manager:
         self.topo_lock = threading.RLock()  # Diagram tab: guards topology.json and the scan progress below
         self.topo_run = None                # the latest CDP topology scan of the active site
         self.diag_lock = threading.RLock()  # Diagnosis tab: guards the run below and the analyses
-        self.diag_run = None                # the latest Diagnosis run (commands or log analysis) of the active site
+        self.diag_runs = {"commands": None, "logs": None}   # the latest Run Commands run and the latest Log Analysis run of the active site (kept apart)
         self.diag_results = {}              # {host: latest log analysis} of the active site
         self.pool = ThreadPoolExecutor(max_workers=BACKUP_WORKERS)
         self.job_tmp = tempfile.mkdtemp(prefix="swmgr_")  # private dir (0700) for credential job files
@@ -5863,7 +6216,7 @@ class Manager:
             self.jobs = {}
             self.backup_run = None
             self.topo_run = None
-            self.diag_run = None
+            self.diag_runs = {"commands": None, "logs": None}
             self.diag_results = {}
             try:
                 self.profiles, self.assign = load_site_profiles(name)
@@ -7632,6 +7985,8 @@ class Manager:
         job, up = self.jobs.get(host), self.ops[host]["upgrade"]
         if job is None or up["state"] in TERMINAL:
             return
+        if up.get("phase") == "waiting_backup":
+            return          # the pre-upgrade backup is still running: self.jobs still holds the PREVIOUS run's worker, whose old status must not overwrite this run's progress
         data = read_json_file(job["status_path"])
         if data:
             self._apply_status(host, job, data)
@@ -7970,14 +8325,15 @@ class Manager:
             cred_ok = {h: self.assign.get(h) in self.profiles for h in order}
             profile = {h: self.assign.get(h) for h in order}
         with self.diag_lock:
-            run = self.diag_run if (self.diag_run and self.diag_run.get("site") == site) else None
-            run_copy = None if run is None else {k: (v if k != "hosts" else {h: dict(x) for h, x in v.items()})
-                                                  for k, v in run.items()}
+            runs = {}
+            for kind, run in self.diag_runs.items():
+                runs[kind] = None if (run is None or run.get("site") != site) else {
+                    k: (v if k != "hosts" else {h: dict(x) for h, x in v.items()}) for k, v in run.items()}
             results = {h: a for h, a in self.diag_results.items() if h in info} if site else {}
         devices = [{"host": h, "label": info[h].get("label") or h, "platform": info[h].get("platform") or "",
                     "has_creds": cred_ok[h], "profile": profile[h] if cred_ok[h] else None} for h in order]
         cfg = self.ai_cfg
-        return {"site": site, "devices": devices, "run": run_copy, "results": results,
+        return {"site": site, "devices": devices, "runs": runs, "results": results,
                 "commands": self._diag_commands_saved() if site else "",
                 "lookbacks": list(DIAG_LOOKBACK_HOURS), "log_commands": list(DIAG_LOG_COMMANDS),
                 "allowed_words": list(DIAG_COMMAND_WORDS), "max_commands": DIAG_MAX_COMMANDS,
@@ -7993,8 +8349,9 @@ class Manager:
             busy = {h for h in hosts if self._upgrade_active(h)}
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         with self.diag_lock:
-            if self.diag_run and self.diag_run.get("site") == self.site_name and not self.diag_run["finished"]:
-                raise ApiError("A Diagnosis run is already in progress - wait for it to finish.", 409)
+            cur = self.diag_runs.get(kind)
+            if cur and cur.get("site") == self.site_name and not cur["finished"]:
+                raise ApiError("A " + ("Run Commands" if kind == "commands" else "Log Analysis") + " run is already in progress - wait for it to finish.", 409)
             run = {"kind": kind, "site": self.site_name, "stamp": stamp, "started": now_str(), "finished": None,
                    "total": len(hosts), "done": 0, "hosts": {h: {"state": "queued", "detail": "", "file": ""} for h in hosts}}
             run.update(extra)
@@ -8003,7 +8360,7 @@ class Manager:
                 run["done"] += 1
             if run["done"] >= run["total"]:
                 run["finished"] = now_str()
-            self.diag_run = run
+            self.diag_runs[kind] = run
             if kind == "logs":
                 for h in hosts:
                     self.diag_results.pop(h, None)
@@ -8015,9 +8372,9 @@ class Manager:
         (folder / name).write_text(text, encoding="utf-8")
         return f"{SITE_DIAG_SUBDIR}/{folder.name}/{name}"
 
-    def _diag_set(self, site, host, state, detail, file=""):
+    def _diag_set(self, site, kind, host, state, detail, file=""):
         with self.diag_lock:
-            run = self.diag_run
+            run = self.diag_runs.get(kind)
             if run and run.get("site") == site and host in run["hosts"]:
                 run["hosts"][host] = {"state": state, "detail": detail, "file": file}
                 if state in ("ok", "failed"):
@@ -8060,7 +8417,7 @@ class Manager:
 
     @activity("Diagnosis")
     def _diag_commands_one(self, host, site, stamp, commands, username, password, secret):
-        self._diag_set_running(site, host, "Connecting ...")
+        self._diag_set_running(site, "commands", host, "Connecting ...")
         label = self.label(host) if host in self.info else host
         state, detail, rel = "failed", "", ""
         try:
@@ -8077,12 +8434,12 @@ class Manager:
             detail = "Connection timed out"
         except Exception as exc:  # noqa: BLE001
             detail = f"{type(exc).__name__}: {exc}"[:160]
-        self._diag_set(site, host, state, detail, rel)
+        self._diag_set(site, "commands", host, state, detail, rel)
         self.events.add(host, label, f"Diagnosis commands: {detail}", "ok" if state == "ok" else "bad")
 
-    def _diag_set_running(self, site, host, detail):
+    def _diag_set_running(self, site, kind, host, detail):
         with self.diag_lock:
-            run = self.diag_run
+            run = self.diag_runs.get(kind)
             if run and run.get("site") == site and host in run["hosts"]:
                 run["hosts"][host] = {"state": "running", "detail": detail, "file": ""}
 
@@ -8105,14 +8462,14 @@ class Manager:
 
     @activity("Diagnosis")
     def _diag_logs_one(self, host, site, stamp, lookback, username, password, secret):
-        self._diag_set_running(site, host, "Connecting ...")
+        self._diag_set_running(site, "logs", host, "Connecting ...")
         label = self.label(host) if host in self.info else host
         try:
             got = self._diag_collect(host, username, password, secret, DIAG_LOG_COMMANDS)
             sections = {c: (o if not e else "") for c, o, e in got}
             if not any(sections.values()):
                 raise RuntimeError("The switch returned no output")
-            self._diag_set_running(site, host, "Analyzing ...")
+            self._diag_set_running(site, "logs", host, "Analyzing ...")
             raw = command_sections_text(f"Log collection - {label} ({host}) - {now_str()}",
                                         [(c, o if not e else f"(command failed: {e})") for c, o, e in got])
             raw_rel = self._diag_write(site, host, f"logs_{stamp}.txt", raw)
@@ -8123,18 +8480,40 @@ class Manager:
             with self.diag_lock:
                 if self.site_name == site:
                     self.diag_results[host] = a
-            self._diag_set(site, host, "ok", a["verdict_text"], a["files"]["report"])
+            self._diag_set(site, "logs", host, "ok", a["verdict_text"], a["files"]["report"])
             self.events.add(host, label, f"Log analysis: {a['verdict'].upper()} - {a['verdict_text']}",
                             {"green": "ok", "amber": "info", "red": "bad"}[a["verdict"]])
         except NetmikoAuthenticationException:
-            self._diag_set(site, host, "failed", "Authentication failed")
+            self._diag_set(site, "logs", host, "failed", "Authentication failed")
             self.events.add(host, label, "Log analysis: authentication failed", "bad")
         except NetmikoTimeoutException:
-            self._diag_set(site, host, "failed", "Connection timed out")
+            self._diag_set(site, "logs", host, "failed", "Connection timed out")
             self.events.add(host, label, "Log analysis: connection timed out", "bad")
         except Exception as exc:  # noqa: BLE001
-            self._diag_set(site, host, "failed", f"{type(exc).__name__}: {exc}"[:160])
+            self._diag_set(site, "logs", host, "failed", f"{type(exc).__name__}: {exc}"[:160])
             self.events.add(host, label, f"Log analysis failed: {type(exc).__name__}", "bad")
+
+    def diag_report(self, fmt, hosts_csv):
+        """(bytes, content type, file name) - a CSV / Excel / PDF report of the finished log analyses of the given switches."""
+        fmt = str(fmt or "").lower()
+        if fmt not in DIAG_REPORT_FORMATS:
+            raise ApiError("Choose csv, xlsx or pdf.")
+        hosts = [h.strip() for h in str(hosts_csv or "").split(",") if h.strip()]
+        with self.diag_lock:
+            site = self.site_name
+            run = self.diag_runs.get("logs")
+            if run and run.get("site") == site and not run["finished"]:
+                raise ApiError("The log analysis is still running - download the report when it has finished.", 409)
+            analyses = [self.diag_results[h] for h in dict.fromkeys(hosts) if h in self.diag_results]
+        if not analyses:
+            raise ApiError("None of the selected switches has a finished log analysis.", 404)
+        try:
+            data = build_diag_report(fmt, analyses, site or "")
+        except ImportError:
+            raise ApiError("Excel reports need the openpyxl package.", 500)
+        name = f"log_analysis_{safe_name(site or 'site')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{DIAG_REPORT_FORMATS[fmt][1]}"
+        self.events.add("-", "", f"Log analysis report ({fmt.upper()}) downloaded for {len(analyses)} switch(es)", "info")
+        return data, DIAG_REPORT_FORMATS[fmt][0], name
 
     # ---- optional AI second opinion (Settings > AI Analysis) ---------------------------------------------- #
     def ai_settings_view(self):
@@ -9367,6 +9746,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dx-ai pre { margin:6px 0 0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 inherit; font-family:inherit; }
   .dx-line { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--pn); font-size:13px; }
   .dx-line .sp { margin-left:auto; display:flex; gap:6px; }
+  .dx-rep { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px; padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--pn); font-size:13px; }
+  .dx-rep[hidden] { display:none; }
+  .dx-rep .sp { margin-left:auto; display:flex; gap:6px; }
   @media (max-width: 900px) { .dx-grid { grid-template-columns:1fr; } .dx-pick { border-right:0; border-bottom:1px solid var(--bd); max-height:260px; } }
   .dg-side { width:300px; }
   .dg-sec { padding:0 14px 14px; }
@@ -10338,6 +10720,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <button type="button" class="btn p" id="dx-analyze" disabled>Analyze Logs</button></div>
           </div>
           <div class="msg" id="dx-msg" role="status" aria-live="polite"></div>
+          <div class="dx-rep" id="dx-rep" hidden></div>
           <div class="dx-res" id="dx-res"></div>
         </div>
       </div>
@@ -13723,15 +14106,18 @@ document.addEventListener("keydown", e => { if (e.key === "Escape" && $("dg-card
 
 // ---- Diagnosis tab: run read-only commands on switches, or analyze their logs locally ----
 const DX_SAMPLE = "show ip interface brief\nshow version\nshow logging";
-const dx = {data: null, tool: "cmd", picked: new Set(), busy: false, timer: null, tick: 0, site: null, resKey: "", listKey: "",
-            wasRunning: false, open: new Set(), cmdInit: false, aiBusy: new Set()};
+const dx = {data: null, tool: "cmd", picked: new Set(), busy: false, timer: null, tick: 0, site: null, resKey: null, listKey: "", repKey: "",
+            was: {commands: false, logs: false}, open: new Set(), cmdInit: false, aiBusy: new Set()};
+// Run Commands and Log Analysis keep separate runs and separate results; each tab only ever shows its own.
+const dxKind = () => dx.tool === "cmd" ? "commands" : "logs";
+const dxOn = r => !!(r && !r.finished);
 const dxSay = (kind, text) => { const m = $("dx-msg"); m.className = "msg " + kind; m.textContent = text || ""; };
 function openDiagnosis() { dxStop(); dxLoad(true); dx.timer = setInterval(dxTick, 2000); }
 function dxStop() { if (dx.timer) { clearInterval(dx.timer); dx.timer = null; } }
 function dxTick() {
   if ($("diagnosis").hidden) { dxStop(); return; }
   dx.tick++;
-  const running = dx.data && dx.data.run && !dx.data.run.finished;
+  const running = dx.data && (dxOn(dx.data.runs.commands) || dxOn(dx.data.runs.logs));
   if (running || dx.tick % 5 === 0 || (siteName || null) !== (dx.site || null)) dxLoad(false);
 }
 async function dxLoad(force) {
@@ -13739,13 +14125,16 @@ async function dxLoad(force) {
   dx.busy = true;
   try {
     const d = await getJSON("/api/diag");
-    if (d.site !== dx.site) { dx.site = d.site; dx.picked = new Set(); dx.listKey = ""; dx.resKey = ""; dx.open = new Set(); dx.cmdInit = false; }
-    const running = !!(d.run && !d.run.finished);
-    if (dx.wasRunning && !running && d.run) {
-      const hs = Object.values(d.run.hosts), ok = hs.filter(x => x.state === "ok").length;
-      dxSay(ok === hs.length ? "ok" : "err", (d.run.kind === "logs" ? "Log analysis" : "Commands") + " finished: " + ok + " of " + hs.length + " switch(es) succeeded.");
+    if (d.site !== dx.site) { dx.site = d.site; dx.picked = new Set(); dx.listKey = ""; dx.resKey = null; dx.repKey = ""; dx.open = new Set(); dx.cmdInit = false; }
+    for (const k of ["commands", "logs"]) {
+      const r = d.runs[k], on = dxOn(r);
+      if (dx.was[k] && !on && r && k === dxKind()) {
+        const hs = Object.values(r.hosts), ok = hs.filter(x => x.state === "ok").length;
+        dxSay(ok === hs.length ? "ok" : "err", (k === "logs" ? "Log analysis" : "Commands") + " finished: " + ok + " of " + hs.length + " switch(es) succeeded.");
+      }
+      dx.was[k] = on;
     }
-    dx.wasRunning = running; dx.data = d;
+    dx.data = d;
     if (!dx.cmdInit) { dx.cmdInit = true; $("dx-cmds").value = d.commands || DX_SAMPLE; }
     if (!$("dx-look").options.length) {
       $("dx-look").innerHTML = d.lookbacks.map(h => '<option value="' + h + '">' + (h === 0 ? "Whole log buffer" : h < 48 ? "Last " + h + " hours" : "Last " + (h / 24) + " days") + "</option>").join("");
@@ -13758,33 +14147,33 @@ async function dxLoad(force) {
 }
 function dxRender() {
   const d = dx.data; if (!d) return;
-  const cmd = dx.tool === "cmd", run = !!(d.run && !d.run.finished);
+  const cmd = dx.tool === "cmd", run = dxOn(d.runs[dxKind()]), runC = dxOn(d.runs.commands), runL = dxOn(d.runs.logs);
   document.querySelectorAll("#dx-nav button").forEach(b => { const on = b.dataset.dx === dx.tool; b.classList.toggle("on", on); b.setAttribute("aria-selected", String(on)); });
   $("dx-title").textContent = cmd ? "Run Commands" : "Log Analysis";
   $("dx-site").textContent = d.site ? "Site: " + d.site : "";
   $("dx-p-cmd").hidden = !cmd; $("dx-p-log").hidden = cmd;
-  dxRenderList(); dxRenderResults();
+  dxRenderList(); dxRenderResults(); dxRenderReports();
   const n = [...dx.picked].filter(h => d.devices.some(v => v.host === h && v.has_creds)).length;
-  $("dx-run").disabled = run || n === 0; $("dx-analyze").disabled = run || n === 0;
-  $("dx-run").textContent = run && d.run.kind === "commands" ? "Running " + d.run.done + "/" + d.run.total : "Run Commands" + (n ? " (" + n + ")" : "");
-  $("dx-analyze").textContent = run && d.run.kind === "logs" ? "Analyzing " + d.run.done + "/" + d.run.total : "Analyze Logs" + (n ? " (" + n + ")" : "");
+  $("dx-run").disabled = runC || n === 0; $("dx-analyze").disabled = runL || n === 0;
+  $("dx-run").textContent = runC ? "Running " + d.runs.commands.done + "/" + d.runs.commands.total : "Run Commands" + (n ? " (" + n + ")" : "");
+  $("dx-analyze").textContent = runL ? "Analyzing " + d.runs.logs.done + "/" + d.runs.logs.total : "Analyze Logs" + (n ? " (" + n + ")" : "");
   const pickable = d.devices.filter(v => v.has_creds).length, all = $("dx-all"), allOn = pickable > 0 && n === pickable;
   all.textContent = allOn ? "Clear" : "Select All"; all.dataset.mode = allOn ? "clear" : "all"; all.disabled = run || pickable === 0;
   $("dx-cmd-count").textContent = "";
 }
 function dxRenderList() {
-  const d = dx.data, run = !!(d.run && !d.run.finished), live = (typeof dgLive === "function") ? dgLive() : new Map();
+  const d = dx.data, kr = d.runs[dxKind()], run = dxOn(kr), live = (typeof dgLive === "function") ? dgLive() : new Map();
   let html = "";
   if (!d.site) html = '<div class="st-empty">No site selected. Create or select one from the Site menu on the Home page.</div>';
   else if (!d.devices.length) html = '<div class="st-empty">This site has no devices yet. Add them on the Home page first.</div>';
   for (const v of d.devices) {
-    const lv = live.get(v.host), st = lv ? lv.status : "PENDING", rs = d.run && d.run.hosts && d.run.hosts[v.host], an = d.results[v.host];
+    const lv = live.get(v.host), st = lv ? lv.status : "PENDING", rs = kr && kr.hosts[v.host], an = dx.tool === "log" ? d.results[v.host] : null;
     let line, cls = "";
     if (!v.has_creds) { line = "No credentials profile - assign one on the Home page"; cls = "warn"; }
     else if (rs && (rs.state === "queued" || rs.state === "running")) line = rs.state === "queued" ? "Waiting ..." : (rs.detail || "Working ...");
     else if (rs && rs.state === "failed") { line = rs.detail; cls = "bad"; }
     else if (rs && rs.state === "skipped") { line = rs.detail; cls = "warn"; }
-    else if (rs && rs.state === "ok") { line = d.run.kind === "logs" && an ? an.verdict.toUpperCase() : rs.detail; cls = d.run.kind === "logs" && an ? (an.verdict === "green" ? "ok" : an.verdict === "red" ? "bad" : "warn") : "ok"; }
+    else if (rs && rs.state === "ok") { line = an ? an.verdict.toUpperCase() : rs.detail; cls = an ? (an.verdict === "green" ? "ok" : an.verdict === "red" ? "bad" : "warn") : "ok"; }
     else if (an) { line = "Analyzed " + an.time + " - " + an.verdict.toUpperCase(); cls = an.verdict === "green" ? "ok" : an.verdict === "red" ? "bad" : "warn"; }
     else line = "Not run yet";
     html += '<label class="dg-dev' + (v.has_creds ? "" : " off") + '"><input type="checkbox" data-dxhost="' + esc(v.host) + '"' +
@@ -13832,7 +14221,7 @@ function dxRenderResults() {
   const d = dx.data, box = $("dx-res"); let html = "";
   const label = h => { const v = d.devices.find(x => x.host === h); return v ? v.label : h; };
   if (dx.tool === "cmd") {
-    const r = d.run && d.run.kind === "commands" ? d.run : null;
+    const r = d.runs.commands;
     if (r) {
       html += '<div class="dx-note">Run started ' + esc(r.started) + " - " + r.commands.length + " command(s): " + esc(r.commands.join("; ")) + "</div>";
       for (const [h, s] of Object.entries(r.hosts)) {
@@ -13842,7 +14231,7 @@ function dxRenderResults() {
       }
     }
   } else {
-    const r = d.run && d.run.kind === "logs" ? d.run : null, hosts = r ? Object.keys(r.hosts) : Object.keys(d.results);
+    const r = d.runs.logs, hosts = r ? Object.keys(r.hosts) : Object.keys(d.results);
     for (const h of hosts) {
       const a = d.results[h], s = r && r.hosts[h];
       if (a) html += dxAnalysisHtml(h, label(h), a, d.ai.enabled);
@@ -13855,6 +14244,28 @@ function dxRenderResults() {
   }
   if (html !== dx.resKey) { dx.resKey = html; box.innerHTML = html; }
 }
+// Reports (CSV / Excel / PDF) for the ticked switches that have a finished analysis
+function dxReportHosts() { const d = dx.data; return d ? [...dx.picked].filter(h => d.results[h]) : []; }
+function dxRenderReports() {
+  const box = $("dx-rep"), d = dx.data;
+  if (!d || dx.tool !== "log" || !Object.keys(d.results).length) { box.hidden = true; dx.repKey = ""; return; }
+  const hosts = dxReportHosts(), busy = dxOn(d.runs.logs), key = hosts.join(",") + "|" + busy;
+  box.hidden = false;
+  if (key === dx.repKey) return;
+  dx.repKey = key;
+  const dis = (busy || !hosts.length) ? " disabled" : "";
+  box.innerHTML = "<b>Download report</b><span class=\"dx-note\" style=\"margin:0\">" + (busy ? "available when the analysis is finished" :
+    hosts.length ? "for the " + hosts.length + " ticked switch(es) with a finished analysis" : "tick the switches to include (only analyzed ones are used)") + "</span>" +
+    '<span class="sp"><button type="button" class="btn sm" data-dx-rep="csv"' + dis + '>CSV</button><button type="button" class="btn sm" data-dx-rep="xlsx"' + dis +
+    '>Excel</button><button type="button" class="btn sm" data-dx-rep="pdf"' + dis + ">PDF</button></span>";
+}
+$("dx-rep").addEventListener("click", e => {
+  const b = e.target.closest("[data-dx-rep]"); if (!b || b.disabled) return;
+  const hosts = dxReportHosts(); if (!hosts.length) return;
+  const a = document.createElement("a");
+  a.href = "/api/diag/report?format=" + encodeURIComponent(b.dataset.dxRep) + "&hosts=" + encodeURIComponent(hosts.join(","));
+  a.download = ""; document.body.appendChild(a); a.click(); a.remove();
+});
 function dxOpenFile(rel) {
   if (!dx.site || !rel) return;
   if (stg.site !== dx.site) { stg.site = dx.site; stg.path = ""; stg.query = ""; }
@@ -13867,7 +14278,7 @@ function dxOpenFolder(folder) {
 }
 $("dx-nav").addEventListener("click", e => {
   const b = e.target.closest("[data-dx]"); if (!b) return;
-  dx.tool = b.dataset.dx; dx.resKey = ""; dxSay("", ""); if (dx.data) dxRender();
+  dx.tool = b.dataset.dx; dx.resKey = null; dx.listKey = ""; dx.repKey = ""; dxSay("", ""); if (dx.data) dxRender();
 });
 $("dx-list").addEventListener("change", e => {
   const h = e.target.dataset && e.target.dataset.dxhost; if (!h) return;
@@ -13882,14 +14293,14 @@ $("dx-all").addEventListener("click", () => {
 });
 $("dx-run").addEventListener("click", async () => {
   const hosts = [...dx.picked]; if (!hosts.length) return;
-  dxSay("", ""); dx.resKey = "";
-  try { const r = await post("/api/diag/commands", {hosts, commands: $("dx-cmds").value}); dxSay("ok", r.message); dx.wasRunning = true; await dxLoad(false); }
+  dxSay("", ""); dx.resKey = null;
+  try { const r = await post("/api/diag/commands", {hosts, commands: $("dx-cmds").value}); dxSay("ok", r.message); await dxLoad(false); }
   catch (e) { dxSay("err", e.message); }
 });
 $("dx-analyze").addEventListener("click", async () => {
   const hosts = [...dx.picked]; if (!hosts.length) return;
-  dxSay("", ""); dx.resKey = ""; dx.open = new Set();
-  try { const r = await post("/api/diag/logs", {hosts, lookback_hours: +$("dx-look").value}); dxSay("ok", r.message); dx.wasRunning = true; await dxLoad(false); }
+  dxSay("", ""); dx.resKey = null; dx.open = new Set();
+  try { const r = await post("/api/diag/logs", {hosts, lookback_hours: +$("dx-look").value}); dxSay("ok", r.message); await dxLoad(false); }
   catch (e) { dxSay("err", e.message); }
 });
 $("dx-res").addEventListener("click", async e => {
@@ -13899,10 +14310,10 @@ $("dx-res").addEventListener("click", async e => {
   const h = ai.dataset.dxAi, d = dx.data; if (!d || dx.aiBusy.has(h)) return;
   if (!confirm("Send the condensed findings of this switch (not the whole log) to " + d.ai.provider + " (model " + d.ai.model + ")?\n\n" +
                (d.ai.mask ? "IP / MAC addresses, host names and user names are masked first." : "Masking is OFF: addresses and names are sent as they are.") + "\n\nThe answer is advisory only.")) return;
-  dx.aiBusy.add(h); dx.resKey = ""; dxRenderResults(); dxSay("", "Asking the AI ...");
+  dx.aiBusy.add(h); dx.resKey = null; dxRenderResults(); dxSay("", "Asking the AI ...");
   try { const r = await post("/api/diag/ai", {host: h}); if (dx.data && dx.data.results[h]) dx.data.results[h].ai = r.ai; dxSay("ok", "AI second opinion added."); }
   catch (err) { dxSay("err", err.message); }
-  finally { dx.aiBusy.delete(h); dx.resKey = ""; dxLoad(false); }
+  finally { dx.aiBusy.delete(h); dx.resKey = null; dxLoad(false); }
 });
 $("dx-res").addEventListener("toggle", e => {
   const k = e.target.dataset && e.target.dataset.key; if (!k) return;
@@ -14993,6 +15404,9 @@ def make_handler(manager, allowed_hosts, any_host):
                     self._json(200, {"sites": list_site_profiles(), "current": manager.site_name})
                 elif path == "/api/diag":
                     self._json(200, manager.diag_view())
+                elif path == "/api/diag/report":
+                    data, ctype, fname = manager.diag_report(qv("format"), qv("hosts"))
+                    self._send(200, data, ctype, {"Content-Disposition": f'attachment; filename="{fname}"'})
                 elif path == "/api/ai/settings":
                     self._json(200, manager.ai_settings_view())
                 elif path == "/api/topology":
