@@ -83,6 +83,11 @@ class ParallelQueueTests(unittest.TestCase):
         obj.rollout_of = {}
         obj.runs_dir = Path(temp.name) / "Runs"
         started = []
+        backups_started = []
+
+        def start_backup(run_hosts):
+            backups_started.extend(run_hosts)
+            return {"message": "Backup started on all selected switches."}
 
         with patch.object(obj, "_validate_hosts", return_value=hosts), \
                 patch.object(obj, "_creds_map", return_value={h: ("user", "secret") for h in hosts}), \
@@ -91,10 +96,14 @@ class ParallelQueueTests(unittest.TestCase):
                 patch.object(obj, "_require_platform_known"), patch.object(obj, "_enforce_image_check"), \
                 patch.object(obj, "_active_reload_count", return_value=0), \
                 patch.object(obj, "_save_schedule"), \
-                patch.object(obj, "_launch_job", side_effect=lambda host, *args: started.append(host)):
+                patch.object(obj, "start_backup", side_effect=start_backup), \
+                patch.object(manager.threading, "Thread") as background_thread:
             result = obj.start_upgrade(hosts, "image.bin", started_by="admin")
 
-        self.assertEqual(started, hosts[:2])
+        self.assertEqual(backups_started, hosts[:2])
+        self.assertEqual(started, [])  # upgrade jobs wait for each backup to finish
+        self.assertTrue(all(obj.ops[h]["upgrade"]["phase"] == "waiting_backup" for h in hosts[:2]))
+        background_thread.return_value.start.assert_called_once()
         self.assertEqual(set(obj.schedule), {hosts[2]})
         self.assertTrue(obj.schedule[hosts[2]]["queued"])
         self.assertEqual(obj.schedule[hosts[2]]["rollout"], obj.rollout_of[hosts[2]])

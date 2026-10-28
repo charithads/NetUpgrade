@@ -6,7 +6,7 @@ web page, with the firmware-upgrade worker built into the same file/program.
 What it does
   * Availability   - pings every switch from the Excel list and shows live UP/DOWN status.
   * Backup         - select switches in the GUI, click "Run backup": saves show running-config,
-                     show version, show boot, show inventory and any extra commands typed in the
+                     show vlan, show version, show boot, show inventory and any extra commands typed in the
                      GUI - all outputs together in ONE file per switch - then shows COMPLETED and the
                      current software version in the table.
   * Install mode   - every upgrade uses IOS-XE INSTALL mode, following Cisco's "Upgrade Catalyst 9300 /
@@ -59,6 +59,7 @@ Security notes
 
 # ---- Standard library ----
 import argparse
+import collections
 import csv
 import difflib
 import functools
@@ -88,7 +89,7 @@ import webbrowser
 import zipfile
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -97,13 +98,21 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "5.14.0"          # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "5.16.0"          # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # What each release added, newest first - shown under Settings > About. Add one entry here for every release
 # (keep APP_VERSION above and APP_VERSION in launcher.py equal to the newest entry).
 CHANGELOG = [
+    {"version": "5.16.0", "date": "2026-10-28", "features": [
+        "New Diagnosis tab between Diagram and Storage. Run Commands: type read-only commands, run them on several switches at once and keep every output in Storage under Diagnosis.",
+        "Diagnosis > Log Analysis: reads each switch's log and checks it locally against built-in rules (stack, power/fan/temperature, flash, crashes, reloads, failed installs, flapping ports) and gives a green / amber / red advisory verdict with the evidence. It never blocks or starts an upgrade.",
+        "Settings > AI Analysis: optional cloud AI second opinion (Anthropic or any OpenAI-compatible API). Off by default; identifiers are masked before anything is sent and the API key is stored encrypted."]},
+    {"version": "5.15.0", "date": "2026-10-27", "features": [
+        "New Upgrade Records folder in Storage: every upgrade keeps its pre-upgrade backup, pre-check and post-check output together, one folder per switch and per upgrade run.",
+        "The \"Back up configuration first\" option is gone: every upgrade, scheduled or immediate, always takes the configuration backup first and is skipped if that backup fails.",
+        "Compare Pre/Post Checks window in the Storage tab: pre-check against post-check of the same upgrade, or any two saved records of a switch, side by side."]},
     {"version": "5.14.0", "date": "2026-10-25", "features": [
         "Choose one storage location for IOS images and switch backups, stored under a NetUpgrade folder.",
         "Create the NetUpgrade storage folder directly from the installer folder picker."]},
@@ -445,6 +454,7 @@ REBOOT_SSH_RETRY = 15       # seconds between login attempts
 
 STATUS = None               # StatusFile, set in --job mode (progress shown in the web GUI)
 LOG_FILE = None             # optional log file, set in --job mode
+RECORD_DIR = None           # this run's folder under <site>/Upgrade Records/<switch>/, set in --job mode
 
 _print_lock = threading.Lock()
 
@@ -1427,9 +1437,18 @@ def save_check_file(suffix, heading, outputs, extra=None):
             text = '\n'.join(extra) + '\n\n' + text
         with open(path, 'w', encoding='utf-8') as fh:
             fh.write(text)
-        return path
     except OSError:
         return None
+    if RECORD_DIR:                         # second copy, kept together with this run's backup for the Storage compare window
+        try:
+            kind = {'precheck': 'pre-check', 'postcheck': 'post-check'}.get(suffix, suffix)
+            stamp = os.path.basename(RECORD_DIR)
+            os.makedirs(RECORD_DIR, exist_ok=True)
+            with open(os.path.join(RECORD_DIR, '{}_{}.txt'.format(kind, stamp)), 'w', encoding='utf-8') as fh:
+                fh.write(text)
+        except OSError:
+            pass                           # the record copy is best-effort; the Runs copy above is already saved
+    return path
 
 
 @activity('Pre-check')
@@ -2182,7 +2201,7 @@ def pause_before_exit():
 #------------------------------------------------------------------------------
 def job_main(job_path):
     """Upgrade ONE switch described by a job file written by switch_manager.py."""
-    global STATUS, LOG_FILE
+    global STATUS, LOG_FILE, RECORD_DIR
     for stream in (sys.stdout, sys.stderr):           # switch output must never crash the console
         try:                                           # line-buffered so the web console is live
             stream.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
@@ -2205,6 +2224,7 @@ def job_main(job_path):
         return 2
 
     LOG_FILE = job.get('log_path')
+    RECORD_DIR = job.get('record_dir') or None
     apply_timeouts(job.get('timeouts'))             # the waits chosen on the dashboard's Settings page
     device = {'ipaddr': job['ip'], 'type': 'cisco-xe', 'name': job.get('name') or job['ip']}
     STATUS = StatusFile(job['status_path'])
@@ -2401,7 +2421,7 @@ TYPE_HEADERS = ["type", "device_type", "device type"]
 PLATFORM_HEADERS = ["platform", "model", "device model", "switch model", "hardware"]
 MAX_PLATFORM_LEN = 40
 BACKUP_DEVICE_TYPES = {"cisco-ios": "cisco_ios", "cisco-xe": "cisco_xe"}
-EXTRA_COMMANDS = [("show version", "show_version"), ("show boot", "show_boot"),
+EXTRA_COMMANDS = [("show vlan", "show_vlan"), ("show version", "show_version"), ("show boot", "show_boot"),
                   ("show inventory", "show_inventory")]
 
 IMAGES_DIRNAME = "IOS Images"       # folder (next to the program) where uploaded images are kept
@@ -2465,6 +2485,14 @@ _VERSION_STORE_LOCK = threading.Lock()
 #         upgrade_report_<timestamp>.csv
 #         backup_summary_<timestamp>.csv
 #       Runs/                      <- firmware upgrade worker logs for this site
+#       Diagnosis/
+#         <Hostname>_<ip>/                  <- commands_<stamp>.txt, logs_<stamp>.txt, log-analysis_<stamp>.txt, ai-advice_<stamp>.txt
+#       Upgrade Records/
+#         <Hostname>_<ip-with-underscores>/
+#           <upgrade start timestamp>/      <- one folder per upgrade run (same stamp as its log in Runs/)
+#             pre-upgrade-backup_<stamp>.txt   (only when the upgrade was started with "backup first")
+#             pre-check_<stamp>.txt
+#             post-check_<stamp>.txt
 #     <Site B>/
 #       ...
 #
@@ -2478,6 +2506,8 @@ LEGACY_BACKUPS_DIRNAME = SITES_ROOT_DIRNAME
 SITE_BACKUPS_SUBDIR = "Switch Backups"
 SITE_REPORTS_SUBDIR = "Reports"
 SITE_RUNS_SUBDIR = "Runs"
+SITE_DIAG_SUBDIR = "Diagnosis"             # per switch: custom command outputs, raw logs and log-analysis reports
+SITE_UPGRADE_SUBDIR = "Upgrade Records"   # per switch, per upgrade run: pre-upgrade backup + pre-check + post-check
 
 STORAGE_REGISTRY_KEY = r"Software\Innovate Nexus\NetUpgrade"
 
@@ -2564,6 +2594,8 @@ SETTINGS_GROUPS = [
      "intro": "E-mail copies of the notifications shown under the bell icon. Off until you switch it on. Gmail: "
               "smtp.gmail.com, port 587 (STARTTLS) and an App password (2-Step Verification > App passwords) - "
               "your normal password will not work. The password is stored encrypted and is never shown again."},
+    {"id": "ai", "title": "AI Analysis",
+     "intro": "Log analysis in the Diagnosis tab always runs on this computer with built-in rules. Here you can optionally let a cloud AI give a second opinion on one switch's findings. Off by default. Only the condensed findings are sent, with addresses and names masked, and only when you press the button. The API key is stored encrypted and is never shown again."},
     {"id": "about", "title": "About",
      "intro": "Details of this installation and what each version added. The application is updated only from the "
               "Windows application (About tab > Check for new updates), never from this page."},
@@ -2886,6 +2918,14 @@ def site_runs_dir(name):
     return site_dir(name) / SITE_RUNS_SUBDIR
 
 
+def site_upgrade_dir(name):
+    return site_dir(name) / SITE_UPGRADE_SUBDIR
+
+
+def site_diag_dir(name):
+    return site_dir(name) / SITE_DIAG_SUBDIR
+
+
 def site_history_path(name):
     return site_dir(name) / "upgrade_history.json"
 
@@ -3124,7 +3164,7 @@ STORAGE_PREVIEW_BYTES = 8 * 1024 * 1024       # how much of a file the "View" po
 STORAGE_SEARCH_LIMIT = 500                    # max search hits returned
 STORAGE_MAX_ZIP_BYTES = 1024 * 1024 * 1024    # refuse to zip more than 1 GB of backups
 STORAGE_CHUNK = 1024 * 1024
-STORAGE_FOLDERS = (SITE_BACKUPS_SUBDIR, SITE_REPORTS_SUBDIR, SITE_RUNS_SUBDIR)   # top level of the browser
+STORAGE_FOLDERS = (SITE_BACKUPS_SUBDIR, SITE_UPGRADE_SUBDIR, SITE_DIAG_SUBDIR, SITE_REPORTS_SUBDIR, SITE_RUNS_SUBDIR)   # top level of the browser
 
 
 def storage_root(site):
@@ -3188,7 +3228,7 @@ def storage_list(site, rel):
         with os.scandir(path) as it:
             for e in it:
                 if not rel and e.name not in STORAGE_FOLDERS:
-                    continue                # site root: only Switch Backups / Reports / Runs
+                    continue                # site root: only the STORAGE_FOLDERS
                 try:
                     if e.is_symlink():
                         continue
@@ -3297,6 +3337,132 @@ def storage_backup_runs(site, rel):
 
 def storage_compare(site, rel, a, b, ignore_volatile=True, cmd=None):
     return compare_backup_dir(_storage_backup_folder(site, rel), a, b, ignore_volatile, cmd)
+
+
+# ---- Upgrade Records: <site>/Upgrade Records/<switch>/<run stamp>/{pre-upgrade-backup,pre-check,post-check}_<stamp>.txt ----
+RECORD_FILE_RE = re.compile(r"^(pre-upgrade-backup|pre-check|post-check)_(\d{8}_\d{6})\.txt$")
+RECORD_KIND_LABELS = {"pre-upgrade-backup": "Pre-upgrade backup", "pre-check": "Pre-check", "post-check": "Post-check"}
+RECORD_KIND_ORDER = {"pre-upgrade-backup": 0, "pre-check": 1, "post-check": 2}
+RECORD_ID_RE = re.compile(r"^(\d{8}_\d{6})/(pre-upgrade-backup|pre-check|post-check)$")
+RECORD_HEAD_RE = re.compile(r"(?m)^#{4} (.+?)\s*$")
+
+
+def record_sections(text):
+    """{command: output} of one record file. Backups use '!===== COMMAND: x =====' blocks, pre-/post-check files use
+    '#### x' blocks; the post-check's Result/Detail/Issue lines become their own 'Post-check result' block."""
+    parts = split_command_sections(text)
+    if parts:
+        return parts
+    marks = list(RECORD_HEAD_RE.finditer(text))
+    out = {}
+    verdict = []
+    first = marks[0].start() if marks else len(text)
+    for line in text[:first].splitlines():
+        if re.match(r"^(Result|Detail|Issue)\s*:", line):
+            verdict.append(line.rstrip())
+    if verdict:
+        out["Post-check result"] = "\n".join(verdict)
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out.setdefault(m.group(1), text[m.end():end].strip("\r\n"))
+    if not out:
+        out["(whole file)"] = text
+    return out
+
+
+def list_upgrade_records(device_dir, limit=200):
+    """One switch's Upgrade Records folder -> {runs:[{stamp,time,result,files:[{id,kind,label,size}]}], files:[...] newest first}."""
+    runs = {}
+    try:
+        with os.scandir(device_dir) as it:
+            run_dirs = [e for e in it if e.is_dir() and re.fullmatch(r"\d{8}_\d{6}", e.name)]
+    except OSError:
+        return {"runs": [], "files": []}
+    for rd in run_dirs:
+        files = []
+        try:
+            with os.scandir(rd.path) as it2:
+                for f in it2:
+                    m = RECORD_FILE_RE.match(f.name)
+                    if m and f.is_file() and m.group(2) == rd.name:
+                        files.append({"id": f"{rd.name}/{m.group(1)}", "kind": m.group(1),
+                                      "label": RECORD_KIND_LABELS[m.group(1)], "size": f.stat().st_size})
+        except OSError:
+            continue
+        if not files:
+            continue
+        files.sort(key=lambda x: RECORD_KIND_ORDER[x["kind"]])
+        result = ""
+        for f in files:
+            if f["kind"] == "post-check":
+                try:
+                    with open(os.path.join(rd.path, f"post-check_{rd.name}.txt"), "r", encoding="utf-8", errors="replace") as fh:
+                        mm = re.search(r"(?m)^Result\s*:\s*(\S+)", fh.read(2000))
+                    result = mm.group(1) if mm else ""
+                except OSError:
+                    pass
+        runs[rd.name] = {"stamp": rd.name, "time": _stamp_to_time(rd.name), "result": result, "files": files}
+    ordered = [runs[k] for k in sorted(runs, reverse=True)[:limit]]
+    flat = []
+    for r in ordered:
+        for f in reversed(r["files"]):        # newest run first; inside a run: post-check, pre-check, backup
+            flat.append(dict(f, stamp=r["stamp"], time=r["time"], name=f"{r['time']} \u00b7 {f['label']}"))
+    return {"runs": ordered, "files": flat}
+
+
+def _storage_record_folder(site, rel):
+    """The folder of ONE switch inside 'Upgrade Records' (a path one level deeper, a single run, is accepted too)."""
+    name, root = storage_root(site)
+    path, rel = storage_resolve(root, rel)
+    parts = rel.split("/") if rel else []
+    if len(parts) not in (2, 3) or parts[0] != SITE_UPGRADE_SUBDIR:
+        raise ApiError("Open a switch's folder under Upgrade Records to compare its pre-/post-checks.")
+    dev = root.joinpath(*parts[:2]).resolve()
+    try:
+        dev.relative_to(root.resolve())
+    except ValueError:
+        raise ApiError("Invalid path.")
+    if not dev.is_dir():
+        raise ApiError("Folder not found.", 404)
+    return dev, (parts[2] if len(parts) == 3 else "")
+
+
+def storage_records(site, rel):
+    dev, focus = _storage_record_folder(site, rel)
+    d = list_upgrade_records(dev)
+    d["focus"] = focus if any(r["stamp"] == focus for r in d["runs"]) else ""
+    return d
+
+
+def _record_text(dev, rid):
+    m = RECORD_ID_RE.match(str(rid or ""))
+    if not m:
+        raise ApiError("Pick two records to compare.")
+    stamp, kind = m.group(1), m.group(2)
+    path = Path(dev) / stamp / f"{kind}_{stamp}.txt"
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read(BACKUP_COMPARE_MAX_FILE).decode("utf-8", "replace")
+    except OSError:
+        raise ApiError("One of the records was not found.", 404)
+    return {"id": f"{stamp}/{kind}", "time": f"{_stamp_to_time(stamp)} \u00b7 {RECORD_KIND_LABELS[kind]}"}, record_sections(text)
+
+
+def storage_record_compare(site, rel, a, b, ignore_volatile=True, cmd=None):
+    dev, _focus = _storage_record_folder(site, rel)
+    if str(a) == str(b):
+        raise ApiError("Pick two different records.")
+    ia, sec_a = _record_text(dev, a)
+    ib, sec_b = _record_text(dev, b)
+    head_a, head_b = {"stamp": ia["id"], "time": ia["time"]}, {"stamp": ib["id"], "time": ib["time"]}
+    if cmd:
+        if cmd not in sec_a and cmd not in sec_b:
+            raise ApiError("That command is not in either record.", 404)
+        rows, add, rem, cut = side_by_side_rows(sec_a.get(cmd), sec_b.get(cmd), bool(ignore_volatile))
+        return {"a": head_a, "b": head_b, "command": cmd, "in_a": cmd in sec_a, "in_b": cmd in sec_b,
+                "rows": rows, "added": add, "removed": rem, "truncated": cut}
+    summary, results = diff_backup_sections(sec_a, sec_b, bool(ignore_volatile))
+    return {"a": head_a, "b": head_b, "ignore_volatile": bool(ignore_volatile), "summary": summary, "commands": results}
 
 
 def storage_zip_folder(site, rel):
@@ -3651,7 +3817,7 @@ EMAILER = EmailNotifier()
 ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER = "administrator", "operator", "viewer"
 ROLES = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER)
 ROLE_LABELS = {ROLE_ADMIN: "Administrator", ROLE_OPERATOR: "Operator", ROLE_VIEWER: "Viewer"}
-OPERATOR_DENIED_POSTS = ("/api/monitor/stop", "/api/settings", "/api/notifications/email",
+OPERATOR_DENIED_POSTS = ("/api/monitor/stop", "/api/settings", "/api/notifications/email", "/api/ai/settings", "/api/ai/test",
                          "/api/notifications/email/test", "/api/timeout-profiles/save",
                          "/api/timeout-profiles/delete", "/api/timeout-profiles/apply")
 VIEWER_PAGES = ("/", "/index.html", "/favicon.ico")
@@ -4046,7 +4212,7 @@ BACKUP_FILE_PREFIX = "config_backup"
 
 
 def do_backup(host, device_type, username, password, secret, device_dir, run_stamp, custom_commands=None):
-    """Run show running-config / show version / show boot / show inventory, plus any extra commands
+    """Run show running-config / show vlan / show version / show boot / show inventory, plus any extra commands
     typed in the GUI, and save ALL the outputs in ONE file inside device_dir - a PERMANENT folder for
     this one device. The file name carries run_stamp, so repeated backups accumulate a history in that
     same folder instead of overwriting each other. Returns a result dict including a per-command log
@@ -5022,6 +5188,577 @@ def build_topology_graph(info, order, devices, roots):
             "updated": max(stamps) if stamps else ""}
 
 
+# =============================================================================
+# Diagnosis tab: custom read-only commands, local log analysis, optional AI second opinion.
+# Everything here only READS from the switches; nothing in this section changes a switch or
+# takes part in an upgrade.
+# =============================================================================
+DIAG_COMMAND_WORDS = ("show", "ping", "traceroute", "dir", "more", "verify")     # read-only exec commands
+DIAG_MAX_COMMANDS = 30
+DIAG_MAX_COMMAND_LEN = 200
+DIAG_PIPE_BLOCK_RE = re.compile(r"\|\s*(redirect|tee|append|format)\b", re.I)    # would write a file on the switch
+DIAG_LOG_COMMANDS = ["show logging", "show clock", "show version", "show switch", "show interfaces status err-disabled"]
+DIAG_LOOKBACK_HOURS = (0, 24, 72, 168, 720)          # 0 = everything still in the log buffer
+DIAG_FLAP_WARN = 10                                  # state changes of one interface that count as flapping
+DIAG_STP_WARN = 20                                   # spanning-tree topology changes that count as a storm
+DIAG_MAX_EXAMPLES = 3
+
+
+def parse_diag_commands(text):
+    """(commands, problems) from the text box. Only read-only commands (show, ping, traceroute, dir, more, verify)
+    are accepted, so nothing typed here can change a switch. Blank lines and lines starting with ! or # are skipped."""
+    cmds, problems = [], []
+    for raw in str(text or "").splitlines():
+        line = " ".join(raw.strip().split())
+        if not line or line[0] in "!#":
+            continue
+        if len(line) > DIAG_MAX_COMMAND_LEN:
+            problems.append(f"'{line[:40]}...' is longer than {DIAG_MAX_COMMAND_LEN} characters.")
+            continue
+        if any(ord(c) < 32 for c in line):
+            problems.append(f"'{line[:40]}' contains a control character.")
+            continue
+        word = line.split(" ", 1)[0].lower()
+        if len(word) < 2 or not any(w.startswith(word) for w in DIAG_COMMAND_WORDS):
+            problems.append(f"'{line[:40]}' is not allowed - only read-only commands are accepted "
+                            f"({', '.join(DIAG_COMMAND_WORDS)}).")
+            continue
+        if DIAG_PIPE_BLOCK_RE.search(line):
+            problems.append(f"'{line[:40]}' writes to a file on the switch (redirect / tee / append) and is not allowed.")
+            continue
+        if line not in cmds:
+            cmds.append(line)
+    if len(cmds) > DIAG_MAX_COMMANDS:
+        problems.append(f"At most {DIAG_MAX_COMMANDS} commands per run (you entered {len(cmds)}).")
+    if not cmds and not problems:
+        problems.append("Type at least one command.")
+    return cmds[:DIAG_MAX_COMMANDS], problems
+
+
+_LOG_MONTHS = {m: i + 1 for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
+_LOG_TS_RE = re.compile(r"^\s*(?:\d+:\s*)?(?P<flag>[*.])?(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})(?:\s+(?P<year>\d{4}))?"
+                        r"\s+(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})")
+_LOG_MSG_RE = re.compile(r"%(?P<fac>[A-Z][A-Z0-9_]*)-(?P<sev>[0-7])-(?P<mn>[A-Z][A-Z0-9_]*)\s*:?\s*(?P<msg>.*)")
+_LOG_CLOCK_RE = re.compile(r"(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?\s+\S+\s+\w{3}\s+(\w{3})\s+(\d{1,2})\s+(\d{4})")
+_LOG_TRACE_RE = re.compile(r"-Traceback=|^\s*Traceback", re.I)
+_LOG_NOISE_KEYS = ("%LINK-3-UPDOWN", "%LINEPROTO-5-UPDOWN")           # counted per interface instead (flap check)
+SEV_NAMES = ["emergency", "alert", "critical", "error", "warning", "notice", "informational", "debug"]
+
+# (id, title, category, level, regex on "%FAC-SEV-MNEMONIC: message", advice) - the first rule that matches a line wins
+DIAG_RULES = [
+    ("stack_error", "Stack manager error", "Stack", "crit", r"^%STACKMGR-[0-3]-",
+     "A stack error was logged. Check 'show switch' and 'show switch stack-ports' and fix it before upgrading a stack."),
+    ("stack_change", "Stack topology change", "Stack", "warn",
+     r"^%STACKMGR-[4-6]-\w*(REMOVED|LINK|PORT|ELECT|RELOAD|MISMATCH|DOWN|CHANGE)",
+     "A stack member or stack cable changed state. Confirm every member is Ready and all stack ports are up."),
+    ("power_fan_temp", "Power, fan or temperature problem", "Hardware", "crit",
+     r"^%PLATFORM_ENV-[0-3]-|over.?temp|temperature.{0,30}(critical|exceed|too high)|fan.{0,25}(fail|fault)|"
+     r"power.?supply.{0,25}(fail|fault|removed)|\bpsu\b.{0,25}(fail|fault)",
+     "Fix power, fan or cooling faults first - a reload during an upgrade can make a marginal power supply or fan fail."),
+    ("platform_error", "Platform / hardware error", "Hardware", "crit",
+     r"^%PLATFORM-[0-3]-|^%IOSXE-[0-2]-|^%C9K\w*-[0-2]-",
+     "A platform-level error was logged. Check it with 'show platform' / 'show tech-support' and, if unexplained, open a TAC case before upgrading."),
+    ("hw_check", "Hardware error counters", "Hardware", "warn", r"(asic|parity|\becc\b|uncorrectable|sensor).{0,40}(error|fail)",
+     "Hardware error counters can point to failing components; watch whether they keep growing."),
+    ("oir", "Module / power supply inserted or removed (OIR)", "Hardware", "warn", r"^%OIR-",
+     "Hardware was inserted or removed. Confirm it was planned and that the switch inventory is as expected."),
+    ("flash_fs", "Flash or file system problem", "Storage", "crit",
+     r"(flash|bootflash|filesystem|file system).{0,40}(corrupt|error|fail|no space|full|read.?only)|"
+     r"(corrupt|fail).{0,40}(flash|bootflash)|^%FILESYS-[0-3]-|^%IFS-[0-3]-",
+     "The image is copied to flash: fix file system errors and free space first ('dir flash:', 'show file systems')."),
+    ("memory", "Memory allocation problem", "System", "crit", r"MALLOCFAIL|NOMEMORY|memory.{0,20}(exhaust|leak)",
+     "Memory exhaustion can make an install fail or crash the switch. Check 'show processes memory sorted'."),
+    ("cpuhog", "High CPU", "System", "warn", r"CPUHOG|CPU_?HIGH|high cpu",
+     "A busy CPU slows the install. Find the cause ('show processes cpu sorted') or upgrade in a quieter window."),
+    ("crash", "Crash, traceback or watchdog", "System", "crit",
+     r"^%SYS-[0-2]-|traceback|crashinfo|segmentation|core dump|watchdog|kernel panic|process.{0,20}crash",
+     "Crashes or tracebacks suggest a software or hardware fault. Collect 'show tech-support' and check crashinfo before upgrading."),
+    ("reload", "Switch reloaded or restarted", "System", "warn", r"^%SYS-5-(RELOAD|RESTART)|reload requested|system restarted",
+     "The switch restarted inside this log window. Confirm the reload was planned."),
+    ("install", "Install / upgrade failure", "Upgrade", "crit", r"^%INSTALL-[0-3]-|(install|issu|rollback).{0,40}(fail|abort|error|timeout)",
+     "A previous install or rollback failed. Check 'show install summary' and clean up ('install remove inactive') before a new upgrade."),
+    ("install_info", "Earlier install activity", "Upgrade", "info", r"^%INSTALL-[4-7]-",
+     "Install operations were logged earlier. Informational."),
+    ("errdisable", "Port err-disabled", "Interfaces", "warn", r"^%PM-4-ERR_DISABLE|err-?disable",
+     "Ports were shut down by a protection feature. See 'show interfaces status err-disabled' and fix the cause."),
+    ("stp_guard", "Spanning-tree protection triggered", "Interfaces", "warn",
+     r"^%SPANTREE-\d-(LOOPGUARD|ROOTGUARD|BLOCK_|BPDUGUARD)|bpdu.?guard",
+     "Spanning-tree protection fired. Resolve it first - a reload while the topology is unstable can make it worse."),
+    ("macflap", "MAC address flapping (possible loop)", "Interfaces", "warn", r"MACFLAP",
+     "The same MAC moves between ports, which usually means a loop. Find and fix it before the maintenance window."),
+    ("poe", "PoE problem", "Interfaces", "warn", r"^%ILPOWER-[0-3]-",
+     "PoE faults were logged. Check 'show power inline' - PoE devices lose power during the reload anyway."),
+    ("config_change", "Configuration changed", "Changes", "info", r"^%SYS-5-CONFIG_I",
+     "Configuration was changed. If the running config is not saved, the backup and the upgrade may not match it."),
+    ("login_fail", "Failed logins", "Security", "info", r"LOGIN_FAILED|authentication fail|USERAUTH.{0,20}fail",
+     "Failed log-in attempts were logged. Informational."),
+    ("ntp", "Clock / NTP problem", "System", "info", r"^%NTP-|ntp.{0,30}(unsynchroni|lost|no server|not synchron)",
+     "Without a synchronized clock the log times are unreliable and certificates can fail."),
+    ("smart_lic", "Smart licensing communication problem", "System", "info", r"^%SMART_LIC-[0-3]-|^%LICENSE-[0-3]-",
+     "Licensing errors do not block an upgrade, but check the license state afterwards."),
+]
+_DIAG_RULES_C = [(rid, title, cat, lvl, re.compile(rx, re.I), advice) for rid, title, cat, lvl, rx, advice in DIAG_RULES]
+_LEVEL_ORDER = {"crit": 0, "warn": 1, "info": 2}
+_LEVEL_LABEL = {"crit": "CRITICAL", "warn": "WARNING", "info": "INFO"}
+
+
+def _diag_clock_now(clock_text, fallback=None):
+    """The switch's own 'now' from 'show clock' (so a look-back window is measured on the switch's clock)."""
+    m = _LOG_CLOCK_RE.search(clock_text or "")
+    if m:
+        try:
+            return datetime(int(m.group(6)), _LOG_MONTHS[m.group(4)[:3].title()], int(m.group(5)),
+                                     int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except (KeyError, ValueError):
+            pass
+    return fallback or datetime.now()
+
+
+def _diag_parse_ts(line, now):
+    """(datetime or None, flag) of a log line. flag '*' = clock not synchronized, '.' = synchronized but not by NTP."""
+    m = _LOG_TS_RE.match(line)
+    if not m:
+        return None, ""
+    mon = _LOG_MONTHS.get(m.group("mon"))
+    if not mon:
+        return None, ""
+    year = int(m.group("year")) if m.group("year") else now.year
+    try:
+        ts = datetime(year, mon, int(m.group("day")), int(m.group("h")), int(m.group("m")), int(m.group("s")))
+    except ValueError:
+        return None, m.group("flag") or ""
+    if not m.group("year") and ts > now + timedelta(days=1):
+        try:
+            ts = ts.replace(year=year - 1)
+        except ValueError:
+            return None, m.group("flag") or ""
+    return ts, m.group("flag") or ""
+
+
+def _diag_short(line, width=230):
+    line = " ".join(str(line).split())
+    return line if len(line) <= width else line[:width - 3] + "..."
+
+
+def _diag_uptime_minutes(text):
+    m = re.search(r"(?im)\buptime is (.+)$", text or "")
+    if not m:
+        return None
+    total = 0
+    for n, unit in re.findall(r"(\d+)\s+(year|week|day|hour|minute)s?", m.group(1)):
+        total += int(n) * {"year": 525600, "week": 10080, "day": 1440, "hour": 60, "minute": 1}[unit]
+    return total
+
+
+def parse_show_switch(text):
+    """[{switch, role, state}] from 'show switch', or None when the switch is not a stack / the command is not valid."""
+    if not text or re.search(r"(?im)^\s*%\s*(invalid|ambiguous|incomplete)", text) or "Invalid input" in text:
+        return None
+    rows = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*\*?\s*(\d+)\s+(\w+)\s+[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}\s+\d+\s+\S+\s+(.+?)\s*$", line, re.I)
+        if m:
+            rows.append({"switch": int(m.group(1)), "role": m.group(2), "state": m.group(3)})
+    return rows or None
+
+
+def analyze_switch_logs(sections, lookback_hours=0, label="", host=""):
+    """Rule-based analysis of the output of DIAG_LOG_COMMANDS ({command: output}). Pure function, no network.
+    Returns a JSON-friendly dict: verdict (green/amber/red), findings, top messages, facts, notes."""
+    log_text = sections.get("show logging", "") or ""
+    clock_text = sections.get("show clock", "") or ""
+    version_text = sections.get("show version", "") or ""
+    now = _diag_clock_now(clock_text)
+    cutoff = now - timedelta(hours=lookback_hours) if lookback_hours else None
+    notes = []
+
+    # ---- the log buffer ----
+    entries, outside, ts_seen, star_seen, unsynced_dot = [], 0, 0, 0, 0
+    for line in log_text.splitlines():
+        msg = _LOG_MSG_RE.search(line)
+        trace = (not msg) and _LOG_TRACE_RE.search(line)
+        if not msg and not trace:
+            continue
+        ts, flag = _diag_parse_ts(line, now)
+        if ts:
+            ts_seen += 1
+            if flag == "*":
+                star_seen += 1
+        if cutoff and ts and flag != "*" and ts < cutoff:
+            outside += 1
+            continue
+        if msg:
+            head = f"%{msg.group('fac')}-{msg.group('sev')}-{msg.group('mn')}: {msg.group('msg')}"
+            entries.append({"sev": int(msg.group("sev")), "key": f"%{msg.group('fac')}-{msg.group('sev')}-{msg.group('mn')}",
+                            "head": head, "line": line, "ts": ts if flag != "*" else None})
+        else:
+            entries.append({"sev": 2, "key": "(traceback)", "head": line.strip(), "line": line, "ts": ts if flag != "*" else None})
+    buf_size = None
+    m = re.search(r"Log Buffer \((\d+) bytes\)", log_text)
+    if m:
+        buf_size = int(m.group(1))
+    buffer_off = bool(re.search(r"Buffer logging:\s*disabled", log_text, re.I))
+    if "Invalid input" in log_text or not log_text.strip():
+        notes.append("'show logging' returned nothing usable on this switch.")
+    if buffer_off:
+        notes.append("Buffer logging is disabled on this switch, so there is no history to analyze ('logging buffered').")
+    elif buf_size is not None and buf_size < 16384:
+        notes.append(f"The log buffer is only {buf_size} bytes - older events may already be overwritten. "
+                     "Consider 'logging buffered 65536' so more history is kept.")
+    if entries and not ts_seen:
+        notes.append("The log lines carry no timestamps (service timestamps log datetime), so times and the look-back window cannot be used.")
+    elif ts_seen and star_seen > ts_seen // 2:
+        notes.append("The switch clock was not synchronized when most events were logged (lines start with *), so their times are unreliable.")
+    if lookback_hours and not ts_seen and entries:
+        notes.append("The look-back window was ignored because the log has no usable timestamps.")
+    if outside:
+        notes.append(f"{outside} older event(s) are outside the {lookback_hours}-hour look-back window and were left out.")
+
+    sev_counts = {str(i): 0 for i in range(8)}
+    findings = {}
+    others = {2: collections.Counter(), 3: collections.Counter()}
+    key_counts = collections.Counter()
+    key_example = {}
+    flaps = collections.Counter()
+    stp_changes = 0
+
+    def add(fid, title, cat, lvl, advice, entry):
+        f = findings.setdefault(fid, {"id": fid, "title": title, "category": cat, "level": lvl, "count": 0, "first": "", "last": "",
+                                      "advice": advice, "examples": []})
+        f["count"] += 1
+        if entry is not None:
+            t = entry["ts"].strftime("%b %d %H:%M:%S") if entry["ts"] else ""
+            if t and not f["first"]:
+                f["first"] = t
+            if t:
+                f["last"] = t
+            ex = _diag_short(entry["head"])
+            if ex not in f["examples"] and len(f["examples"]) < DIAG_MAX_EXAMPLES:
+                f["examples"].append(ex)
+
+    for e in entries:
+        sev_counts[str(e["sev"])] += 1
+        key_counts[e["key"]] += 1
+        key_example.setdefault(e["key"], _diag_short(e["head"]))
+        if e["key"] == "%LINK-3-UPDOWN":
+            mm = re.search(r"Interface (\S+?),", e["head"])
+            if mm:
+                flaps[mm.group(1)] += 1
+        if re.search(r"SPANTREE.{0,60}(TOPO|topology change)", e["head"], re.I):
+            stp_changes += 1
+        for rid, title, cat, lvl, rx, advice in _DIAG_RULES_C:
+            if rx.search(e["head"]):
+                add(rid, title, cat, lvl, advice, e)
+                break
+        else:
+            if e["key"] in _LOG_NOISE_KEYS:
+                continue
+            if e["sev"] <= 2:
+                others[2][e["key"]] += 1
+            elif e["sev"] == 3:
+                others[3][e["key"]] += 1
+    flappers = [(i, n) for i, n in flaps.most_common() if n >= DIAG_FLAP_WARN]
+    if flappers:
+        f = {"id": "flap", "title": "Interface flapping", "category": "Interfaces", "level": "warn",
+             "count": sum(n for _i, n in flappers), "first": "", "last": "",
+             "advice": "Ports that keep going up and down are unstable (cable, SFP, or a looping / rebooting device). "
+                       "Check them before the upgrade, or you will not know afterwards whether the upgrade caused it.",
+             "examples": [f"{i}: {n} link state changes" for i, n in flappers[:DIAG_MAX_EXAMPLES]]}
+        findings["flap"] = f
+    if stp_changes >= DIAG_STP_WARN:
+        findings["stp_storm"] = {"id": "stp_storm", "title": "Many spanning-tree topology changes", "category": "Interfaces",
+                                 "level": "warn", "count": stp_changes, "first": "", "last": "",
+                                 "advice": "Frequent topology changes mean an unstable layer-2 network; find the source (flapping port, loop) first.",
+                                 "examples": []}
+    for sev, lvl, title in ((2, "crit", "Other messages of severity 0-2 (emergency / alert / critical)"),
+                            (3, "info", "Other error messages (severity 3)")):
+        if others[sev]:
+            findings[f"other{sev}"] = {
+                "id": f"other{sev}", "title": title, "category": "Other", "level": lvl, "count": sum(others[sev].values()),
+                "first": "", "last": "",
+                "advice": "These do not match a known upgrade-relevant pattern. Read them and decide whether they matter.",
+                "examples": [f"{k} x{n}" for k, n in others[sev].most_common(5)]}
+
+    # ---- the other commands ----
+    facts = {}
+    ver = re.search(r"(?im)\bVersion\s+([0-9][0-9A-Za-z.()\[\]-]*)", version_text)
+    if ver:
+        facts["version"] = ver.group(1).rstrip(",")
+    up = re.search(r"(?im)\buptime is (.+)$", version_text)
+    if up:
+        facts["uptime"] = up.group(1).strip()
+    rr = re.search(r"(?im)^Last reload reason\s*:?\s*(.+)$", version_text) or re.search(r"(?im)System returned to ROM by (.+)$", version_text)
+    if rr:
+        facts["reload_reason"] = rr.group(1).strip()
+        if re.search(r"power|crash|exception|watchdog|abnormal|panic|kernel", rr.group(1), re.I):
+            add("reload_reason", "Last reload was not a normal reload", "System", "warn",
+                "The reason for the last reload looks abnormal. Find out why before adding another reload.", None)
+            findings["reload_reason"]["examples"] = [_diag_short(rr.group(0))]
+    mins = _diag_uptime_minutes(version_text)
+    if mins is not None and mins < 60:
+        add("recent_boot", "Switch booted less than an hour ago", "System", "info",
+            "A freshly booted switch may still be settling (routing, stack sync). Wait before upgrading.", None)
+        findings["recent_boot"]["examples"] = [f"uptime {facts.get('uptime', '')}"]
+    stack = parse_show_switch(sections.get("show switch", ""))
+    if stack is not None:
+        facts["stack"] = stack
+        bad = [r for r in stack if r["state"].lower() != "ready"]
+        if bad:
+            add("stack_state", "Stack member not Ready", "Stack", "crit",
+                "Every stack member must be Ready before an upgrade; a member that is not Ready can be left behind or fail to join.", None)
+            findings["stack_state"]["count"] = len(bad)
+            findings["stack_state"]["examples"] = [f"switch {r['switch']} ({r['role']}): {r['state']}" for r in bad[:5]]
+    ed_text = sections.get("show interfaces status err-disabled", "")
+    if ed_text and "Invalid input" not in ed_text and not re.search(r"(?m)^\s*%", ed_text):
+        n_ed = len([l for l in ed_text.splitlines() if re.match(r"^\s*[A-Za-z]{2,}\d\S*\s.*\berr-disabled\b", l, re.I)])
+        facts["err_disabled"] = n_ed
+        if n_ed:
+            add("errdisabled_now", f"{n_ed} port(s) currently err-disabled", "Interfaces", "warn",
+                "These ports are down right now. Know why, so you can tell afterwards whether the upgrade changed anything.", None)
+            findings["errdisabled_now"]["count"] = n_ed
+    if buffer_off:
+        findings["buffer_off"] = {"id": "buffer_off", "title": "Buffer logging is disabled", "category": "System", "level": "warn",
+                                  "count": 1, "first": "", "last": "", "advice": "There is no log history to check. Enable 'logging buffered' and re-run later.",
+                                  "examples": []}
+
+    flist = sorted(findings.values(), key=lambda f: (_LEVEL_ORDER[f["level"]], -f["count"]))
+    crit = sum(1 for f in flist if f["level"] == "crit")
+    warn = sum(1 for f in flist if f["level"] == "warn")
+    if crit:
+        verdict, text = "red", f"Review before upgrading: {crit} critical finding(s)" + (f" and {warn} warning(s)." if warn else ".")
+    elif warn:
+        verdict, text = "amber", f"{warn} warning(s) found - check them before the maintenance window."
+    elif not entries and not stack and "version" not in facts:
+        verdict, text = "amber", "Nothing could be analyzed - see the notes."
+    else:
+        verdict, text = "green", "No upgrade-impacting events found in the available log."
+    times = [e["ts"] for e in entries if e["ts"]]
+    return {
+        "host": host, "label": label or host, "time": now_str(), "verdict": verdict, "verdict_text": text,
+        "lookback_hours": int(lookback_hours or 0),
+        "buffer": {"lines": len(entries), "outside_window": outside, "buffer_bytes": buf_size,
+                   "first": min(times).strftime("%b %d %H:%M:%S") if times else "",
+                   "last": max(times).strftime("%b %d %H:%M:%S") if times else ""},
+        "severity": sev_counts, "findings": flist,
+        "top": [{"key": k, "count": n, "example": key_example.get(k, "")} for k, n in key_counts.most_common(8)],
+        "facts": facts, "notes": notes,
+    }
+
+
+def format_analysis_report(a, files=None):
+    """The analysis as a readable text file for the Storage folder."""
+    out = [f"Log analysis - {a['label']} ({a['host']})",
+           f"Collected   : {a['time']}",
+           f"Look-back   : {'whole log buffer' if not a['lookback_hours'] else str(a['lookback_hours']) + ' hours'}",
+           f"Verdict     : {a['verdict'].upper()} - {a['verdict_text']}",
+           "This verdict is advisory, produced by built-in rules. Read the evidence and decide yourself.", ""]
+    b = a["buffer"]
+    out.append(f"Log buffer  : {b['lines']} message line(s) analyzed" + (f", {b['first']} -> {b['last']}" if b["first"] else ""))
+    if a["facts"]:
+        out.append("Facts       : " + "; ".join(f"{k}={v}" for k, v in a["facts"].items() if k != "stack"))
+        for r in a["facts"].get("stack", []):
+            out.append(f"  stack member {r['switch']}: {r['role']}, {r['state']}")
+    for n in a["notes"]:
+        out.append(f"Note        : {n}")
+    out += ["", "Severity counts: " + ", ".join(f"{SEV_NAMES[int(k)]}={v}" for k, v in a["severity"].items() if v), "",
+            "FINDINGS" if a["findings"] else "No findings."]
+    for f in a["findings"]:
+        span = f" ({f['first']} -> {f['last']})" if f["first"] else ""
+        out.append(f"[{_LEVEL_LABEL[f['level']]}] {f['title']} - {f['category']} - x{f['count']}{span}")
+        out.append(f"    What to do: {f['advice']}")
+        for ex in f["examples"]:
+            out.append(f"    evidence: {ex}")
+    if a["top"]:
+        out += ["", "MOST FREQUENT MESSAGES"]
+        out += [f"{t['count']:>6}  {t['key']}   {t['example']}" for t in a["top"]]
+    if files:
+        out += ["", "Raw command output: " + files]
+    return "\n".join(out) + "\n"
+
+
+# ---- optional cloud AI second opinion (Settings > AI Analysis). Off by default; the local rules never need it. ----
+AI_SETTINGS_FILENAME = "ai_settings.json"
+AI_PROVIDERS = {"anthropic": "Anthropic (Claude)", "openai": "OpenAI-compatible (any server with /chat/completions)"}
+AI_DEFAULTS = {"enabled": False, "provider": "anthropic", "model": "claude-sonnet-5-5", "base_url": "", "api_key_enc": "", "mask": True}
+AI_MAX_PROMPT_CHARS = 14000
+AI_TIMEOUT = 90
+AI_SYSTEM_PROMPT = (
+    "You are a senior network engineer helping to decide whether a Cisco IOS-XE switch is safe to upgrade. "
+    "You get the findings of a rule-based log analyzer for ONE switch (identifiers may be masked as IP-1, MAC-1, SWITCH-1, USER-1). "
+    "Explain, in plain language, which findings could affect a software upgrade or reload and why, what to check or fix first, "
+    "and which are probably harmless. Use only the data given; if it is not enough, say what is missing. Do not invent log lines. "
+    "Never suggest configuration changes without labelling them optional. Keep it short: a one-sentence overall opinion, "
+    "then a numbered list ordered by importance.")
+
+
+def ai_settings_path():
+    return this_program_path().parent / AI_SETTINGS_FILENAME
+
+
+def load_ai_settings():
+    cfg = dict(AI_DEFAULTS)
+    data = read_json_file(ai_settings_path())
+    if isinstance(data, dict):
+        for key in AI_DEFAULTS:
+            if key in data:
+                cfg[key] = data[key]
+    cfg["enabled"] = bool(cfg["enabled"])
+    cfg["mask"] = bool(cfg["mask"])
+    if cfg["provider"] not in AI_PROVIDERS:
+        cfg["provider"] = "anthropic"
+    for k in ("model", "base_url", "api_key_enc"):
+        cfg[k] = str(cfg[k] or "")
+    return cfg
+
+
+def save_ai_settings(cfg):
+    path = ai_settings_path()
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def ai_clean_values(values):
+    """(cfg without the key, problems) from the Settings form."""
+    v = values if isinstance(values, dict) else {}
+    cfg = {"enabled": bool(v.get("enabled")), "provider": str(v.get("provider") or "anthropic"),
+           "model": str(v.get("model") or "").strip(), "base_url": str(v.get("base_url") or "").strip().rstrip("/"),
+           "mask": bool(v.get("mask", True))}
+    problems = []
+    if cfg["provider"] not in AI_PROVIDERS:
+        problems.append("Choose a provider.")
+    if len(cfg["model"]) > 100 or re.search(r"[\s\x00-\x1f]", cfg["model"]):
+        problems.append("The model name is not valid.")
+    if cfg["enabled"] and not cfg["model"]:
+        problems.append("Enter the model name.")
+    if cfg["provider"] == "openai":
+        if cfg["enabled"] and not cfg["base_url"]:
+            problems.append("Enter the API base URL (for example https://api.openai.com/v1).")
+        if cfg["base_url"] and not re.match(r"^https?://[^\s/]+(/[^\s]*)?$", cfg["base_url"]):
+            problems.append("The API base URL must start with https:// (or http:// for a server on your own network).")
+        if len(cfg["base_url"]) > 300:
+            problems.append("The API base URL is too long.")
+    else:
+        cfg["base_url"] = ""
+    return cfg, problems
+
+
+class AiMasker:
+    """Replaces IP / MAC addresses, host names and user names with stable tokens before text leaves this computer,
+    and puts the real values back into the answer that comes back."""
+
+    def __init__(self, names=()):
+        self.map = {}
+        self.orig = {}
+        self.names = [n for n in names if n and len(n) >= 3]
+        self.count = collections.Counter()
+
+    def _tok(self, kind, value):
+        key = (kind, value.lower())
+        if key not in self.map:
+            self.count[kind] += 1
+            self.map[key] = f"{kind}-{self.count[kind]}"
+            self.orig[self.map[key]] = value
+        return self.map[key]
+
+    def mask(self, text):
+        text = str(text)
+        for n in sorted(self.names, key=len, reverse=True):
+            text = re.sub(re.escape(n), lambda m: self._tok("SWITCH", n), text, flags=re.I)
+        text = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", lambda m: self._tok("IP", m.group(0)), text)
+        text = re.sub(r"\b[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}\b", lambda m: self._tok("MAC", m.group(0)), text, flags=re.I)
+        text = re.sub(r"\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b", lambda m: self._tok("MAC", m.group(0)), text, flags=re.I)
+        text = re.sub(r"(?i)(\bby |\buser(?:name)?[ :=]+'?|\[user: )([A-Za-z0-9_.@\\-]+)",
+                      lambda m: m.group(1) + self._tok("USER", m.group(2)), text)
+        text = re.sub(r"(?i)\b(password|secret|community|key|token)\b(\s+\d+)?\s+\S+", lambda m: m.group(1) + " <redacted>", text)
+        return text
+
+    def unmask(self, text):
+        for tok in sorted(self.orig, key=len, reverse=True):
+            text = re.sub(r"\b" + re.escape(tok) + r"\b", lambda m, t=tok: self.orig[t], text)
+        return text
+
+
+def ai_build_prompt(a, masker=None):
+    """The condensed analysis of one switch as text (never the whole log), optionally masked."""
+    m = masker.mask if masker else (lambda s: s)
+    lines = [f"Switch: {m(a['label'])}", f"Verdict from the rules: {a['verdict'].upper()} - {a['verdict_text']}",
+             f"Look-back: {'whole buffer' if not a['lookback_hours'] else str(a['lookback_hours']) + ' hours'}"]
+    f = a.get("facts") or {}
+    if f:
+        lines.append("Facts: " + "; ".join(f"{k}={m(v)}" for k, v in f.items() if k != "stack"))
+        for r in f.get("stack", []):
+            lines.append(f"Stack member {r['switch']}: {r['role']}, {r['state']}")
+    for n in a.get("notes", []):
+        lines.append("Note: " + m(n))
+    lines.append("Severity counts: " + ", ".join(f"{SEV_NAMES[int(k)]}={v}" for k, v in a["severity"].items() if v))
+    lines.append("")
+    lines.append("Findings:")
+    for fd in a["findings"]:
+        span = f", {fd['first']} to {fd['last']}" if fd["first"] else ""
+        lines.append(f"- [{_LEVEL_LABEL[fd['level']]}] {fd['title']} ({fd['category']}), {fd['count']} time(s){span}")
+        for ex in fd["examples"]:
+            lines.append("    evidence: " + m(ex))
+    if a.get("top"):
+        lines += ["", "Most frequent messages:"] + [f"- {t['count']}x {m(t['example'])}" for t in a["top"]]
+    return "\n".join(lines)[:AI_MAX_PROMPT_CHARS]
+
+
+def ai_describe_error(exc):
+    """A short reason for a failed API call. Never contains the API key."""
+    import urllib.error
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            body = exc.read(600).decode("utf-8", "replace")
+            detail = ""
+            try:
+                j = json.loads(body)
+                err = j.get("error")
+                detail = (err.get("message") if isinstance(err, dict) else err) or ""
+            except ValueError:
+                pass
+            detail = " ".join(str(detail).split())[:200]
+        except Exception:  # noqa: BLE001
+            detail = ""
+        hint = {401: " - the API key was rejected.", 403: " - access denied for this key or model.", 404: " - check the model name and the base URL.",
+                429: " - rate limit or quota reached."}.get(exc.code, "")
+        return f"The API answered HTTP {exc.code}{hint}" + (f" ({detail})" if detail else "")
+    if isinstance(exc, urllib.error.URLError):
+        return "Could not reach the API server (" + type(exc.reason).__name__ + ") - check the base URL and your internet / proxy access."
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "The API did not answer in time."
+    if isinstance(exc, ssl.SSLError):
+        return "The secure connection to the API failed."
+    return f"{type(exc).__name__}: {str(exc)[:160]}"
+
+
+def ai_call(cfg, api_key, system, user, max_tokens=900):
+    """One chat request to the configured provider. Returns the reply text. Raises on failure."""
+    import urllib.request
+    if not api_key:
+        raise ValueError("No API key is saved.")
+    if cfg["provider"] == "anthropic":
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {"content-type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
+        body = {"model": cfg["model"], "max_tokens": max_tokens, "system": system, "messages": [{"role": "user", "content": user}]}
+    else:
+        url = cfg["base_url"].rstrip("/") + "/chat/completions"
+        headers = {"content-type": "application/json", "authorization": "Bearer " + api_key}
+        body = {"model": cfg["model"], "max_tokens": max_tokens,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=AI_TIMEOUT, context=ssl.create_default_context()) as resp:
+        data = json.loads(resp.read(2_000_000).decode("utf-8", "replace"))
+    if cfg["provider"] == "anthropic":
+        text = "".join(b.get("text", "") for b in data.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
+    else:
+        text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    text = str(text).strip()
+    if not text:
+        raise ValueError("The API returned an empty answer.")
+    return text
+
+
 class Manager:
     def __init__(self, monitor, events):
         self.monitor = monitor
@@ -5029,6 +5766,7 @@ class Manager:
         self.site_name = None               # no site profile active until switch_site() is called
         self.backup_dir = None
         self.runs_dir = None
+        self.upgrade_dir = None
         self.reports_dir = None
         self.order = []
         self.info = {}
@@ -5045,6 +5783,7 @@ class Manager:
         self.max_parallel = MAX_CONCURRENT_RELOADS   # switches upgraded at the same time (global setting)
         self.stop_on_failure = True         # stop starting queued switches once one in the rollout fails
         self.settings = load_global_settings()          # the Settings page (gear icon); one file for every site
+        self.ai_cfg = load_ai_settings()                # Settings > AI Analysis (optional cloud second opinion)
         self.email_cfg = load_email_settings()          # Settings > Notifications (e-mail copies of the notifications)
         self.session_started = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # "fresh start" = nothing older than this
         self._apply_settings()
@@ -5052,6 +5791,7 @@ class Manager:
         self.rollout_of = {}                # host -> rollout id
         self.profiles = {}                  # credential profiles of the active site (passwords encrypted)
         self.assign = {}                    # host -> credential profile name
+        self._assign_cleared = set()        # sites whose profile assignments were reset in this run
         self.notes = []                     # upgrade notifications of the active site (oldest first)
         self.notes_lock = threading.Lock()
         self.keep_awake = KeepAwake(self._need_awake, self._awake_changed)
@@ -5059,6 +5799,9 @@ class Manager:
         self.target_image = ""              # image last picked in an Operator/Administrator drawer (shown to Viewers)
         self.topo_lock = threading.RLock()  # Diagram tab: guards topology.json and the scan progress below
         self.topo_run = None                # the latest CDP topology scan of the active site
+        self.diag_lock = threading.RLock()  # Diagnosis tab: guards the run below and the analyses
+        self.diag_run = None                # the latest Diagnosis run (commands or log analysis) of the active site
+        self.diag_results = {}              # {host: latest log analysis} of the active site
         self.pool = ThreadPoolExecutor(max_workers=BACKUP_WORKERS)
         self.job_tmp = tempfile.mkdtemp(prefix="swmgr_")  # private dir (0700) for credential job files
         self._stop = threading.Event()
@@ -5103,6 +5846,11 @@ class Manager:
             self.site_name = name
             self.backup_dir = site_backups_dir(name)
             self.runs_dir = site_runs_dir(name)
+            self.upgrade_dir = site_upgrade_dir(name)
+            try:
+                self.upgrade_dir.mkdir(parents=True, exist_ok=True)   # visible in Storage from the start
+            except OSError:
+                pass
             global COMMAND_LOG_DIR
             COMMAND_LOG_DIR = self.runs_dir
             self.term_close_all()
@@ -5115,12 +5863,24 @@ class Manager:
             self.jobs = {}
             self.backup_run = None
             self.topo_run = None
+            self.diag_run = None
+            self.diag_results = {}
             try:
                 self.profiles, self.assign = load_site_profiles(name)
             except Exception as exc:  # noqa: BLE001 - a damaged profile file must not block the site
                 print(f"Could not read credential profiles for '{name}': {type(exc).__name__}", flush=True)
                 self.profiles, self.assign = {}, {}
             self.assign = {h: p for h, p in self.assign.items() if h in self.info}
+            if name not in self._assign_cleared:
+                # First time this site is opened since the tool was launched: no switch keeps the credential
+                # profile it had in the previous run (the profiles themselves stay saved - attach one again).
+                self._assign_cleared.add(name)
+                if self.assign:
+                    self.assign = {}
+                    try:
+                        save_site_profiles(name, self.profiles, self.assign)
+                    except OSError as exc:
+                        print(f"Could not clear the credential profile assignments of '{name}': {type(exc).__name__}", flush=True)
             data = read_json_file(site_notes_path(name))
             with self.notes_lock:
                 carried = [n for n in self.notes if n.get("kind") in ("login", "logout")]   # not tied to a site
@@ -6518,11 +7278,13 @@ class Manager:
             if self._upgrade_active(h):
                 raise ApiError(f"{h} is already upgrading right now.", 409)
 
-    def start_upgrade(self, hosts, image_path, backup_first=False, action="full",
+    def start_upgrade(self, hosts, image_path, backup_first=True, action="full",
                       started_by=None, skip_image_check=False, ignore_space=False):
         """action: 'full' (upload+activate+reload, default) | 'distribute' (upload+add to flash
         only, no reload - stage it ahead of time) | 'activate' (activate an image already
-        distributed to flash and reload - no image_path needed)."""
+        distributed to flash and reload - no image_path needed).
+        The configuration backup (the defined backup commands) always runs first, whatever the caller passes."""
+        backup_first = True
         self._require_site()
         hosts = self._validate_hosts(hosts)
         if not self.monitor.running:
@@ -6579,7 +7341,7 @@ class Manager:
                     self.ops[h]["upgrade"] = {**self._new_ops()["upgrade"], "state": "starting",
                                               "phase": "waiting_backup", "started": now_str(),
                                               "started_ts": time.time(), "action": action,
-                                              "started_by": started_by or "local",
+                                              "started_by": started_by or "local", "with_backup": True,
                                               "message": "Backing up before the upgrade starts ..."}
                 threading.Thread(target=self._launch_after_backup,
                                  args=(list(run_hosts), cm, image, action, started_by or "local", ignore_space),
@@ -6612,13 +7374,40 @@ class Manager:
                     if self.ops[h]["backup"]["state"] == "completed":
                         self.runs_dir.mkdir(parents=True, exist_ok=True)
                         self._launch_job(h, *cm[h], image, action, started_by, ignore_space)
+                        self.ops[h]["upgrade"]["with_backup"] = True      # the Backup stage of the progress bar was done
+                        self._copy_backup_to_record(h)                    # keep that backup with this run's pre-/post-check
                     else:
-                        self.ops[h]["upgrade"] = {**self._new_ops()["upgrade"], "started_by": started_by}
+                        self.ops[h]["upgrade"] = {**self._new_ops()["upgrade"], "started_by": started_by,
+                                                  "action": action, "phase": "waiting_backup", "with_backup": True}
                         self._finish(h, "failed", "Upgrade skipped: the pre-upgrade backup failed")
 
+    def _copy_backup_to_record(self, host):
+        """Copy the backup that was just taken (newest config_backup_*.txt of the device) into this upgrade's
+        record folder as pre-upgrade-backup_<stamp>.txt. Best-effort: never blocks or fails the upgrade."""
+        try:
+            job = self.jobs.get(host) or {}
+            record_dir = job.get("record_dir")
+            if not record_dir or self.backup_dir is None:
+                return
+            device_dir = self.backup_dir / device_folder_name(self.label(host), host)
+            newest = None
+            for e in os.scandir(device_dir):
+                if e.is_file() and e.name.startswith(BACKUP_FILE_PREFIX + "_") and e.name.endswith(".txt"):
+                    mt = e.stat().st_mtime
+                    if newest is None or mt > newest[0]:
+                        newest = (mt, e.path)
+            if newest is None or time.time() - newest[0] > 3600:      # nothing recent: not this run's backup
+                return
+            stamp = os.path.basename(record_dir)
+            Path(record_dir).mkdir(parents=True, exist_ok=True)
+            shutil.copy2(newest[1], os.path.join(record_dir, f"pre-upgrade-backup_{stamp}.txt"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not copy the pre-upgrade backup of {host} to its upgrade record: {type(exc).__name__}", flush=True)
+
     # ---- scheduled upgrade --------------------------------------------------- #
-    def schedule_upgrade(self, hosts, image_path, run_at, backup_first=False, action="full",
+    def schedule_upgrade(self, hosts, image_path, run_at, backup_first=True, action="full",
                          started_by=None, skip_image_check=False, ignore_space=False):
+        backup_first = True                    # the pre-upgrade backup is mandatory
         self._require_site()
         hosts = self._validate_hosts(hosts)
         self._creds_map(hosts)          # every device needs a profile now; read again when the run starts
@@ -6709,7 +7498,7 @@ class Manager:
                         self._finish(h, "failed", f"Scheduled run failed: {exc}")
                         entry.clear()
                         continue
-                    if entry.get("backup_first"):
+                    if True:                          # the pre-upgrade backup is mandatory (older schedule entries may lack the flag)
                         try:
                             self.start_backup([h])
                         except ApiError as exc:
@@ -6742,7 +7531,13 @@ class Manager:
         self.term_close_host(host)                  # no console may stay open on a switch that is about to reload
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = self.runs_dir / f"upgrade_{safe_name(host)}_{stamp}"
-        job = {"id": stamp, "status_path": f"{base}.status.json", "log_path": f"{base}.log",
+        record_dir = self.upgrade_dir / device_folder_name(self.label(host), host) / stamp if self.upgrade_dir else None
+        if record_dir is not None:
+            try:
+                record_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                record_dir = None
+        job = {"id": stamp, "record_dir": str(record_dir) if record_dir else "", "status_path": f"{base}.status.json", "log_path": f"{base}.log",
                "job_path": os.path.join(self.job_tmp, f"{safe_name(host)}_{stamp}.job.json"),
                "console_log": f"{base}.console.txt", "beat": time.time(), "proc": None, "direct": False}
         verb = self.ACTION_VERB.get(action, "Firmware upgrade")
@@ -6759,6 +7554,8 @@ class Manager:
                    "username": username, "password": password, "secret": secret,
                    "status_path": job["status_path"], "log_path": job["log_path"],
                    "timeouts": dict(TIMEOUTS)}
+        if record_dir is not None:
+            payload["record_dir"] = str(record_dir)
         _rec = self.profiles.get(self.assign.get(host)) or {}
         if _rec.get("port") and _rec.get("port") != default_port("ssh"):
             payload["port"] = int(_rec["port"])         # custom SSH port: the worker (and its SCP copy) must use it too
@@ -7145,6 +7942,294 @@ class Manager:
                     run["finished"] = now_str()
         self.events.add(host, self.label(host) if host in self.info else host, f"Topology scan: {detail}",
                         "ok" if ok else "bad")
+
+    # ---- Diagnosis tab: custom read-only commands + log analysis (never part of an upgrade) ------------------- #
+    def _diag_state_path(self):
+        return site_dir(self.site_name) / "diagnosis.json"
+
+    def _diag_commands_saved(self):
+        data = read_json_file(self._diag_state_path()) if self.site_name else None
+        text = data.get("commands") if isinstance(data, dict) else ""
+        return text if isinstance(text, str) else ""
+
+    def _diag_commands_save(self, text):
+        try:
+            site_dir(self.site_name).mkdir(parents=True, exist_ok=True)
+            tmp = self._diag_state_path().with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"commands": text[:20000]}, indent=1), encoding="utf-8")
+            tmp.replace(self._diag_state_path())
+        except OSError:
+            pass                                          # remembering the text is a convenience only
+
+    def diag_view(self):
+        """Everything the Diagnosis tab draws: the device picker, the run in progress, the analyses so far."""
+        with self.lock:
+            site = self.site_name
+            order = list(self.order)
+            info = {h: dict(self.info[h]) for h in order}
+            cred_ok = {h: self.assign.get(h) in self.profiles for h in order}
+            profile = {h: self.assign.get(h) for h in order}
+        with self.diag_lock:
+            run = self.diag_run if (self.diag_run and self.diag_run.get("site") == site) else None
+            run_copy = None if run is None else {k: (v if k != "hosts" else {h: dict(x) for h, x in v.items()})
+                                                  for k, v in run.items()}
+            results = {h: a for h, a in self.diag_results.items() if h in info} if site else {}
+        devices = [{"host": h, "label": info[h].get("label") or h, "platform": info[h].get("platform") or "",
+                    "has_creds": cred_ok[h], "profile": profile[h] if cred_ok[h] else None} for h in order]
+        cfg = self.ai_cfg
+        return {"site": site, "devices": devices, "run": run_copy, "results": results,
+                "commands": self._diag_commands_saved() if site else "",
+                "lookbacks": list(DIAG_LOOKBACK_HOURS), "log_commands": list(DIAG_LOG_COMMANDS),
+                "allowed_words": list(DIAG_COMMAND_WORDS), "max_commands": DIAG_MAX_COMMANDS,
+                "ai": {"enabled": bool(cfg["enabled"] and cfg.get("api_key_enc")), "provider": AI_PROVIDERS[cfg["provider"]],
+                       "model": cfg["model"], "mask": bool(cfg["mask"])}}
+
+    def _diag_start(self, kind, hosts, extra):
+        self._require_site()
+        hosts = self._validate_hosts(hosts)
+        cm = self._creds_map(hosts)
+        with self.lock:
+            self._poll_all()
+            busy = {h for h in hosts if self._upgrade_active(h)}
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with self.diag_lock:
+            if self.diag_run and self.diag_run.get("site") == self.site_name and not self.diag_run["finished"]:
+                raise ApiError("A Diagnosis run is already in progress - wait for it to finish.", 409)
+            run = {"kind": kind, "site": self.site_name, "stamp": stamp, "started": now_str(), "finished": None,
+                   "total": len(hosts), "done": 0, "hosts": {h: {"state": "queued", "detail": "", "file": ""} for h in hosts}}
+            run.update(extra)
+            for h in busy:
+                run["hosts"][h] = {"state": "skipped", "detail": "Upgrade in progress - not touched", "file": ""}
+                run["done"] += 1
+            if run["done"] >= run["total"]:
+                run["finished"] = now_str()
+            self.diag_run = run
+            if kind == "logs":
+                for h in hosts:
+                    self.diag_results.pop(h, None)
+        return cm, [h for h in hosts if h not in busy], stamp, busy
+
+    def _diag_write(self, site, host, name, text):
+        folder = site_diag_dir(site) / device_folder_name(self.label(host), host)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_text(text, encoding="utf-8")
+        return f"{SITE_DIAG_SUBDIR}/{folder.name}/{name}"
+
+    def _diag_set(self, site, host, state, detail, file=""):
+        with self.diag_lock:
+            run = self.diag_run
+            if run and run.get("site") == site and host in run["hosts"]:
+                run["hosts"][host] = {"state": state, "detail": detail, "file": file}
+                if state in ("ok", "failed"):
+                    run["done"] += 1
+                    if run["done"] >= run["total"] and not run["finished"]:
+                        run["finished"] = now_str()
+
+    def start_diag_commands(self, hosts, commands_text, who=None):
+        """Run the typed read-only commands on the selected switches and save every output under Diagnosis/<switch>/."""
+        cmds, problems = parse_diag_commands(commands_text)
+        if problems:
+            raise ApiError(" ".join(problems[:4]) + (f" (+{len(problems) - 4} more problem(s))" if len(problems) > 4 else ""))
+        cm, todo, stamp, busy = self._diag_start("commands", hosts, {"commands": cmds})
+        self._diag_commands_save(str(commands_text))
+        for h in todo:
+            self.pool.submit(self._diag_commands_one, h, self.site_name, stamp, cmds, *cm[h])
+        self.events.add("-", "", f"Diagnosis: {len(cmds)} command(s) on {len(todo)} switch(es) started by {who or 'local'}", "info")
+        msg = f"Running {len(cmds)} command(s) on {len(todo)} switch(es) ..."
+        if busy:
+            msg += f" {len(busy)} skipped because an upgrade is running on them."
+        return {"message": msg}
+
+    def _diag_connect_kwargs(self, host, username, password, secret):
+        info = self.info.get(host) or {}
+        return {"device_type": BACKUP_DEVICE_TYPES.get(info.get("type"), "cisco_xe"), "host": host, "username": username,
+                "password": password, "secret": secret}
+
+    def _diag_collect(self, host, username, password, secret, commands):
+        """[(command, output, error)] - one login, every command tried even if an earlier one failed."""
+        out = []
+        with ConnectHandler(**self._diag_connect_kwargs(host, username, password, secret)) as conn:
+            if secret:
+                conn.enable()
+            for cmd in commands:
+                try:
+                    out.append((cmd, conn.send_command(cmd, read_timeout=tmo("show_cmd")), ""))
+                except Exception as exc:  # noqa: BLE001
+                    out.append((cmd, "", f"{type(exc).__name__}"))
+        return out
+
+    @activity("Diagnosis")
+    def _diag_commands_one(self, host, site, stamp, commands, username, password, secret):
+        self._diag_set_running(site, host, "Connecting ...")
+        label = self.label(host) if host in self.info else host
+        state, detail, rel = "failed", "", ""
+        try:
+            got = self._diag_collect(host, username, password, secret, commands)
+            sections = [(c, o if not e else f"(command failed: {e})") for c, o, e in got]
+            failed = sum(1 for _c, _o, e in got if e)
+            text = command_sections_text(f"Diagnosis commands - {label} ({host}) - {now_str()}", sections)
+            rel = self._diag_write(site, host, f"commands_{stamp}.txt", text)
+            detail = f"{len(commands) - failed} of {len(commands)} command(s) saved" + (f", {failed} failed" if failed else "")
+            state = "ok" if failed < len(commands) else "failed"
+        except NetmikoAuthenticationException:
+            detail = "Authentication failed"
+        except NetmikoTimeoutException:
+            detail = "Connection timed out"
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {exc}"[:160]
+        self._diag_set(site, host, state, detail, rel)
+        self.events.add(host, label, f"Diagnosis commands: {detail}", "ok" if state == "ok" else "bad")
+
+    def _diag_set_running(self, site, host, detail):
+        with self.diag_lock:
+            run = self.diag_run
+            if run and run.get("site") == site and host in run["hosts"]:
+                run["hosts"][host] = {"state": "running", "detail": detail, "file": ""}
+
+    def start_diag_logs(self, hosts, lookback_hours, who=None):
+        """Read the log (and a few related commands) from the selected switches and analyze it locally."""
+        try:
+            lookback = int(lookback_hours or 0)
+        except (TypeError, ValueError):
+            lookback = -1
+        if lookback not in DIAG_LOOKBACK_HOURS:
+            raise ApiError("Choose one of the look-back windows from the list.")
+        cm, todo, stamp, busy = self._diag_start("logs", hosts, {"lookback_hours": lookback})
+        for h in todo:
+            self.pool.submit(self._diag_logs_one, h, self.site_name, stamp, lookback, *cm[h])
+        self.events.add("-", "", f"Diagnosis: log analysis on {len(todo)} switch(es) started by {who or 'local'}", "info")
+        msg = f"Reading the logs of {len(todo)} switch(es) ..."
+        if busy:
+            msg += f" {len(busy)} skipped because an upgrade is running on them."
+        return {"message": msg}
+
+    @activity("Diagnosis")
+    def _diag_logs_one(self, host, site, stamp, lookback, username, password, secret):
+        self._diag_set_running(site, host, "Connecting ...")
+        label = self.label(host) if host in self.info else host
+        try:
+            got = self._diag_collect(host, username, password, secret, DIAG_LOG_COMMANDS)
+            sections = {c: (o if not e else "") for c, o, e in got}
+            if not any(sections.values()):
+                raise RuntimeError("The switch returned no output")
+            self._diag_set_running(site, host, "Analyzing ...")
+            raw = command_sections_text(f"Log collection - {label} ({host}) - {now_str()}",
+                                        [(c, o if not e else f"(command failed: {e})") for c, o, e in got])
+            raw_rel = self._diag_write(site, host, f"logs_{stamp}.txt", raw)
+            a = analyze_switch_logs(sections, lookback, label, host)
+            a["stamp"] = stamp
+            a["files"] = {"logs": raw_rel}
+            a["files"]["report"] = self._diag_write(site, host, f"log-analysis_{stamp}.txt", format_analysis_report(a, raw_rel))
+            with self.diag_lock:
+                if self.site_name == site:
+                    self.diag_results[host] = a
+            self._diag_set(site, host, "ok", a["verdict_text"], a["files"]["report"])
+            self.events.add(host, label, f"Log analysis: {a['verdict'].upper()} - {a['verdict_text']}",
+                            {"green": "ok", "amber": "info", "red": "bad"}[a["verdict"]])
+        except NetmikoAuthenticationException:
+            self._diag_set(site, host, "failed", "Authentication failed")
+            self.events.add(host, label, "Log analysis: authentication failed", "bad")
+        except NetmikoTimeoutException:
+            self._diag_set(site, host, "failed", "Connection timed out")
+            self.events.add(host, label, "Log analysis: connection timed out", "bad")
+        except Exception as exc:  # noqa: BLE001
+            self._diag_set(site, host, "failed", f"{type(exc).__name__}: {exc}"[:160])
+            self.events.add(host, label, f"Log analysis failed: {type(exc).__name__}", "bad")
+
+    # ---- optional AI second opinion (Settings > AI Analysis) ---------------------------------------------- #
+    def ai_settings_view(self):
+        """For the Settings page. The API key is never sent back - only whether one is saved."""
+        cfg = self.ai_cfg
+        return {"values": {"enabled": cfg["enabled"], "provider": cfg["provider"], "model": cfg["model"],
+                           "base_url": cfg["base_url"], "mask": cfg["mask"]},
+                "key_saved": bool(cfg.get("api_key_enc")),
+                "providers": [{"key": k, "label": v} for k, v in AI_PROVIDERS.items()],
+                "defaults": {"anthropic_model": AI_DEFAULTS["model"]}}
+
+    def update_ai_settings(self, values, who=None):
+        if not isinstance(values, dict):
+            raise ApiError("Send the AI settings as a JSON object.")
+        cfg, problems = ai_clean_values(values)
+        key = str(values.get("api_key") or "").strip()
+        if len(key) > 400 or re.search(r"[\s\x00-\x1f]", key):
+            problems.append("The API key is not valid (spaces or line breaks).")
+        cfg["api_key_enc"] = "" if values.get("clear_key") else self.ai_cfg.get("api_key_enc", "")
+        if cfg["enabled"] and not key and not cfg["api_key_enc"]:
+            problems.append("Enter the API key.")
+        if problems:
+            raise ApiError(" ".join(problems))
+        if key:
+            try:
+                cfg["api_key_enc"] = protect_secret(key)
+            except (Exception, SystemExit) as exc:  # noqa: BLE001
+                raise ApiError(f"Could not encrypt the API key ({type(exc).__name__}).", 500)
+        try:
+            save_ai_settings(cfg)
+        except OSError as exc:
+            raise ApiError(f"Could not save the AI settings ({type(exc).__name__}).", 500)
+        was = self.ai_cfg["enabled"]
+        self.ai_cfg = cfg
+        self.events.add("-", "", "AI log analysis settings saved by " + (who or "local") + ": " + (
+            f"ON ({AI_PROVIDERS[cfg['provider']]}, model {cfg['model']})" if cfg["enabled"] else ("switched OFF" if was else "OFF")), "info")
+        out = self.ai_settings_view()
+        out["message"] = "Saved - applied now." if cfg["enabled"] else "Saved - the cloud AI option is OFF (log analysis stays local)."
+        return out
+
+    def test_ai_settings(self, values, who=None):
+        cfg, problems = ai_clean_values(dict(values or {}, enabled=True))
+        key = str((values or {}).get("api_key") or "").strip()
+        if not key and self.ai_cfg.get("api_key_enc") and not (values or {}).get("clear_key"):
+            try:
+                key = unprotect_secret(self.ai_cfg["api_key_enc"])
+            except Exception:  # noqa: BLE001
+                key = ""
+        if not key:
+            problems.append("Enter the API key.")
+        if problems:
+            raise ApiError(" ".join(problems))
+        try:
+            ai_call(cfg, key, "Reply with the single word OK.", "Connection test.", max_tokens=20)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
+            raise ApiError("Test failed: " + ai_describe_error(exc))
+        return {"message": f"Connected - {AI_PROVIDERS[cfg['provider']]} answered using model {cfg['model']}."}
+
+    def diag_ai_advice(self, host, who=None):
+        """A second opinion on ONE switch's local analysis. Sends only the condensed findings (masked by default)."""
+        cfg = self.ai_cfg
+        if not cfg["enabled"] or not cfg.get("api_key_enc"):
+            raise ApiError("The cloud AI option is off. An administrator can turn it on under Settings > AI Analysis.")
+        with self.diag_lock:
+            a = self.diag_results.get(host)
+            site = self.site_name
+        if not a:
+            raise ApiError("Run the log analysis on this switch first.")
+        try:
+            key = unprotect_secret(cfg["api_key_enc"])
+        except Exception:  # noqa: BLE001
+            raise ApiError("The saved API key cannot be read on this computer - enter it again in Settings > AI Analysis.")
+        masker = AiMasker([a.get("label"), self.label(host) if host in self.info else ""]) if cfg["mask"] else None
+        prompt = ai_build_prompt(a, masker)
+        try:
+            text = ai_call(cfg, key, AI_SYSTEM_PROMPT, prompt)
+        except (Exception, SystemExit) as exc:  # noqa: BLE001
+            raise ApiError("The AI request failed: " + ai_describe_error(exc))
+        if masker:
+            text = masker.unmask(text)
+        advice = {"time": now_str(), "provider": AI_PROVIDERS[cfg["provider"]], "model": cfg["model"],
+                  "masked": bool(cfg["mask"]), "text": text}
+        try:
+            rel = self._diag_write(site, host, f"ai-advice_{a.get('stamp') or datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                   f"AI second opinion - {a['label']} ({host}) - {advice['time']}\n"
+                                   f"Provider: {advice['provider']}, model {advice['model']}, identifiers {'masked' if advice['masked'] else 'NOT masked'}\n"
+                                   "Advisory only - generated text, verify it against the evidence.\n\n" + text + "\n")
+            advice["file"] = rel
+        except OSError:
+            advice["file"] = ""
+        with self.diag_lock:
+            if self.site_name == site and host in self.diag_results:
+                self.diag_results[host]["ai"] = advice
+        self.events.add(host, a["label"], f"AI second opinion requested by {who or 'local'} ({advice['provider']})", "info")
+        return {"message": "Done.", "ai": advice}
 
     def topology_set_root(self, host, on):
         """Choose which switch is the top of its tree (the distribution / core), overriding the automatic guess."""
@@ -8149,6 +9234,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .step.failed .c { background:var(--rd); color:#fff; }
   .step.active .c { background:var(--ac); color:#fff; animation:pulse 1.4s ease-in-out infinite; }
   .step.done, .step.warn, .step.failed, .step.active { color:var(--tx); }
+  .step.skip { opacity:.55; }
   .dr-bar { height:6px; border-radius:3px; background:var(--t-g); overflow:hidden; flex:1; }
   .dr-bar > i { display:block; height:100%; background:var(--ac); transition:width .4s; }
   .dr-barrow { display:flex; align-items:center; gap:10px; font-size:12px; }
@@ -8247,6 +9333,41 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tab.on { color:var(--tx); font-weight:600; border-bottom-color:var(--ac); }
 
   /* ---- Diagram page ---- */
+  /* ---- Diagnosis tab ---- */
+  #diagnosis main { overflow:auto; }
+  .dx-card { flex:1; min-height:0; display:flex; flex-direction:column; }
+  .dx-grid { display:grid; grid-template-columns:290px minmax(0,1fr); flex:1; min-height:0; }
+  .dx-pick { border-right:1px solid var(--bd); padding:0 14px 14px; overflow:auto; }
+  .dx-work { padding:14px 18px 22px; overflow:auto; min-width:0; }
+  .dx-intro { font-size:13px; color:var(--mu); margin:0 0 10px; line-height:1.5; }
+  .dx-work textarea { width:100%; height:170px; box-sizing:border-box; }
+  .dx-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:10px 0 4px; }
+  .dx-row label { margin:0; font-size:13px; }
+  .dx-res { margin-top:14px; display:flex; flex-direction:column; gap:10px; }
+  .dx-sw { border:1px solid var(--bd); border-radius:10px; background:var(--pn); overflow:hidden; }
+  .dx-sw > .hd { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:9px 12px; border-bottom:1px solid var(--bd); }
+  .dx-sw > .hd b { font-size:14px; }
+  .dx-sw .bd { padding:10px 12px; font-size:13px; }
+  .dx-sw .sp { margin-left:auto; display:flex; gap:6px; flex-wrap:wrap; }
+  .dx-v { display:inline-block; padding:2px 10px; border-radius:999px; font-size:11.5px; font-weight:700; border:1px solid currentColor; }
+  .dx-v.green { color:var(--gr); background:var(--t-gn); } .dx-v.amber { color:var(--c-a); background:var(--t-a); } .dx-v.red { color:var(--c-r); background:var(--t-r); }
+  .dx-v.run { color:var(--mu); } .dx-v.bad { color:var(--c-r); background:var(--t-r); }
+  .dx-note { font-size:12px; color:var(--mu); margin:4px 0; }
+  .dx-f { border:1px solid var(--bd); border-radius:8px; margin:6px 0; background:var(--pn2); }
+  .dx-f > summary { cursor:pointer; padding:6px 10px; font-weight:600; display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  .dx-f > summary .m { font-weight:400; color:var(--mu); font-size:12px; }
+  .dx-f .fb { padding:2px 12px 10px; }
+  .dx-lv { font-size:10.5px; font-weight:700; padding:1px 7px; border-radius:6px; border:1px solid currentColor; }
+  .dx-lv.crit { color:var(--c-r); } .dx-lv.warn { color:var(--c-a); } .dx-lv.info { color:var(--c-b); }
+  .dx-ev { margin:6px 0 0; padding:6px 8px; background:var(--pn); border:1px solid var(--bd); border-radius:6px; font:11.5px ui-monospace,Consolas,monospace; white-space:pre-wrap; word-break:break-word; }
+  .dx-top { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
+  .dx-top td { padding:3px 6px; border-top:1px solid var(--bd); vertical-align:top; }
+  .dx-top td:first-child { width:48px; text-align:right; color:var(--mu); }
+  .dx-ai { margin-top:10px; padding:10px 12px; border:1px dashed var(--ac); border-radius:8px; background:var(--acs); }
+  .dx-ai pre { margin:6px 0 0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 inherit; font-family:inherit; }
+  .dx-line { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--pn); font-size:13px; }
+  .dx-line .sp { margin-left:auto; display:flex; gap:6px; }
+  @media (max-width: 900px) { .dx-grid { grid-template-columns:1fr; } .dx-pick { border-right:0; border-bottom:1px solid var(--bd); max-height:260px; } }
   .dg-side { width:300px; }
   .dg-sec { padding:0 14px 14px; }
   .dg-actions { position:sticky; top:0; z-index:3; display:flex; gap:8px; margin:8px -14px 0; padding:8px 14px; background:var(--pn2); border-bottom:1px solid var(--bd); }
@@ -8406,7 +9527,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .user-pop a[hidden] { display:none; }
   @media (max-width:900px) { .userbtn .uname { display:none; } }
   /* ---- roles: the server enforces them; this only hides what a role cannot use ---- */
-  body.role-viewer #side, body.role-viewer #storage, body.role-viewer #tab-storage, body.role-viewer #diagram, body.role-viewer #tab-diagram, body.role-viewer #btn-mon,
+  body.role-viewer #side, body.role-viewer #storage, body.role-viewer #tab-storage, body.role-viewer #diagram, body.role-viewer #tab-diagram, body.role-viewer #diagnosis, body.role-viewer #tab-diagnosis, body.role-viewer #btn-mon,
   body.role-viewer #sel-count, body.role-viewer #btn-version, body.role-viewer #btn-delete-devices,
   body.role-viewer .ck, body.role-viewer #note-clear { display:none !important; }
   body.role-viewer #site-badge { pointer-events:none; cursor:default; }
@@ -8691,6 +9812,250 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   @media (max-width:1000px) { .ct-wb, .ct-result-g { grid-template-columns:minmax(0,1fr); } .ct-tiles { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   .pill[data-rtip] { cursor:help; }
   [data-rtip] { cursor:help; }
+
+  /* ================= NetUpgrade "Glass Dashboard" theme (redesign) =================
+     Floating pill header, glass cards with a blue corner glow, pill buttons, donut charts. */
+  :root {
+    --card:linear-gradient(160deg,#f1f6ff 0%,#fff 45%); --hd:#fff; --thb:#eef3fc; --glass:#f4f7fd;
+    --glow:0 6px 22px #1f6bff55; --rad:22px; --tile:#f4f7fd;
+    --bg:#e9eff9; --bg2:#dfe8f8; --bd:#d9e2f3; --ac:#1f6bff; --acs:#e2ecff; --sel:#e2ecff; --tbd:#d9e2f3;
+    --sh:0 8px 30px #1b2f6a12; --pn2:#f3f6fd;
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+    --card:linear-gradient(155deg,#12306b 0%,#0c1a3a 34%,#0a1329 100%); --hd:linear-gradient(90deg,#0f1c40,#0a1431 60%,#0a1330);
+    --thb:#080f21; --glass:#111c3a; --tile:#0b1429; --bg:#050a18; --bg2:#0a1630; --pn:#0c1429; --pn2:#09111f; --bd:#1a2748;
+    --tbd:#1a2748; --ac:#2f86ff; --acs:#13295c; --sel:#14316e; --tx:#eef3ff; --mu:#8d9cc2; --sh:none;
+    --t-b:#0f2f66; --t-r:#3a1a2c; --t-a:#3a3016; --t-g:#17213d; --t-gn:#0f3326; --glow:0 6px 26px #2f86ff66; } }
+  :root[data-theme="dark"] {
+    --card:linear-gradient(155deg,#12306b 0%,#0c1a3a 34%,#0a1329 100%); --hd:linear-gradient(90deg,#0f1c40,#0a1431 60%,#0a1330);
+    --thb:#080f21; --glass:#111c3a; --tile:#0b1429; --bg:#050a18; --bg2:#0a1630; --pn:#0c1429; --pn2:#09111f; --bd:#1a2748;
+    --tbd:#1a2748; --ac:#2f86ff; --acs:#13295c; --sel:#14316e; --tx:#eef3ff; --mu:#8d9cc2; --sh:none;
+    --t-b:#0f2f66; --t-r:#3a1a2c; --t-a:#3a3016; --t-g:#17213d; --t-gn:#0f3326; --glow:0 6px 26px #2f86ff66;
+  }
+  body { background:radial-gradient(900px 480px at 12% -8%, var(--bg2), transparent 70%),
+                    radial-gradient(800px 460px at 100% 0, var(--bg2), transparent 65%), var(--bg); }
+  ::-webkit-scrollbar { width:9px; height:9px; } ::-webkit-scrollbar-thumb { background:var(--bd); border-radius:9px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+
+  /* header: floating pill */
+  header { margin:14px 16px 0; height:64px; border-radius:999px; background:var(--hd); border:1px solid var(--bd);
+           box-shadow:var(--sh); padding:0 14px 0 10px; gap:8px; }
+  .brand { border-right:0; font-weight:600; font-size:17px; padding-right:6px; }
+  .brand img { width:36px; height:36px; border-radius:50%; background:var(--glass); padding:5px; border:1px solid var(--bd); }
+  .tabs { align-self:center; gap:6px; margin-left:6px; }
+  .tab { border:0; border-radius:999px; height:42px; padding:0 20px; font-size:13.5px; }
+  .tab:hover { background:var(--glass); }
+  .tab.on { background:linear-gradient(180deg,#4a97ff,#1d6bff); color:#fff; box-shadow:var(--glow), inset 0 1px 0 #ffffff55; }
+  .ib { border-radius:50%; width:40px; height:40px; background:var(--glass); border:1px solid var(--bd); }
+  .ib:hover { background:var(--acs); border-color:var(--ac); }
+  .card > h4 .ib.mx { border:0; background:none; border-radius:8px; }
+  .userbtn { height:44px; padding:0 14px 0 5px; border-radius:999px; background:var(--glass); border:1px solid var(--bd); }
+  .userbtn svg { width:32px; height:32px; padding:6px; border-radius:50%; background:linear-gradient(135deg,#3b8cff,#7c5cff); color:#fff; }
+  .mstate, .badge { border-radius:999px; }
+  .badge { background:var(--glass); }
+  .site-pop, .note-pop, .user-pop, .col-pop { border-radius:16px; }
+
+  /* layout: floating glass side panel + cards */
+  .app { padding:14px 16px 16px; gap:14px; }
+  .side { border:1px solid var(--bd); border-radius:var(--rad); background:var(--card); box-shadow:var(--sh); }
+  .sec > h3 { border-radius:999px; }
+  .sec.o > h3 { background:var(--sel); box-shadow:none; color:var(--tx); border:1px solid var(--ac); }
+  main { padding:0; gap:14px; }
+  .card, .fbar { border-radius:var(--rad); background:var(--card); border:1px solid var(--bd); box-shadow:var(--sh); }
+  .card > h4 { padding:16px 20px 8px; font-size:15px; font-weight:600; border-bottom:0; }
+  .dev-tools { padding-left:20px; padding-right:20px; }
+
+  /* buttons and inputs: pills */
+  .btn { border-radius:999px; background:var(--glass); padding:7px 15px; }
+  .btn.sm { padding:5px 13px; }
+  .btn.p { background:linear-gradient(180deg,#4a97ff,#1d6bff); border-color:transparent; box-shadow:var(--glow); }
+  .btn.p:hover:not(:disabled) { filter:brightness(1.08); }
+  .btn.on { background:var(--acs); }
+  input[type=text], input[type=password], input[type=datetime-local], textarea, select { border-radius:12px; background:var(--glass); }
+
+  /* summary tiles + donut cards */
+  .wg { grid-template-columns:repeat(2, minmax(0,1fr)); }
+  .tl { padding:6px 20px 20px; gap:10px; }
+  .t { border-radius:16px; padding:12px 6px; background:var(--tile); border:1px solid var(--bd); }
+  .t b { font-size:28px; font-weight:600; } .t.b b { color:var(--ac); } .t.r b { color:var(--rd); } .t.gn b { color:var(--gr); } .t.a b { color:var(--am); }
+
+  /* device table */
+  .sc { padding:0 14px 14px; }
+  th { background:var(--thb); padding:12px 8px; }
+  th:first-child { border-radius:14px 0 0 14px; } th:last-child { border-radius:0 14px 14px 0; }
+  td { padding:12px 8px; }
+  tr:hover td { background:var(--glass); } tr.sel td { background:var(--sel); }
+  .pill { padding:3px 11px; }
+  .hist i { border-radius:3px; }
+
+  /* device drawer: floating glass panel */
+  .drawer { top:92px; bottom:14px; right:14px; border:1px solid var(--bd); border-radius:var(--rad); background:var(--card); overflow:hidden; }
+  @media (min-width:1400px) { body.drawer-open #dashboard { margin-right:calc(var(--dw) + 14px); } }
+  .dr-card, .dr-fold, .dr-run { border-radius:14px; }
+  .dr-tabs button.on { border-bottom-width:3px; }
+  .modal-card { border-radius:20px; }
+
+  /* fit fixes */
+  .badge, #btn-mon, .mstate { white-space:nowrap; }
+  .row .btn { padding:6px 8px; }
+  .row .btn { padding:6px 4px; min-width:0; font-size:12px; }
+  #btn-mon.ok { background:var(--t-gn); border-color:var(--gr); color:var(--gr); box-shadow:none; }
+  #btn-mon.ok:hover:not(:disabled) { filter:none; box-shadow:0 0 0 3px color-mix(in srgb, var(--gr) 22%, transparent); }
+
+  /* ================= Modern controls (v-ui): sliding tabs, gear spin, file picker, checkboxes, switches, dropdowns ================= */
+  /* sliding tab indicator (only when the script that moves it is running: .tabs.js) */
+  .tabs { position:relative; }
+  .tab { position:relative; z-index:1; transition:color .25s ease, background .2s ease; }
+  .tab svg { transition:transform .35s cubic-bezier(.34,1.56,.64,1); }
+  .tabs.js .tab.on, .tabs.js .tab.on:hover { background:none; box-shadow:none; color:#fff; }
+  .tabs.js .tab.on svg { transform:scale(1.12); }
+  .tab-ind { position:absolute; left:0; top:0; width:0; height:0; border-radius:999px; z-index:0; pointer-events:none; opacity:0;
+             background:linear-gradient(180deg,#4a97ff,#1d6bff); box-shadow:var(--glow), inset 0 1px 0 #ffffff55; }
+  .tab-ind.show { opacity:1; }
+  .tab-ind.ready { transition:transform .5s cubic-bezier(.5,1.35,.4,1), width .5s cubic-bezier(.5,1.35,.4,1), opacity .2s ease; }
+
+  /* settings gear: spins once on every click, turns a little on hover, rests rotated while Settings is open */
+  #btn-settings svg { transition:transform .5s cubic-bezier(.34,1.4,.5,1); transform-origin:50% 50%; }
+  #btn-settings:hover svg { transform:rotate(45deg); }
+  #btn-settings.on svg { transform:rotate(90deg); }
+  #btn-settings.spin svg { animation:gear-spin .8s cubic-bezier(.45,.05,.25,1); }
+  @keyframes gear-spin { from { transform:rotate(0deg); } to { transform:rotate(360deg); } }
+
+  /* file picker: dashed drop area with a pill button */
+  input[type=file] { width:100%; padding:8px 10px; border:1.5px dashed color-mix(in srgb, var(--mu) 45%, transparent); border-radius:14px;
+                     background:var(--glass); color:var(--mu); font-size:12px; cursor:pointer; transition:border-color .2s, background .2s, box-shadow .2s; }
+  input[type=file]:hover, input[type=file].dragover { border-color:var(--ac); background:var(--acs); }
+  input[type=file].dragover { box-shadow:0 0 0 3px var(--acs); }
+  input[type=file]:focus-visible { outline:none; border-color:var(--ac); box-shadow:0 0 0 3px var(--acs); }
+  input[type=file]::file-selector-button { margin-right:12px; border:0; border-radius:999px; padding:7px 16px; cursor:pointer; color:#fff;
+                     font:inherit; font-size:12px; font-weight:600; background:linear-gradient(180deg,#4a97ff,#1d6bff); box-shadow:var(--glow);
+                     transition:filter .15s, transform .15s; }
+  input[type=file]::file-selector-button:hover { filter:brightness(1.1); }
+  input[type=file]::file-selector-button:active { transform:scale(.96); }
+
+  /* checkboxes and radios */
+  input[type=checkbox], input[type=radio] { -webkit-appearance:none; appearance:none; flex:none; width:18px; height:18px; margin:0; cursor:pointer;
+        display:inline-grid; place-content:center; background:var(--glass); border:1.5px solid color-mix(in srgb, var(--mu) 55%, transparent);
+        transition:background .18s, border-color .18s, box-shadow .18s, transform .12s; vertical-align:middle; }
+  input[type=checkbox] { border-radius:6px; }
+  input[type=radio] { border-radius:50%; }
+  input[type=checkbox]:hover:not(:disabled), input[type=radio]:hover:not(:disabled) { border-color:var(--ac); box-shadow:0 0 0 3px var(--acs); }
+  input[type=checkbox]:active:not(:disabled), input[type=radio]:active:not(:disabled) { transform:scale(.9); }
+  input[type=checkbox]:focus-visible, input[type=radio]:focus-visible { outline:2px solid var(--ac); outline-offset:2px; }
+  input[type=checkbox]:disabled, input[type=radio]:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=checkbox]::after { content:""; width:9px; height:5px; margin-top:-2px; border-left:2px solid #fff; border-bottom:2px solid #fff;
+        transform:rotate(-45deg) scale(0); transition:transform .18s cubic-bezier(.34,1.56,.64,1); }
+  input[type=checkbox]:checked, input[type=checkbox]:indeterminate, input[type=radio]:checked {
+        background:linear-gradient(180deg,#4a97ff,#1d6bff); border-color:transparent; }
+  input[type=checkbox]:checked::after { transform:rotate(-45deg) scale(1); }
+  input[type=checkbox]:indeterminate::after { width:9px; height:0; margin:0; border-left:0; transform:scale(1); }
+  input[type=radio]::after { content:""; width:7px; height:7px; border-radius:50%; background:#fff; transform:scale(0); transition:transform .18s cubic-bezier(.34,1.56,.64,1); }
+  input[type=radio]:checked::after { transform:scale(1); }
+
+  /* option rows ("Back up configuration first" ...) become soft selectable cards */
+  .chk { padding:9px 12px; border:1px solid var(--bd); border-radius:12px; background:var(--glass); transition:background .15s, border-color .15s; }
+  .chk:hover { border-color:var(--ac); }
+  .chk:has(input:checked) { background:var(--acs); border-color:color-mix(in srgb, var(--ac) 60%, transparent); }
+  .chk.set-chk { padding:0; border:0; background:none; }
+
+  /* On / Off switches in Settings */
+  .set-chk input[type=checkbox] { width:38px; height:22px; border-radius:999px; place-content:center start; padding:0 2px; }
+  .set-chk input[type=checkbox]::after { content:""; width:16px; height:16px; margin:0; border:0; border-radius:50%; background:#fff;
+        box-shadow:0 1px 3px #0005; transform:none; transition:transform .22s cubic-bezier(.34,1.4,.5,1); }
+  .set-chk input[type=checkbox]:checked::after { transform:translateX(16px); }
+  .set-chk input[type=checkbox]:not(:checked) { background:color-mix(in srgb, var(--mu) 35%, var(--glass)); border-color:transparent; }
+
+  /* dropdowns: a custom button + floating list replaces the native select (the real select stays hidden and in sync) */
+  select.nsel-native { display:none !important; }
+  .nsel[hidden] { display:none; }
+  .nsel { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; min-width:0; text-align:left; cursor:pointer;
+          background:var(--glass); border:1px solid var(--bd); color:var(--tx); border-radius:12px; padding:7px 10px 7px 12px; font:inherit;
+          transition:border-color .15s, box-shadow .15s, background .15s; }
+  .nsel:hover:not(:disabled) { border-color:var(--ac); }
+  .nsel:focus-visible, .nsel.open { outline:none; border-color:var(--ac); box-shadow:0 0 0 3px var(--acs); }
+  .nsel:disabled { opacity:.5; cursor:not-allowed; }
+  .nsel-t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .nsel-t.ph { color:var(--mu); }
+  .nsel-c { width:16px; height:16px; flex:none; color:var(--mu); transition:transform .22s ease, color .15s; }
+  .nsel.open .nsel-c { transform:rotate(180deg); color:var(--ac); }
+  .dev-tools .nsel { width:auto; max-width:170px; padding:5px 8px 5px 12px; font-size:12px; }
+  .tp-bar .nsel { width:auto; min-width:260px; flex:0 1 380px; font-size:13px; }
+  .ct-card .nsel { font-size:13px; max-width:100%; }
+  .ct-f .nsel { width:100%; }
+  .nt-form .nt-inline .nsel { flex:1; width:auto; }
+  .cmp-box .nsel { flex:1; min-width:0; }
+  .cmp-bar .nsel { width:auto; min-width:170px; }
+  .nsel-pop { position:fixed; z-index:3000; overflow:auto; padding:6px; background:var(--pn); border:1px solid var(--bd); border-radius:16px;
+              box-shadow:0 16px 44px #0000004d; opacity:0; transform:translateY(-6px) scale(.98); transform-origin:top center;
+              transition:opacity .15s ease, transform .15s ease; pointer-events:none; }
+  .nsel-pop.up { transform-origin:bottom center; transform:translateY(6px) scale(.98); }
+  .nsel-pop.show { opacity:1; transform:none; pointer-events:auto; }
+  .nsel-opt { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:10px; cursor:pointer; color:var(--tx); font-size:13px; line-height:1.35; }
+  .nsel-opt > span { flex:1; min-width:0; overflow-wrap:anywhere; }
+  .nsel-opt:hover, .nsel-opt.act { background:var(--acs); }
+  .nsel-opt.sel { color:var(--ac); font-weight:600; }
+  .nsel-opt.dis { opacity:.45; cursor:not-allowed; }
+  .nsel-k { width:15px; height:15px; flex:none; opacity:0; color:var(--ac); }
+  .nsel-opt.sel .nsel-k { opacity:1; }
+  .nsel-grp { padding:8px 10px 4px; font-size:11px; font-weight:600; color:var(--mu); text-transform:uppercase; letter-spacing:.04em; }
+  @media (prefers-reduced-motion: reduce) {
+    .tab-ind.ready, .nsel-pop, .nsel-c, #btn-settings svg, input[type=checkbox]::after, input[type=radio]::after { transition:none; }
+    #btn-settings.spin svg { animation:none; }
+  }
+
+  /* ================= Date & time picker (schedule) ================= */
+  input.ndt-native { display:none !important; }
+  .ndt { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; min-width:0; text-align:left; cursor:pointer;
+         background:var(--glass); border:1px solid var(--bd); color:var(--tx); border-radius:12px; padding:7px 10px 7px 12px; font:inherit;
+         transition:border-color .15s, box-shadow .15s; }
+  .ndt[hidden] { display:none; }
+  .ndt:hover:not(:disabled) { border-color:var(--ac); }
+  .ndt:focus-visible, .ndt.open { outline:none; border-color:var(--ac); box-shadow:0 0 0 3px var(--acs); }
+  .ndt:disabled { opacity:.5; cursor:not-allowed; }
+  .ndt-t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ndt-t.ph { color:var(--mu); }
+  .ndt .ndt-i { width:17px; height:17px; flex:none; color:var(--mu); transition:color .15s; }
+  .ndt.open .ndt-i, .ndt:hover:not(:disabled) .ndt-i { color:var(--ac); }
+  .ndt-pop { position:fixed; z-index:3000; width:312px; max-width:calc(100vw - 16px); padding:14px; background:var(--pn); border:1px solid var(--bd);
+             border-radius:20px; box-shadow:0 18px 50px #0000004d; opacity:0; transform:translateY(-6px) scale(.98); transform-origin:top center;
+             transition:opacity .15s ease, transform .15s ease; pointer-events:none; }
+  .ndt-pop.up { transform-origin:bottom center; transform:translateY(6px) scale(.98); }
+  .ndt-pop.show { opacity:1; transform:none; pointer-events:auto; }
+  .ndt-hd { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+  .ndt-mt { font-weight:600; font-size:14px; }
+  .ndt-nav { width:32px; height:32px; border-radius:50%; border:1px solid var(--bd); background:var(--glass); color:var(--tx); cursor:pointer;
+             display:grid; place-items:center; padding:0; transition:background .15s, border-color .15s; }
+  .ndt-nav svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+  .ndt-nav:hover:not(:disabled) { border-color:var(--ac); background:var(--acs); }
+  .ndt-nav:disabled { opacity:.35; cursor:not-allowed; }
+  .ndt-wd, .ndt-grid { display:grid; grid-template-columns:repeat(7,1fr); gap:2px; }
+  .ndt-wd span { text-align:center; font-size:10px; font-weight:600; color:var(--mu); padding:4px 0; text-transform:uppercase; }
+  .ndt-d { height:34px; border:0; border-radius:50%; background:none; color:var(--tx); font:inherit; font-size:12.5px; cursor:pointer; padding:0;
+           transition:background .12s, transform .12s; }
+  .ndt-d:hover:not(:disabled):not(.sel) { background:var(--acs); }
+  .ndt-d:active:not(:disabled) { transform:scale(.92); }
+  .ndt-d.today { box-shadow:inset 0 0 0 1.5px var(--ac); }
+  .ndt-d.sel { background:linear-gradient(180deg,#4a97ff,#1d6bff); color:#fff; font-weight:600; box-shadow:var(--glow); }
+  .ndt-d:disabled { opacity:.3; cursor:not-allowed; }
+  .ndt-sep { height:1px; background:var(--bd); margin:12px 0; }
+  .ndt-time { display:flex; gap:10px; }
+  .ndt-tc { flex:1; min-width:0; }
+  .ndt-tl { font-size:10.5px; font-weight:600; color:var(--mu); margin-bottom:5px; text-transform:uppercase; letter-spacing:.04em; }
+  .ndt-col { position:relative; height:128px; overflow:auto; padding:4px; border:1px solid var(--bd); border-radius:12px; background:var(--glass); scrollbar-width:thin; }
+  .ndt-col button { display:block; width:100%; border:0; border-radius:8px; background:none; color:var(--tx); font:inherit; font-size:13px; padding:5px 0;
+                    text-align:center; cursor:pointer; transition:background .12s; }
+  .ndt-col button:hover:not(:disabled):not(.sel) { background:var(--acs); }
+  .ndt-col button.sel { background:linear-gradient(180deg,#4a97ff,#1d6bff); color:#fff; font-weight:600; }
+  .ndt-col button:disabled { opacity:.3; cursor:not-allowed; }
+  .ndt-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; }
+  .ndt-chip { border:1px solid var(--bd); background:var(--glass); color:var(--tx); border-radius:999px; padding:4px 11px; font:inherit; font-size:11.5px;
+              cursor:pointer; transition:background .15s, border-color .15s; }
+  .ndt-chip:hover { border-color:var(--ac); background:var(--acs); }
+  .ndt-sum { margin-top:12px; font-size:12px; color:var(--mu); text-align:center; }
+  .ndt-sum b { color:var(--tx); font-weight:600; }
+  .ndt-ft { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:12px; }
+  .ndt-ft .btn { flex:1; }
+  @media (prefers-reduced-motion: reduce) { .ndt-pop { transition:none; } }
 </style>
 </head>
 <body class="role-__ROLE__">
@@ -8705,6 +10070,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <nav class="tabs" aria-label="Sections" role="tablist">
     <button type="button" class="tab on" id="tab-home" role="tab" aria-selected="true" data-view="home"><span data-i="home"></span>Home</button>
     <button type="button" class="tab" id="tab-diagram" role="tab" aria-selected="false" data-view="diagram"><span data-i="diagram"></span>Diagram</button>
+    <button type="button" class="tab" id="tab-diagnosis" role="tab" aria-selected="false" data-view="diagnosis"><span data-i="diagnosis"></span>Diagnosis</button>
     <button type="button" class="tab" id="tab-storage" role="tab" aria-selected="false" data-view="storage"><span data-i="storage"></span>Storage</button>
   </nav>
   <span class="sp"></span>
@@ -8778,8 +10144,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <h3 tabindex="0" role="button" title="Configuration Backup"><span data-i="3"></span><span class="lbl">Configuration Backup</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
         <label for="custom-commands" style="margin-top:0">Additional commands (optional)</label>
-        <textarea id="custom-commands" placeholder="show vlan brief&#10;show interfaces status"></textarea>
-        <div class="row"><button class="btn p" id="btn-backup" disabled>Run Backup</button><span class="tip" data-tip="Saves show running-config, show version, show boot, show inventory and the additional commands (all outputs in ONE file per switch), then shows the current software version in the table. Additional commands: one per line."></span></div>
+        <textarea id="custom-commands" placeholder="show ip interface brief&#10;show logging"></textarea>
+        <div class="row"><button class="btn p" id="btn-backup" disabled>Run Backup</button><span class="tip" data-tip="Saves show running-config, show vlan, show version, show boot, show inventory and the additional commands (all outputs in ONE file per switch), then shows the current software version in the table. Additional commands: one per line."></span></div>
         <div class="hint" id="backup-status">No backup run yet.</div>
         <div class="hint" id="backup-commands-log" style="max-height:110px; overflow-y:auto; display:none;"></div>
         <div class="msg" id="msg-3" role="status" aria-live="polite"></div>
@@ -8799,7 +10165,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </select>
         <div class="row"><button class="btn" id="btn-readiness" disabled
               title="Log in and check version, free flash space, CPU, memory and stack health - read-only, no upload or reload">Readiness Check</button></div>
-        <label class="chk"><input type="checkbox" id="backup-before-upgrade" checked><span>Back up configuration first</span></label>
         <label class="chk"><input type="checkbox" id="skip-image-check"><span>Ignore image check warnings</span><span class="tip w" data-tip="Tick only if you are sure: the image does not match the switch model, or it is older than the running version."></span></label>
         <label class="chk"><input type="checkbox" id="ignore-space"><span>Ignore flash space check</span><span class="tip w" data-tip="Tick only if you are sure: continues even when free flash is below the image size + 1 GB that Cisco asks for. Free some flash first if you can (delete old .bin / .pkg files). If flash really runs out, the install can fail part-way."></span></label>
         <label for="sched-time">Schedule for (optional)<span class="tip" id="slot-tip" data-tip="A live web console opens at the bottom of this page for every switch, immediately or at its scheduled time. The switch reloads by itself; the table shows the new version once it is back."></span></label>
@@ -8945,6 +10310,41 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </main>
 </div>
 
+<div class="app" id="diagnosis" hidden>
+  <aside class="side st-side" aria-label="Diagnosis menu">
+    <div class="sh"><span data-i="diagnosis"></span><span class="shl">Diagnosis</span></div>
+    <div class="set-nav" id="dx-nav" role="tablist" aria-orientation="vertical">
+      <button type="button" role="tab" data-dx="cmd" class="on" aria-selected="true">Run Commands</button>
+      <button type="button" role="tab" data-dx="log" aria-selected="false">Log Analysis</button>
+    </div>
+  </aside>
+  <main>
+    <div class="card dx-card">
+      <h4><span id="dx-title">Run Commands</span><span class="a"><span class="hint" id="dx-site"></span></span></h4>
+      <div class="dx-grid">
+        <div class="dx-pick">
+          <div class="dg-actions"><button type="button" class="btn" id="dx-all" disabled>Select All</button></div>
+          <div class="dg-list" id="dx-list"></div>
+        </div>
+        <div class="dx-work">
+          <div id="dx-p-cmd">
+            <p class="dx-intro">Type the commands to run (one per line) and tick the switches on the left. Each switch's output is saved in the Storage tab under <b>Diagnosis</b>, in that switch's folder. Only read-only commands are accepted: <span id="dx-words"></span>. Nothing here changes a switch.</p>
+            <textarea id="dx-cmds" spellcheck="false" autocomplete="off" placeholder="show ip interface brief&#10;show version&#10;show logging"></textarea>
+            <div class="dx-row"><button type="button" class="btn p" id="dx-run" disabled>Run Commands</button><span class="hint" id="dx-cmd-count"></span></div>
+          </div>
+          <div id="dx-p-log" hidden>
+            <p class="dx-intro">Reads the log of each ticked switch (<span id="dx-logcmds"></span>) and checks it on this computer against built-in rules for things that can disturb an upgrade: stack problems, power / fan / temperature, flash errors, crashes, unexpected reloads, failed installs, flapping ports and more. The verdict is advice for you to judge; it never blocks or starts anything. The raw output and a report are saved in Storage under <b>Diagnosis</b>.</p>
+            <div class="dx-row"><label for="dx-look">Look back</label><select id="dx-look"></select>
+              <button type="button" class="btn p" id="dx-analyze" disabled>Analyze Logs</button></div>
+          </div>
+          <div class="msg" id="dx-msg" role="status" aria-live="polite"></div>
+          <div class="dx-res" id="dx-res"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
 <div class="app" id="storage" hidden>
   <aside class="side st-side" aria-label="Sites">
     <div class="sh"><span data-i="site"></span><span class="shl">Sites</span></div>
@@ -8975,7 +10375,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <span class="sp"></span>
         <div class="st-search">
           <span class="si" data-i="search"></span>
-          <input type="text" id="st-search" placeholder="Search backups, reports and runs in this site..." autocomplete="off" spellcheck="false" aria-label="Search files and folders">
+          <input type="text" id="st-search" placeholder="Search backups, upgrade records, reports and runs in this site..." autocomplete="off" spellcheck="false" aria-label="Search files and folders">
           <button type="button" class="st-clear" id="st-clear" title="Clear search" hidden>&times;</button>
         </div>
         <button type="button" class="btn sm in" id="st-compare" title="Compare two backups of this switch" hidden>Compare Backups</button>
@@ -9131,6 +10531,7 @@ const IC = {
   dn: I('<path d="m6 9 6 6 6-6"/>'),
   home: I('<path d="M3 11 12 3l9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>'),
   diagram: I('<rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-4h12v4"/>'),
+  diagnosis: I('<path d="M3 12h4l2-6 4 12 2-6h6"/>'),
   storage: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   folder: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   file: I('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>'),
@@ -10009,7 +11410,7 @@ $("btn-upgrade").addEventListener("click", async () => {
   const action = $("upgrade-action").value;
   const image = $("image-select").value;
   if (action !== "activate" && !image) { sayIn(4, "err", "Choose an image from the dropdown (upload one above if the list is empty)."); return; }
-  const backupFirst = $("backup-before-upgrade").checked;
+  const backupFirst = true;                 // the configuration backup always runs first - there is no option to skip it
   const list = [...selected].join(", ");
   const reloadNote = action === "distribute" ? "" : "\n\nEach switch will reload and be offline for several minutes.";
   const qNote = (action !== "distribute" && selected.size > ROLLOUT.max_parallel)
@@ -10034,7 +11435,7 @@ $("btn-schedule").addEventListener("click", async () => {
   if (!when) { sayIn(4, "err", "Pick a date and time to schedule this."); return; }
   const runAt = new Date(when).getTime() / 1000;
   if (!Number.isFinite(runAt) || runAt < Date.now() / 1000 + 30) { sayIn(4, "err", "Pick a time at least a minute in the future."); return; }
-  const backupFirst = $("backup-before-upgrade").checked;
+  const backupFirst = true;                 // the configuration backup always runs first - there is no option to skip it
   const list = [...selected].join(", ");
   if (!confirm("Schedule the " + ACTION_LABEL[action] + " for " + new Date(when).toLocaleString() + " on " +
                selected.size + " switch(es)?\n\n" + list + stagedWarning(action, image) +
@@ -10703,15 +12104,16 @@ function stSay(kind, text) { const m = $("st-msg"); m.className = "msg " + kind;
 
 function showView(view, push) {
   if (view === "settings" && ME.role === "viewer") view = "home";
-  if (view === "diagram" && ME.role === "viewer") view = "home";
-  if (view !== "storage" && view !== "settings" && view !== "diagram") view = "home";
-  const storage = view === "storage", settings = view === "settings", diagram = view === "diagram";
-  if (storage || settings || diagram) { try { closeDrawer(); } catch (e) {} }
-  $("dashboard").hidden = storage || settings || diagram;
+  if ((view === "diagram" || view === "diagnosis") && ME.role === "viewer") view = "home";
+  if (view !== "storage" && view !== "settings" && view !== "diagram" && view !== "diagnosis") view = "home";
+  const storage = view === "storage", settings = view === "settings", diagram = view === "diagram", diagnosis = view === "diagnosis";
+  if (storage || settings || diagram || diagnosis) { try { closeDrawer(); } catch (e) {} }
+  $("dashboard").hidden = storage || settings || diagram || diagnosis;
   $("storage").hidden = !storage;
   $("diagram").hidden = !diagram;
+  $("diagnosis").hidden = !diagnosis;
   $("settings").hidden = !settings;
-  for (const [id, on] of [["tab-home", view === "home"], ["tab-diagram", diagram], ["tab-storage", storage]]) {
+  for (const [id, on] of [["tab-home", view === "home"], ["tab-diagram", diagram], ["tab-diagnosis", diagnosis], ["tab-storage", storage]]) {
     $(id).classList.toggle("on", on);
     $(id).setAttribute("aria-selected", String(on));
   }
@@ -10720,6 +12122,7 @@ function showView(view, push) {
   if (storage) openStorage();
   if (settings) openSettings();
   if (diagram) openDiagram(); else dgStop();
+  if (diagnosis) openDiagnosis(); else dxStop();
 }
 document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => showView(b.dataset.view)));
 
@@ -10808,9 +12211,14 @@ function stRenderCrumbs() {
 
 // ---- Compare two backups of one switch (shown while a switch's folder under Switch Backups is open) ----
 // Full-screen, command list on the left, the selected command shown LEFT (older) / RIGHT (newer), or unified.
-const CMP = {cmd: "", view: "side", show: false, all: false, last: null, cache: {}, open: new Set(), tok: 0, folder: ""};
+const CMP = {cmd: "", view: "side", show: false, all: false, last: null, cache: {}, open: new Set(), tok: 0, folder: "", mode: "backups"};
 const CMP_ST = {changed: ["CHANGED", "var(--c-a)"], added: ["ONLY IN NEWER", "var(--gr)"], removed: ["ONLY IN OLDER", "var(--rd)"], same: ["no changes", "var(--mu)"]};
-const stCompareFolder = () => { const p = (stg.path || "").split("/").filter(Boolean); return p.length === 2 && p[0] === "Switch Backups"; };
+// "backups" inside Switch Backups/<switch>; "records" inside Upgrade Records/<switch> (or one run folder of it); else ""
+const stCompareMode = () => { const p = (stg.path || "").split("/").filter(Boolean);
+  if (p.length === 2 && p[0] === "Switch Backups") return "backups";
+  if ((p.length === 2 || p.length === 3) && p[0] === "Upgrade Records") return "records"; return ""; };
+const stCompareFolder = () => !!stCompareMode();
+const cmpApi = () => CMP.mode === "records" ? "rcompare" : "compare";
 function cmpMsg(text) { $("cmp-diff").innerHTML = '<div class="cmp-msg">' + esc(text) + "</div>"; }
 function cmpSumHtml(d) {
   const s = d.summary;
@@ -10852,9 +12260,10 @@ function cmpSideHtml(d) {
     keep = new Uint8Array(n);
     for (let i = 0; i < n; i++) if (rows[i][4] !== "=") for (let k = Math.max(0, i - 3); k <= Math.min(n - 1, i + 3); k++) keep[k] = 1;
   }
-  const na = d.in_a ? "" : " \u2014 command not in this backup", nb = d.in_b ? "" : " \u2014 command not in this backup";
-  let out = '<table class="sbs"><colgroup><col style="width:56px"><col><col style="width:56px"><col></colgroup><thead><tr><th colspan="2">Left &middot; older &middot; ' +
-    esc(d.a.time + na) + '</th><th colspan="2">Right &middot; newer &middot; ' + esc(d.b.time + nb) + "</th></tr></thead><tbody>";
+  const rec = CMP.mode === "records", what = rec ? "not in this record" : "not in this backup";
+  const na = d.in_a ? "" : " \u2014 command " + what, nb = d.in_b ? "" : " \u2014 command " + what;
+  let out = '<table class="sbs"><colgroup><col style="width:56px"><col><col style="width:56px"><col></colgroup><thead><tr><th colspan="2">Left &middot; ' + (rec ? "" : "older &middot; ") +
+    esc(d.a.time + na) + '</th><th colspan="2">Right &middot; ' + (rec ? "" : "newer &middot; ") + esc(d.b.time + nb) + "</th></tr></thead><tbody>";
   let i = 0;
   while (i < n) {
     if (keep && !keep[i]) {
@@ -10889,7 +12298,7 @@ async function cmpPaint(keepScroll) {
   if (!sd) {
     cmpMsg("Loading " + c.command + " ...");
     try {
-      sd = await getJSON(stUrl("compare", CMP.folder) + "&a=" + encodeURIComponent(d.a.stamp) + "&b=" + encodeURIComponent(d.b.stamp) +
+      sd = await getJSON(stUrl(cmpApi(), CMP.folder) + "&a=" + encodeURIComponent(d.a.stamp) + "&b=" + encodeURIComponent(d.b.stamp) +
         "&ignore=" + (d.ignore_volatile ? "1" : "0") + "&cmd=" + encodeURIComponent(c.command));
     } catch (e) { if (tok === CMP.tok) cmpMsg("Could not load this command: " + e.message); return; }
     CMP.cache[key] = sd;
@@ -10905,26 +12314,41 @@ function cmpPickDefault() {
 }
 async function cmpOpen() {
   const folder = stg.path;
+  CMP.mode = stCompareMode() || "backups";
+  const rec = CMP.mode === "records", parts = folder.split("/").filter(Boolean);
   CMP.folder = folder; CMP.last = null; CMP.cache = {}; CMP.open = new Set(); CMP.cmd = "";
-  $("cmp-title").textContent = "Compare backups \u2014 " + folder.split("/").pop();
+  $("cmp-title").textContent = (rec ? "Compare pre/post checks \u2014 " : "Compare backups \u2014 ") + parts[1];
+  document.querySelector('label[for="cmp-a"]').textContent = rec ? "Left" : "Left (older)";
+  document.querySelector('label[for="cmp-b"]').textContent = rec ? "Right" : "Right (newer)";
   $("cmp-modal").hidden = false; cmpMsg("Loading ..."); $("cmp-list").innerHTML = ""; $("cmp-sum").innerHTML = "";
   $("cmp-a").innerHTML = $("cmp-b").innerHTML = ""; $("cmp-go").disabled = true;
   try {
-    const d = await getJSON(stUrl("backups", folder));
+    const d = await getJSON(stUrl(rec ? "records" : "backups", folder));
     if ($("cmp-modal").hidden || folder !== stg.path) return;
-    if (d.runs.length < 2) { cmpMsg("This switch has fewer than two backups, so there is nothing to compare yet."); return; }
-    const opts = d.runs.map(r => '<option value="' + esc(r.stamp) + '">' + esc(r.time) + "</option>").join("");
-    $("cmp-a").innerHTML = opts; $("cmp-b").innerHTML = opts;
-    $("cmp-b").value = d.runs[0].stamp; $("cmp-a").value = d.runs[1].stamp;     // newest against the one before it
+    if (rec) {
+      if (d.files.length < 2) { cmpMsg("This switch has fewer than two saved upgrade records (pre-upgrade backup, pre-check, post-check), so there is nothing to compare yet."); return; }
+      const opts = d.files.map(f => '<option value="' + esc(f.id) + '">' + esc(f.name) + "</option>").join("");
+      $("cmp-a").innerHTML = opts; $("cmp-b").innerHTML = opts;
+      // pre-check (left) against post-check (right) of the opened run, else of the newest run that has both
+      const has = (r, k) => r.files.some(f => f.kind === k);
+      const run = d.runs.find(r => r.stamp === d.focus && has(r, "pre-check") && has(r, "post-check")) || d.runs.find(r => has(r, "pre-check") && has(r, "post-check"));
+      if (run) { $("cmp-a").value = run.stamp + "/pre-check"; $("cmp-b").value = run.stamp + "/post-check"; }
+      else { $("cmp-a").value = d.files[1].id; $("cmp-b").value = d.files[0].id; }
+    } else {
+      if (d.runs.length < 2) { cmpMsg("This switch has fewer than two backups, so there is nothing to compare yet."); return; }
+      const opts = d.runs.map(r => '<option value="' + esc(r.stamp) + '">' + esc(r.time) + "</option>").join("");
+      $("cmp-a").innerHTML = opts; $("cmp-b").innerHTML = opts;
+      $("cmp-b").value = d.runs[0].stamp; $("cmp-a").value = d.runs[1].stamp;     // newest against the one before it
+    }
     $("cmp-go").disabled = false;
     cmpRun();
-  } catch (e) { cmpMsg("Could not load the backups: " + e.message); }
+  } catch (e) { cmpMsg("Could not load the " + (rec ? "upgrade records" : "backups") + ": " + e.message); }
 }
 async function cmpRun() {
   const folder = stg.path, a = $("cmp-a").value, b = $("cmp-b").value;
   cmpMsg("Comparing ...");
   try {
-    const d = await getJSON(stUrl("compare", folder) + "&a=" + encodeURIComponent(a) + "&b=" + encodeURIComponent(b) + "&ignore=" + ($("cmp-ign").checked ? "1" : "0"));
+    const d = await getJSON(stUrl(cmpApi(), folder) + "&a=" + encodeURIComponent(a) + "&b=" + encodeURIComponent(b) + "&ignore=" + ($("cmp-ign").checked ? "1" : "0"));
     if ($("cmp-modal").hidden) return;
     CMP.last = d; CMP.cache = {}; CMP.open = new Set(); CMP.folder = folder;
     $("cmp-sum").innerHTML = cmpSumHtml(d);
@@ -10999,7 +12423,9 @@ function stRender() {
   zip.href = stg.site ? stUrl("download", stg.path) : "#";
   zip.textContent = stg.path ? "Download Folder (.zip)" : "Download Site Storage (.zip)";
   $("st-refresh").disabled = !stg.site;
-  $("st-compare").hidden = !stg.site || searching || !stCompareFolder() || ME.role === "viewer";
+  $("st-compare").hidden = !stg.site || searching || !stCompareMode() || ME.role === "viewer";
+  $("st-compare").textContent = stCompareMode() === "records" ? "Compare Pre/Post Checks" : "Compare Backups";
+  $("st-compare").title = stCompareMode() === "records" ? "Compare the pre-check, post-check and pre-upgrade backup of this switch" : "Compare two backups of this switch";
   $("st-search").disabled = !stg.site;
   $("st-clear").hidden = !stg.query;
 
@@ -11149,6 +12575,7 @@ function renderSettings() {
   let html = '<div class="set-intro">' + esc(g.intro) + "</div>" +
     (g.id === "timeouts" ? '<div id="tp-root"></div><div id="ct-root"></div>' : "") +
     (g.id === "notifications" ? '<div id="nt-root"></div>' : "") +
+    (g.id === "ai" ? '<div id="ai-root"></div>' : "") +
     (g.id === "about" ? '<div id="ab-root"></div>' : ""), sec = null;
   for (const item of SET.data.items.filter(i => i.group === g.id)) {
     if (item.section && item.section !== sec) { html += '<div class="set-sec">' + esc(item.section) + "</div>"; }
@@ -11158,8 +12585,9 @@ function renderSettings() {
   $("set-body").innerHTML = html;
   if (g.id === "timeouts") { tpRender(); ctRender(); }
   if (g.id === "notifications") { ntRender(); if (!NT.data && !NT.loading) { NT.loading = true; ntLoad().finally(() => { NT.loading = false; }); } }
+  if (g.id === "ai") { aiRender(); if (!AIS.data && !AIS.loading) aiLoad(); }
   if (g.id === "about") aboutRender();
-  const own = g.id === "notifications" || g.id === "about";            // these tabs have their own Save button
+  const own = g.id === "notifications" || g.id === "about" || g.id === "ai";            // these tabs have their own Save button
   $("set-reset").hidden = own; $("set-save").hidden = own; $("set-dirty").hidden = own;
   $("set-reset").disabled = !SET_CAN_EDIT;
   setUpdateDirty();
@@ -11171,7 +12599,7 @@ async function openSettings() {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || "Could not load the settings.");
     SET.data = d; SET.draft = {...d.values}; renderSettings();
-    tpLoad(); NT.data = null; if (SET.tab === "notifications") renderSettings(); else ntLoad();
+    tpLoad(); AIS.data = null; NT.data = null; if (SET.tab === "notifications") renderSettings(); else ntLoad();
   } catch (e) { setSay("err", e.message); }
 }
 function setRowRefresh(key) {
@@ -12293,7 +13721,258 @@ $("dg-full").addEventListener("click", async () => {
 document.addEventListener("fullscreenchange", dgFullUI);
 document.addEventListener("keydown", e => { if (e.key === "Escape" && $("dg-card").classList.contains("dg-full")) dgExitFull(); });
 
+// ---- Diagnosis tab: run read-only commands on switches, or analyze their logs locally ----
+const DX_SAMPLE = "show ip interface brief\nshow version\nshow logging";
+const dx = {data: null, tool: "cmd", picked: new Set(), busy: false, timer: null, tick: 0, site: null, resKey: "", listKey: "",
+            wasRunning: false, open: new Set(), cmdInit: false, aiBusy: new Set()};
+const dxSay = (kind, text) => { const m = $("dx-msg"); m.className = "msg " + kind; m.textContent = text || ""; };
+function openDiagnosis() { dxStop(); dxLoad(true); dx.timer = setInterval(dxTick, 2000); }
+function dxStop() { if (dx.timer) { clearInterval(dx.timer); dx.timer = null; } }
+function dxTick() {
+  if ($("diagnosis").hidden) { dxStop(); return; }
+  dx.tick++;
+  const running = dx.data && dx.data.run && !dx.data.run.finished;
+  if (running || dx.tick % 5 === 0 || (siteName || null) !== (dx.site || null)) dxLoad(false);
+}
+async function dxLoad(force) {
+  if (dx.busy) return;
+  dx.busy = true;
+  try {
+    const d = await getJSON("/api/diag");
+    if (d.site !== dx.site) { dx.site = d.site; dx.picked = new Set(); dx.listKey = ""; dx.resKey = ""; dx.open = new Set(); dx.cmdInit = false; }
+    const running = !!(d.run && !d.run.finished);
+    if (dx.wasRunning && !running && d.run) {
+      const hs = Object.values(d.run.hosts), ok = hs.filter(x => x.state === "ok").length;
+      dxSay(ok === hs.length ? "ok" : "err", (d.run.kind === "logs" ? "Log analysis" : "Commands") + " finished: " + ok + " of " + hs.length + " switch(es) succeeded.");
+    }
+    dx.wasRunning = running; dx.data = d;
+    if (!dx.cmdInit) { dx.cmdInit = true; $("dx-cmds").value = d.commands || DX_SAMPLE; }
+    if (!$("dx-look").options.length) {
+      $("dx-look").innerHTML = d.lookbacks.map(h => '<option value="' + h + '">' + (h === 0 ? "Whole log buffer" : h < 48 ? "Last " + h + " hours" : "Last " + (h / 24) + " days") + "</option>").join("");
+    }
+    $("dx-words").textContent = d.allowed_words.join(", ");
+    $("dx-logcmds").textContent = d.log_commands.join(", ");
+    dxRender();
+  } catch (e) { dxSay("err", e.message); }
+  finally { dx.busy = false; }
+}
+function dxRender() {
+  const d = dx.data; if (!d) return;
+  const cmd = dx.tool === "cmd", run = !!(d.run && !d.run.finished);
+  document.querySelectorAll("#dx-nav button").forEach(b => { const on = b.dataset.dx === dx.tool; b.classList.toggle("on", on); b.setAttribute("aria-selected", String(on)); });
+  $("dx-title").textContent = cmd ? "Run Commands" : "Log Analysis";
+  $("dx-site").textContent = d.site ? "Site: " + d.site : "";
+  $("dx-p-cmd").hidden = !cmd; $("dx-p-log").hidden = cmd;
+  dxRenderList(); dxRenderResults();
+  const n = [...dx.picked].filter(h => d.devices.some(v => v.host === h && v.has_creds)).length;
+  $("dx-run").disabled = run || n === 0; $("dx-analyze").disabled = run || n === 0;
+  $("dx-run").textContent = run && d.run.kind === "commands" ? "Running " + d.run.done + "/" + d.run.total : "Run Commands" + (n ? " (" + n + ")" : "");
+  $("dx-analyze").textContent = run && d.run.kind === "logs" ? "Analyzing " + d.run.done + "/" + d.run.total : "Analyze Logs" + (n ? " (" + n + ")" : "");
+  const pickable = d.devices.filter(v => v.has_creds).length, all = $("dx-all"), allOn = pickable > 0 && n === pickable;
+  all.textContent = allOn ? "Clear" : "Select All"; all.dataset.mode = allOn ? "clear" : "all"; all.disabled = run || pickable === 0;
+  $("dx-cmd-count").textContent = "";
+}
+function dxRenderList() {
+  const d = dx.data, run = !!(d.run && !d.run.finished), live = (typeof dgLive === "function") ? dgLive() : new Map();
+  let html = "";
+  if (!d.site) html = '<div class="st-empty">No site selected. Create or select one from the Site menu on the Home page.</div>';
+  else if (!d.devices.length) html = '<div class="st-empty">This site has no devices yet. Add them on the Home page first.</div>';
+  for (const v of d.devices) {
+    const lv = live.get(v.host), st = lv ? lv.status : "PENDING", rs = d.run && d.run.hosts && d.run.hosts[v.host], an = d.results[v.host];
+    let line, cls = "";
+    if (!v.has_creds) { line = "No credentials profile - assign one on the Home page"; cls = "warn"; }
+    else if (rs && (rs.state === "queued" || rs.state === "running")) line = rs.state === "queued" ? "Waiting ..." : (rs.detail || "Working ...");
+    else if (rs && rs.state === "failed") { line = rs.detail; cls = "bad"; }
+    else if (rs && rs.state === "skipped") { line = rs.detail; cls = "warn"; }
+    else if (rs && rs.state === "ok") { line = d.run.kind === "logs" && an ? an.verdict.toUpperCase() : rs.detail; cls = d.run.kind === "logs" && an ? (an.verdict === "green" ? "ok" : an.verdict === "red" ? "bad" : "warn") : "ok"; }
+    else if (an) { line = "Analyzed " + an.time + " - " + an.verdict.toUpperCase(); cls = an.verdict === "green" ? "ok" : an.verdict === "red" ? "bad" : "warn"; }
+    else line = "Not run yet";
+    html += '<label class="dg-dev' + (v.has_creds ? "" : " off") + '"><input type="checkbox" data-dxhost="' + esc(v.host) + '"' +
+      (dx.picked.has(v.host) && v.has_creds ? " checked" : "") + (!v.has_creds || run ? " disabled" : "") + '><span class="meta"><div class="t1"><i class="dot ' +
+      (st === "UP" ? "ok" : st === "DOWN" ? "bad" : "") + '"></i>' + esc(v.label) + '</div><div class="t2">' + esc(v.host) +
+      (v.platform ? " - " + esc(v.platform) : "") + '</div><div class="t2 ' + cls + '">' + esc(line) + "</div></span></label>";
+  }
+  if (html !== dx.listKey) { dx.listKey = html; $("dx-list").innerHTML = html; }
+}
+const dxFolderOf = rel => rel.split("/").slice(0, -1).join("/");
+function dxFindingsHtml(host, a) {
+  if (!a.findings.length) return '<div class="dx-note">No findings.</div>';
+  return a.findings.map(f => {
+    const key = host + "|" + f.id;
+    return '<details class="dx-f" data-key="' + esc(key) + '"' + (dx.open.has(key) ? " open" : "") + '><summary><span class="dx-lv ' + f.level + '">' +
+      (f.level === "crit" ? "CRITICAL" : f.level === "warn" ? "WARNING" : "INFO") + "</span><span>" + esc(f.title) + '</span><span class="m">' + esc(f.category) + " - " + f.count + "x" +
+      (f.first ? " - " + esc(f.first) + (f.last && f.last !== f.first ? " to " + esc(f.last) : "") : "") + '</span></summary><div class="fb"><div>' + esc(f.advice) + "</div>" +
+      (f.examples.length ? '<div class="dx-ev">' + f.examples.map(esc).join("\n") + "</div>" : "") + "</div></details>";
+  }).join("");
+}
+function dxAnalysisHtml(host, label, a, canAi) {
+  const sev = ["emergency", "alert", "critical", "error", "warning", "notice", "informational", "debug"];
+  const facts = a.facts || {}, parts = [];
+  if (facts.version) parts.push("version " + facts.version);
+  if (facts.uptime) parts.push("uptime " + facts.uptime);
+  if (facts.reload_reason) parts.push("last reload: " + facts.reload_reason);
+  if (facts.stack) parts.push("stack: " + facts.stack.map(r => r.switch + " " + r.state).join(", "));
+  if (typeof facts.err_disabled === "number") parts.push(facts.err_disabled + " err-disabled port(s)");
+  const counts = Object.entries(a.severity).filter(e => e[1] > 0).map(e => sev[+e[0]] + " " + e[1]).join(", ");
+  const b = a.buffer;
+  let ai = "";
+  if (a.ai) ai = '<div class="dx-ai"><b>AI second opinion</b> <span class="dx-note">' + esc(a.ai.provider + ", " + a.ai.model + " - " + a.ai.time + (a.ai.masked ? " - identifiers masked" : " - identifiers NOT masked")) +
+    ' - advisory, check it against the evidence above</span><pre>' + esc(a.ai.text) + "</pre></div>";
+  const aiBtn = canAi ? '<button type="button" class="btn sm" data-dx-ai="' + esc(host) + '"' + (dx.aiBusy.has(host) ? " disabled" : "") + ">" + (dx.aiBusy.has(host) ? "Asking ..." : a.ai ? "Ask Again" : "AI Second Opinion") + "</button>" : "";
+  return '<div class="dx-sw"><div class="hd"><span class="dx-v ' + a.verdict + '">' + a.verdict.toUpperCase() + "</span><b>" + esc(label) + '</b><span class="dx-note" style="margin:0">' + esc(host) + " - " + esc(a.time) +
+    '</span><span class="sp">' + aiBtn + '<button type="button" class="btn sm" data-dx-file="' + esc(a.files.report) + '">Report</button><button type="button" class="btn sm" data-dx-file="' + esc(a.files.logs) +
+    '">Raw Output</button><button type="button" class="btn sm" data-dx-folder="' + esc(dxFolderOf(a.files.report)) + '">Open Folder</button></span></div><div class="bd"><div><b>' + esc(a.verdict_text) + "</b></div>" +
+    '<div class="dx-note">' + esc(b.lines + " log message(s) analyzed" + (b.first ? ", " + b.first + " to " + b.last : "") + (a.lookback_hours ? " - last " + a.lookback_hours + " hours" : " - whole buffer")) + (counts ? " - " + esc(counts) : "") + "</div>" +
+    (parts.length ? '<div class="dx-note">' + esc(parts.join(" | ")) + "</div>" : "") +
+    a.notes.map(n => '<div class="dx-note">Note: ' + esc(n) + "</div>").join("") + dxFindingsHtml(host, a) +
+    (a.top.length ? '<details class="dx-f" data-key="' + esc(host + "|top") + '"' + (dx.open.has(host + "|top") ? " open" : "") + '><summary>Most frequent messages</summary><div class="fb"><table class="dx-top">' +
+      a.top.map(t => "<tr><td>" + t.count + "x</td><td>" + esc(t.example) + "</td></tr>").join("") + "</table></div></details>" : "") + ai + "</div></div>";
+}
+function dxRenderResults() {
+  const d = dx.data, box = $("dx-res"); let html = "";
+  const label = h => { const v = d.devices.find(x => x.host === h); return v ? v.label : h; };
+  if (dx.tool === "cmd") {
+    const r = d.run && d.run.kind === "commands" ? d.run : null;
+    if (r) {
+      html += '<div class="dx-note">Run started ' + esc(r.started) + " - " + r.commands.length + " command(s): " + esc(r.commands.join("; ")) + "</div>";
+      for (const [h, s] of Object.entries(r.hosts)) {
+        const cls = s.state === "ok" ? "green" : s.state === "failed" ? "bad" : s.state === "skipped" ? "amber" : "run";
+        html += '<div class="dx-line"><span class="dx-v ' + cls + '">' + esc(s.state.toUpperCase()) + "</span><b>" + esc(label(h)) + "</b><span>" + esc(s.detail || "") + "</span>" +
+          (s.file ? '<span class="sp"><button type="button" class="btn sm" data-dx-file="' + esc(s.file) + '">View Output</button><button type="button" class="btn sm" data-dx-folder="' + esc(dxFolderOf(s.file)) + '">Open Folder</button></span>' : "") + "</div>";
+      }
+    }
+  } else {
+    const r = d.run && d.run.kind === "logs" ? d.run : null, hosts = r ? Object.keys(r.hosts) : Object.keys(d.results);
+    for (const h of hosts) {
+      const a = d.results[h], s = r && r.hosts[h];
+      if (a) html += dxAnalysisHtml(h, label(h), a, d.ai.enabled);
+      else if (s) {
+        const cls = s.state === "failed" ? "bad" : s.state === "skipped" ? "amber" : "run";
+        html += '<div class="dx-line"><span class="dx-v ' + cls + '">' + esc(s.state.toUpperCase()) + "</span><b>" + esc(label(h)) + "</b><span>" + esc(s.detail || "") + "</span></div>";
+      }
+    }
+    if (hosts.length && !d.ai.enabled) html += '<div class="dx-note">Analysis ran locally on this computer. The optional cloud AI second opinion is off - an administrator can enable it under Settings > AI Analysis.</div>';
+  }
+  if (html !== dx.resKey) { dx.resKey = html; box.innerHTML = html; }
+}
+function dxOpenFile(rel) {
+  if (!dx.site || !rel) return;
+  if (stg.site !== dx.site) { stg.site = dx.site; stg.path = ""; stg.query = ""; }
+  stView({name: rel.split("/").pop(), rel: rel, parent: dxFolderOf(rel)});
+}
+function dxOpenFolder(folder) {
+  if (!dx.site) return;
+  stg.site = dx.site; stg.path = folder || ""; stg.query = ""; $("st-search").value = ""; $("st-clear").hidden = true;
+  showView("storage");
+}
+$("dx-nav").addEventListener("click", e => {
+  const b = e.target.closest("[data-dx]"); if (!b) return;
+  dx.tool = b.dataset.dx; dx.resKey = ""; dxSay("", ""); if (dx.data) dxRender();
+});
+$("dx-list").addEventListener("change", e => {
+  const h = e.target.dataset && e.target.dataset.dxhost; if (!h) return;
+  if (e.target.checked) dx.picked.add(h); else dx.picked.delete(h);
+  dxRender();
+});
+$("dx-all").addEventListener("click", () => {
+  if (!dx.data) return;
+  if ($("dx-all").dataset.mode === "clear") dx.picked.clear();
+  else for (const v of dx.data.devices) if (v.has_creds) dx.picked.add(v.host);
+  dx.listKey = ""; dxRender();
+});
+$("dx-run").addEventListener("click", async () => {
+  const hosts = [...dx.picked]; if (!hosts.length) return;
+  dxSay("", ""); dx.resKey = "";
+  try { const r = await post("/api/diag/commands", {hosts, commands: $("dx-cmds").value}); dxSay("ok", r.message); dx.wasRunning = true; await dxLoad(false); }
+  catch (e) { dxSay("err", e.message); }
+});
+$("dx-analyze").addEventListener("click", async () => {
+  const hosts = [...dx.picked]; if (!hosts.length) return;
+  dxSay("", ""); dx.resKey = ""; dx.open = new Set();
+  try { const r = await post("/api/diag/logs", {hosts, lookback_hours: +$("dx-look").value}); dxSay("ok", r.message); dx.wasRunning = true; await dxLoad(false); }
+  catch (e) { dxSay("err", e.message); }
+});
+$("dx-res").addEventListener("click", async e => {
+  const f = e.target.closest("[data-dx-file]"); if (f) { dxOpenFile(f.dataset.dxFile); return; }
+  const o = e.target.closest("[data-dx-folder]"); if (o) { dxOpenFolder(o.dataset.dxFolder); return; }
+  const ai = e.target.closest("[data-dx-ai]"); if (!ai) return;
+  const h = ai.dataset.dxAi, d = dx.data; if (!d || dx.aiBusy.has(h)) return;
+  if (!confirm("Send the condensed findings of this switch (not the whole log) to " + d.ai.provider + " (model " + d.ai.model + ")?\n\n" +
+               (d.ai.mask ? "IP / MAC addresses, host names and user names are masked first." : "Masking is OFF: addresses and names are sent as they are.") + "\n\nThe answer is advisory only.")) return;
+  dx.aiBusy.add(h); dx.resKey = ""; dxRenderResults(); dxSay("", "Asking the AI ...");
+  try { const r = await post("/api/diag/ai", {host: h}); if (dx.data && dx.data.results[h]) dx.data.results[h].ai = r.ai; dxSay("ok", "AI second opinion added."); }
+  catch (err) { dxSay("err", err.message); }
+  finally { dx.aiBusy.delete(h); dx.resKey = ""; dxLoad(false); }
+});
+$("dx-res").addEventListener("toggle", e => {
+  const k = e.target.dataset && e.target.dataset.key; if (!k) return;
+  if (e.target.open) dx.open.add(k); else dx.open.delete(k);
+}, true);
+
+// ---- Settings > AI Analysis: optional cloud AI for the Diagnosis log analysis (off by default) ----
+const AIS = {data: null, draft: null, busy: false, loading: false, msg: null};
+async function aiLoad() {
+  AIS.loading = true;
+  try {
+    const r = await fetch("/api/ai/settings", {cache: "no-store"}), d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Could not load the AI settings.");
+    AIS.data = d; AIS.draft = JSON.parse(JSON.stringify(d.values)); AIS.msg = null;
+  } catch (e) { AIS.data = null; AIS.msg = {kind: "err", text: e.message}; }
+  AIS.loading = false;
+  if (SET.tab === "ai") renderSettings();
+}
+function aiSay(kind, text) { AIS.msg = text ? {kind: kind, text: text} : null; const m = $("ai-msg"); if (m) { m.className = "msg " + (kind || ""); m.textContent = text || ""; } }
+function aiRender() {
+  const root = $("ai-root"); if (!root) return;
+  if (!AIS.data) { root.innerHTML = '<div class="msg ' + (AIS.msg ? AIS.msg.kind : "") + '" style="margin-top:14px">' + esc(AIS.msg ? AIS.msg.text : "Loading ...") + "</div>"; return; }
+  const d = AIS.draft, dis = SET_CAN_EDIT ? "" : " disabled";
+  const prov = AIS.data.providers.map(p => '<option value="' + esc(p.key) + '"' + (p.key === d.provider ? " selected" : "") + ">" + esc(p.label) + "</option>").join("");
+  root.innerHTML =
+    '<div class="nt-form">' +
+    '<label for="ai-enabled">Use a cloud AI for a second opinion</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="ai-enabled"' + (d.enabled ? " checked" : "") + dis + "><span>" + (d.enabled ? "On" : "Off") + "</span></label>" +
+    '<label for="ai-prov">Provider</label><select id="ai-prov"' + dis + ">" + prov + "</select>" +
+    '<label for="ai-model">Model</label><input type="text" id="ai-model" autocomplete="off" spellcheck="false" maxlength="100" value="' + esc(d.model) + '"' + dis + ">" +
+    (d.provider === "openai" ? '<label for="ai-url">API base URL</label><input type="text" id="ai-url" autocomplete="off" spellcheck="false" maxlength="300" placeholder="https://api.openai.com/v1" value="' + esc(d.base_url) + '"' + dis + ">" : "") +
+    '<label for="ai-key">API key</label><input type="password" id="ai-key" autocomplete="new-password" maxlength="400" value=""' + dis + ">" +
+    '<div class="nt-hint">' + (AIS.data.key_saved ? "A key is saved (stored encrypted, never shown again) - leave empty to keep it." : "No key saved yet.") + "</div>" +
+    (AIS.data.key_saved ? '<label for="ai-clear">Remove saved key</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="ai-clear"' + dis + "><span>Remove it when I save</span></label>" : "") +
+    '<label for="ai-mask">Mask identifiers</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="ai-mask"' + (d.mask ? " checked" : "") + dis + "><span>" + (d.mask ? "On (recommended)" : "Off") + "</span></label>" +
+    '<div class="nt-hint">When on, IP and MAC addresses, host names and user names are replaced with tokens before anything is sent, and put back into the answer you read.</div></div>' +
+    '<div class="nt-hint" style="margin-top:12px"><b>What is sent:</b> only when you press <i>AI Second Opinion</i> on one switch, and only the condensed findings of the local analysis (rule results, a few evidence lines, counts) - never the whole log, never passwords. ' +
+    "Log analysis itself always runs locally; with this option off nothing leaves this computer.</div>" +
+    '<div class="nt-actions"><button type="button" class="btn sm" id="ai-test"' + dis + '>Test Connection</button><button type="button" class="btn p sm" id="ai-save"' + dis + ">Save AI Settings</button></div>" +
+    '<div class="msg ' + (AIS.msg ? AIS.msg.kind : "") + '" id="ai-msg" role="status" aria-live="polite" style="margin:10px 0 0">' + esc(AIS.msg ? AIS.msg.text : "") + "</div>";
+}
+function aiCollect() {
+  const d = AIS.draft, g = id => { const el = $(id); return el ? el : null; };
+  if (!g("ai-model")) return "";
+  d.enabled = g("ai-enabled").checked; d.provider = g("ai-prov").value; d.model = g("ai-model").value.trim();
+  if (g("ai-url")) d.base_url = g("ai-url").value.trim();
+  d.mask = g("ai-mask").checked;
+  return g("ai-key").value.trim();
+}
+function aiBody(key) { const d = AIS.draft, c = $("ai-clear"); return {enabled: d.enabled, provider: d.provider, model: d.model, base_url: d.base_url, mask: d.mask, api_key: key, clear_key: !!(c && c.checked)}; }
+document.addEventListener("change", e => {
+  const root = $("ai-root"); if (!root || !root.contains(e.target) || !AIS.data) return;
+  if (e.target.id === "ai-prov") { aiCollect(); if (AIS.draft.provider === "anthropic" && !AIS.draft.model) AIS.draft.model = AIS.data.defaults.anthropic_model; aiRender(); }
+  else if (e.target.id === "ai-enabled" || e.target.id === "ai-mask") { aiCollect(); aiRender(); }
+});
+document.addEventListener("click", async e => {
+  const root = $("ai-root"); if (!root || !root.contains(e.target) || !SET_CAN_EDIT || !AIS.data) return;
+  if (e.target.id !== "ai-test" && e.target.id !== "ai-save") return;
+  if (AIS.busy) return;
+  const key = aiCollect(), test = e.target.id === "ai-test", btn = e.target;
+  AIS.busy = true; btn.disabled = true; aiSay("", test ? "Testing ..." : "Saving ...");
+  try {
+    const r = await post(test ? "/api/ai/test" : "/api/ai/settings", {values: aiBody(key)});
+    if (test) aiSay("ok", r.message);
+    else { AIS.data = r; AIS.draft = JSON.parse(JSON.stringify(r.values)); AIS.msg = {kind: "ok", text: r.message}; aiRender(); }
+  } catch (err) { aiSay("err", err.message); }
+  finally { AIS.busy = false; btn.disabled = false; }
+});
+
 if (location.hash === "#storage") showView("storage", false);
+else if (location.hash === "#diagnosis") showView("diagnosis", false);
 else if (location.hash === "#diagram") showView("diagram", false);
 else if (location.hash === "#settings") showView("settings", false);
 
@@ -12354,9 +14033,9 @@ function drFileRow(title, sub, size, kind, name) {
 // ---- upgrade progress (steps + percentage) ----
 function drProgress(h) {
   const u = h.upgrade;
-  if (u.state === "completed") return 100;
+  if (u.state === "completed" || u.state === "attention") return 100;
   if (u.state === "idle") return 0;
-  return PHASE_PCT[u.phase] || 5;
+  return PHASE_PCT[upLastPhase(u)] || 5;
 }
 // Image stage steps: Distribute = image is on the switch's flash; Activate = installed and the switch reloaded onto it.
 function distStep(h) {
@@ -12381,19 +14060,42 @@ function actStep(h) {
   if (st.upgraded && !st.staged) return "done";
   return "pending";
 }
-function drSteps(h, d) {
-  const u = h.upgrade, hasBackup = !!(d && d.backups.runs.length);
-  const steps = [
-    ["Credentials", {ok: "done", testing: "active", failed: "failed"}[h.creds.state] || "pending"],
-    ["Readiness", {ready: "done", warning: "warn", not_ready: "failed", checking: "active"}[h.readiness.state] || "pending"],
-    ["Backup", {completed: "done", running: "active", queued: "active", failed: "failed"}[h.backup.state] || (hasBackup ? "done" : "pending")],
-    ["Distribute", distStep(h)],
-    ["Activate", actStep(h)],
-    ["Post-check", {passed: "done", warning: "warn", failed: "failed", checking: "active"}[h.postcheck.state] || "pending"]
-  ];
-  const mark = {done: "\u2713", warn: "!", failed: "\u2715", active: "\u25CF"};
+// Upgrade Progress = the six stages of ONE upgrade run, in order. The manual Credentials test, Readiness check and
+// Backup buttons never touch it: it stays empty until an upgrade, distribute or activate is started (or scheduled and due).
+const UP_STEPS = ["Backup", "Pre-check", "Distribute", "Activate", "Reload", "Post-check"];
+const UP_PHASE_STEP = {waiting_backup: 0, starting: 1, connecting: 1, connected: 1, prechecking: 1, boot: 1, cleaning: 1, space_check: 1,
+                       uploading: 2, md5: 2, installing: 3, reloading: 4, waiting_down: 4, waiting_up: 4, waiting_ssh: 4, committing: 4,
+                       postcheck: 5};
+function upLastPhase(u) {
+  if (u.phase && u.phase !== "done" && u.phase !== "skipped") return u.phase;
+  const pt = u.phase_times || [];
+  return pt.length ? pt[pt.length - 1].phase : u.phase;
+}
+function upStepIndex(u) {
+  const ph = upLastPhase(u);
+  let i = UP_PHASE_STEP[ph];
+  if (i === undefined) return 1;
+  if (ph === "installing" && (u.action === "distribute" || (u.action !== "activate" && /^Adding the image/i.test(u.message || "")))) i = 2;
+  return i;
+}
+function drSteps(h) {
+  const u = h.upgrade, act = u.action || "full";
+  const running = ACTIVE_STATES.includes(u.state), failed = u.state === "failed", finished = u.state === "completed" || u.state === "attention";
+  const applies = i => act === "distribute" ? i <= 2 : act === "activate" ? i !== 2 : true;
+  const already = finished && /^Already running/.test(u.message || "");
+  const cur = running || failed ? upStepIndex(u) : -1;
+  const steps = UP_STEPS.map((name, i) => {
+    if (!running && !failed && !finished) return [name, "pending"];
+    if (!applies(i) || (i === 0 && !u.with_backup) || (already && i > 1)) return [name, "skip"];
+    if (finished) {
+      if (i === 5) return [name, {passed: "done", warning: "warn", failed: "failed"}[h.postcheck.state] || (u.state === "attention" ? "warn" : "done")];
+      return [name, "done"];
+    }
+    return [name, i < cur ? "done" : i === cur ? (failed ? "failed" : "active") : "pending"];
+  });
+  const mark = {done: "\u2713", warn: "!", failed: "\u2715", active: "\u25CF", skip: "\u2013"};
   return '<div class="steps">' + steps.map((s, i) =>
-    '<div class="step ' + s[1] + '"><span class="c">' + (mark[s[1]] || (i + 1)) + "</span>" + esc(s[0]) + "</div>").join("") + "</div>";
+    '<div class="step ' + s[1] + '"' + (s[1] === "skip" ? ' title="Not part of this run"' : "") + '><span class="c">' + (mark[s[1]] || (i + 1)) + "</span>" + esc(s[0]) + "</div>").join("") + "</div>";
 }
 
 function drStageLine(h) {
@@ -12451,7 +14153,7 @@ function drOverview(h, d) {
              : u.state === "idle" ? (d && d.missing === 0 ? "Ready to upgrade" : "Not started")
              : u.message;
   out += drSec("Upgrade Progress", u.job_id ? '<a href="#" class="clink" data-console="1">Open live console</a>' : "",
-    drStageLine(h) + drSteps(h, d) + '<div class="dr-barrow"><div class="dr-bar"><i style="width:' + pct + '%"></i></div><b>' + pct + "%</b></div>" +
+    drStageLine(h) + drSteps(h) + '<div class="dr-barrow"><div class="dr-bar"><i style="width:' + pct + '%"></i></div><b>' + pct + "%</b></div>" +
     '<div class="dr-note">' + esc(text) + "</div>");
 
   // recent events
@@ -12828,6 +14530,332 @@ applySite(null);
 refresh();
 setInterval(refresh, 2000);
 </script>
+<script>
+// Modern UI helpers: sliding header tabs, gear spin, drag-over file pickers and custom dropdowns.
+(function () {
+  "use strict";
+  // ---- sliding tab indicator ----
+  const tabs = document.querySelector(".tabs");
+  if (tabs) {
+    const ind = document.createElement("span");
+    ind.className = "tab-ind"; ind.setAttribute("aria-hidden", "true");
+    tabs.insertBefore(ind, tabs.firstChild);
+    tabs.classList.add("js");
+    const place = () => {
+      const on = tabs.querySelector(".tab.on");
+      if (!on || on.offsetParent === null) { if (ind.classList.contains("show")) ind.classList.remove("show"); return; }
+      ind.style.width = on.offsetWidth + "px"; ind.style.height = on.offsetHeight + "px";
+      ind.style.transform = "translate(" + on.offsetLeft + "px," + on.offsetTop + "px)";
+      if (!ind.classList.contains("show")) ind.classList.add("show");
+    };
+    place();
+    requestAnimationFrame(() => requestAnimationFrame(() => ind.classList.add("ready")));
+    const mo = new MutationObserver(place);       // watch the tab buttons only (never the indicator, or it would trigger itself)
+    tabs.querySelectorAll(".tab").forEach(t => mo.observe(t, {attributes: true, attributeFilter: ["class", "hidden"]}));
+    window.addEventListener("resize", place);
+    if (window.ResizeObserver) new ResizeObserver(place).observe(tabs);
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(place);
+  }
+
+  // ---- gear icon: one full turn on every click ----
+  const gear = document.getElementById("btn-settings");
+  if (gear) {
+    gear.addEventListener("click", () => {
+      gear.classList.remove("spin"); void gear.offsetWidth; gear.classList.add("spin");
+    });
+    gear.addEventListener("animationend", () => gear.classList.remove("spin"));
+  }
+
+  // ---- file pickers: highlight while a file is dragged over ----
+  document.addEventListener("dragover", e => { const f = e.target.closest && e.target.closest("input[type=file]"); if (f) f.classList.add("dragover"); });
+  ["dragleave", "drop"].forEach(n => document.addEventListener(n, e => { const f = e.target.closest && e.target.closest("input[type=file]"); if (f) f.classList.remove("dragover"); }));
+
+  // ---- custom dropdowns ----
+  const SVG = (cls, d) => '<svg class="' + cls + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="' + d + '"/></svg>';
+  const CHEV = SVG("nsel-c", "m6 9 6 6 6-6"), CHECK = SVG("nsel-k", "M5 12l5 5L20 7");
+  const VAL = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+  const IDX = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "selectedIndex");
+  const MAP = new WeakMap();
+  let pop = null, cur = null, act = -1, typed = "", typedAt = 0;
+
+  function selectedText(sel) { const o = sel.options[sel.selectedIndex]; return o ? o.textContent : ""; }
+  function refresh(sel) {
+    const st = MAP.get(sel); if (!st) return;
+    const t = st.btn.firstChild, o = sel.options[sel.selectedIndex];
+    t.textContent = selectedText(sel);
+    t.classList.toggle("ph", !o || o.value === "");
+    st.btn.disabled = sel.disabled; st.btn.hidden = sel.hidden;
+    if (cur === sel && pop) { fill(sel); place(); }
+  }
+  function enhance(sel) {
+    if (MAP.has(sel) || sel.multiple || sel.size > 1) return;
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = "nsel";
+    btn.setAttribute("aria-haspopup", "listbox"); btn.setAttribute("aria-expanded", "false");
+    const al = sel.getAttribute("aria-label"); if (al) btn.setAttribute("aria-label", al);
+    if (sel.id) btn.setAttribute("data-for", sel.id);
+    btn.innerHTML = '<span class="nsel-t"></span>' + CHEV;
+    sel.classList.add("nsel-native"); sel.tabIndex = -1;
+    sel.parentNode.insertBefore(btn, sel.nextSibling);
+    MAP.set(sel, {btn});
+    Object.defineProperty(sel, "value", {configurable: true, get() { return VAL.get.call(sel); }, set(v) { VAL.set.call(sel, v); refresh(sel); }});
+    Object.defineProperty(sel, "selectedIndex", {configurable: true, get() { return IDX.get.call(sel); }, set(v) { IDX.set.call(sel, v); refresh(sel); }});
+    new MutationObserver(() => refresh(sel)).observe(sel, {childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "hidden", "selected", "label"]});
+    sel.addEventListener("change", () => refresh(sel));
+    btn.addEventListener("click", () => cur === sel ? closePop() : openPop(sel));
+    btn.addEventListener("keydown", e => keyDown(e, sel));
+    refresh(sel);
+  }
+  function scan() { document.querySelectorAll("select:not(.nsel-native)").forEach(enhance); }
+
+  function fill(sel) {
+    pop.innerHTML = "";
+    const add = (parent, o) => {
+      const d = document.createElement("div");
+      d.className = "nsel-opt" + (o.selected ? " sel" : "") + (o.disabled ? " dis" : "");
+      d.setAttribute("role", "option"); d.setAttribute("aria-selected", String(o.selected)); d.dataset.i = o.index;
+      const s = document.createElement("span"); s.textContent = o.textContent; d.appendChild(s);
+      d.insertAdjacentHTML("beforeend", CHECK);
+      parent.appendChild(d);
+    };
+    [...sel.children].forEach(ch => {
+      if (ch.tagName === "OPTGROUP") {
+        const g = document.createElement("div"); g.className = "nsel-grp"; g.textContent = ch.label; pop.appendChild(g);
+        [...ch.children].forEach(o => add(pop, o));
+      } else if (ch.tagName === "OPTION") add(pop, ch);
+    });
+    if (!pop.children.length) { const e = document.createElement("div"); e.className = "nsel-opt dis"; e.textContent = "No options"; pop.appendChild(e); }
+    act = [...pop.querySelectorAll(".nsel-opt")].findIndex(n => n.classList.contains("sel"));
+    mark();
+  }
+  function items() { return [...pop.querySelectorAll(".nsel-opt[data-i]")]; }
+  function mark(scroll) {
+    const it = items();
+    it.forEach((n, i) => n.classList.toggle("act", i === act));
+    if (scroll && it[act]) it[act].scrollIntoView({block: "nearest"});
+  }
+  function place() {
+    if (!pop || !cur) return;
+    const st = MAP.get(cur), btn = st.btn;
+    if (!btn.isConnected) { closePop(); return; }
+    const r = btn.getBoundingClientRect(), vh = window.innerHeight, vw = window.innerWidth;
+    pop.style.maxHeight = "none"; pop.style.minWidth = r.width + "px"; pop.style.maxWidth = Math.max(r.width, Math.min(520, vw - 16)) + "px";
+    const want = Math.min(pop.scrollHeight + 2, 300);
+    const below = vh - r.bottom - 10, above = r.top - 10;
+    const up = below < want && above > below;
+    const h = Math.min(want, up ? above : below);
+    pop.style.maxHeight = Math.max(h, 80) + "px";
+    pop.classList.toggle("up", up);
+    pop.style.top = up ? Math.max(8, r.top - 6 - Math.max(h, 80)) + "px" : (r.bottom + 6) + "px";
+    pop.style.left = Math.max(8, Math.min(r.left, vw - pop.offsetWidth - 8)) + "px";
+  }
+  function openPop(sel) {
+    closePop();
+    const st = MAP.get(sel); if (!st || st.btn.disabled) return;
+    cur = sel;
+    pop = document.createElement("div"); pop.className = "nsel-pop"; pop.setAttribute("role", "listbox");
+    document.body.appendChild(pop);
+    fill(sel); place();
+    st.btn.classList.add("open"); st.btn.setAttribute("aria-expanded", "true");
+    requestAnimationFrame(() => { if (pop) { pop.classList.add("show"); mark(true); } });
+    pop.addEventListener("mousedown", e => e.preventDefault());
+    pop.addEventListener("click", e => {
+      const n = e.target.closest(".nsel-opt[data-i]"); if (!n || n.classList.contains("dis")) return;
+      choose(sel, +n.dataset.i);
+    });
+    pop.addEventListener("mousemove", e => {
+      const n = e.target.closest(".nsel-opt[data-i]"); if (!n) return;
+      const i = items().indexOf(n); if (i !== act) { act = i; mark(); }
+    });
+  }
+  function closePop() {
+    if (!cur) return;
+    const st = MAP.get(cur); if (st) { st.btn.classList.remove("open"); st.btn.setAttribute("aria-expanded", "false"); }
+    const p = pop; pop = null; cur = null;
+    if (p) { p.classList.remove("show"); setTimeout(() => p.remove(), 160); }
+  }
+  function choose(sel, i) {
+    const changed = IDX.get.call(sel) !== i;
+    IDX.set.call(sel, i); refresh(sel);
+    closePop();
+    const st = MAP.get(sel); if (st) st.btn.focus();
+    if (changed) { sel.dispatchEvent(new Event("input", {bubbles: true})); sel.dispatchEvent(new Event("change", {bubbles: true})); }
+  }
+  function keyDown(e, sel) {
+    const open = cur === sel;
+    if (e.key === "Tab") { closePop(); return; }
+    if (e.key === "Escape") { if (open) { e.preventDefault(); e.stopPropagation(); closePop(); } return; }
+    if (["ArrowDown", "ArrowUp", "Enter", " ", "Home", "End"].includes(e.key)) {
+      e.preventDefault();
+      if (!open) { if (e.key !== "Home" && e.key !== "End") openPop(sel); return; }
+      const it = items(); if (!it.length) return;
+      if (e.key === "Enter" || e.key === " ") { if (it[act] && !it[act].classList.contains("dis")) choose(sel, +it[act].dataset.i); else closePop(); return; }
+      if (e.key === "Home") act = 0; else if (e.key === "End") act = it.length - 1;
+      else { const d = e.key === "ArrowDown" ? 1 : -1; act = (act + d + it.length) % it.length; }
+      mark(true); return;
+    }
+    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {       // type-ahead
+      const now = Date.now(); typed = (now - typedAt > 700 ? "" : typed) + e.key.toLowerCase(); typedAt = now;
+      const opts = [...sel.options], hit = opts.find(o => !o.disabled && o.textContent.trim().toLowerCase().startsWith(typed));
+      if (hit) { if (open) { act = items().findIndex(n => +n.dataset.i === hit.index); mark(true); } else choose(sel, hit.index); }
+    }
+  }
+  document.addEventListener("mousedown", e => { if (cur && !e.target.closest(".nsel-pop") && !e.target.closest(".nsel")) closePop(); }, true);
+  document.addEventListener("scroll", e => { if (cur && !(e.target.closest && e.target.closest(".nsel-pop"))) place(); }, true);
+  window.addEventListener("resize", () => { if (cur) place(); });
+  document.addEventListener("click", e => {                                    // clicking a <label for=select> focuses its button
+    const l = e.target.closest && e.target.closest("label[for]"); if (!l) return;
+    const s = document.getElementById(l.htmlFor);
+    if (s && MAP.has(s)) { e.preventDefault(); MAP.get(s).btn.focus(); }
+  });
+  let queued = false;
+  new MutationObserver(() => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; scan(); }); })
+    .observe(document.body, {childList: true, subtree: true});
+  scan();
+})();
+</script>
+<script>
+// Date & time picker: replaces the browser's own datetime-local popup (Schedule for ...) with one that matches the dashboard.
+(function () {
+  "use strict";
+  const NAT = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+  const MAP = new WeakMap();
+  let pop = null, cur = null, draft = null, vy = 0, vm = 0;
+  const pad = n => String(n).padStart(2, "0");
+  const toVal = d => d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+  const parse = v => { const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(v || ""); return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : null; };
+  const day0 = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const fmt = d => d.toLocaleDateString(undefined, {weekday: "short", day: "numeric", month: "short", year: "numeric"}) + " \u00b7 " + pad(d.getHours()) + ":" + pad(d.getMinutes());
+  const ICON = '<svg class="ndt-i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="16" rx="3"/><path d="M8 2.5v4M16 2.5v4M3 10h18"/></svg>';
+  const L = '<svg viewBox="0 0 24 24"><path d="m15 6-6 6 6 6"/></svg>', R = '<svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></svg>';
+
+  // the earliest time that can be scheduled: two minutes from now, rounded up to the minute
+  function minTime() { const d = new Date(Date.now() + 120000); d.setSeconds(0, 0); d.setMinutes(d.getMinutes() + 1); return d; }
+
+  function refresh(inp) {
+    const st = MAP.get(inp); if (!st) return;
+    const d = parse(NAT.get.call(inp)), t = st.btn.firstChild;
+    t.textContent = d ? fmt(d) : "Select date and time";
+    t.classList.toggle("ph", !d);
+    st.btn.disabled = inp.disabled; st.btn.hidden = inp.hidden;
+  }
+  function enhance(inp) {
+    if (MAP.has(inp)) return;
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = "ndt"; btn.setAttribute("aria-haspopup", "dialog"); btn.setAttribute("aria-expanded", "false");
+    if (inp.id) btn.setAttribute("data-for", inp.id);
+    btn.innerHTML = '<span class="ndt-t"></span>' + ICON;
+    inp.classList.add("ndt-native"); inp.tabIndex = -1;
+    inp.parentNode.insertBefore(btn, inp.nextSibling);
+    MAP.set(inp, {btn});
+    Object.defineProperty(inp, "value", {configurable: true, get() { return NAT.get.call(inp); }, set(v) { NAT.set.call(inp, v); refresh(inp); }});
+    new MutationObserver(() => refresh(inp)).observe(inp, {attributes: true, attributeFilter: ["disabled", "hidden"]});
+    btn.addEventListener("click", () => cur === inp ? close() : open(inp));
+    btn.addEventListener("keydown", e => { if (e.key === "ArrowDown" && cur !== inp) { e.preventDefault(); open(inp); } else if (e.key === "Escape" && cur === inp) { e.stopPropagation(); close(); } });
+    refresh(inp);
+  }
+  function scan() { document.querySelectorAll("input[type=datetime-local]:not(.ndt-native)").forEach(enhance); }
+
+  function clamp() { const m = minTime(); if (draft < m) draft = new Date(m); }
+  function open(inp) {
+    close();
+    const st = MAP.get(inp); if (!st || st.btn.disabled) return;
+    cur = inp;
+    const have = parse(NAT.get.call(inp));
+    const m = minTime();
+    draft = have || new Date(m.getFullYear(), m.getMonth(), m.getDate(), m.getHours() + (m.getMinutes() ? 1 : 0), 0);
+    clamp(); vy = draft.getFullYear(); vm = draft.getMonth();
+    pop = document.createElement("div"); pop.className = "ndt-pop"; pop.setAttribute("role", "dialog"); pop.setAttribute("aria-label", "Pick date and time");
+    pop.innerHTML = '<div class="ndt-hd"><button type="button" class="ndt-nav" data-a="prev" aria-label="Previous month">' + L + '</button><span class="ndt-mt"></span>' +
+      '<button type="button" class="ndt-nav" data-a="next" aria-label="Next month">' + R + '</button></div>' +
+      '<div class="ndt-wd"></div><div class="ndt-grid"></div><div class="ndt-sep"></div>' +
+      '<div class="ndt-time"><div class="ndt-tc"><div class="ndt-tl">Hour</div><div class="ndt-col" data-c="h"></div></div>' +
+      '<div class="ndt-tc"><div class="ndt-tl">Minute</div><div class="ndt-col" data-c="m"></div></div></div>' +
+      '<div class="ndt-sum"></div>' +
+      '<div class="ndt-ft"><button type="button" class="btn sm" data-a="clear">Clear</button><button type="button" class="btn p sm" data-a="set">Set</button></div>';
+    document.body.appendChild(pop);
+    const wd = pop.querySelector(".ndt-wd"), base = new Date(2023, 0, 1);       // a Sunday
+    for (let i = 0; i < 7; i++) { const s = document.createElement("span"); s.textContent = new Date(2023, 0, 1 + i).toLocaleDateString(undefined, {weekday: "short"}).slice(0, 2); wd.appendChild(s); }
+    const hc = pop.querySelector('[data-c="h"]'), mc = pop.querySelector('[data-c="m"]');
+    for (let h = 0; h < 24; h++) hc.insertAdjacentHTML("beforeend", '<button type="button" data-h="' + h + '">' + pad(h) + "</button>");
+    for (let n = 0; n < 60; n++) mc.insertAdjacentHTML("beforeend", '<button type="button" data-m="' + n + '">' + pad(n) + "</button>");
+    drawCal(); drawTime(true); place();
+    st.btn.classList.add("open"); st.btn.setAttribute("aria-expanded", "true");
+    requestAnimationFrame(() => pop && pop.classList.add("show"));
+    pop.addEventListener("click", onClick);
+  }
+  function drawCal() {
+    const grid = pop.querySelector(".ndt-grid"), mn = minTime(), md = day0(mn), today = day0(new Date());
+    pop.querySelector(".ndt-mt").textContent = new Date(vy, vm, 1).toLocaleDateString(undefined, {month: "long", year: "numeric"});
+    pop.querySelector('[data-a="prev"]').disabled = vy < md.getFullYear() || (vy === md.getFullYear() && vm <= md.getMonth());
+    const first = new Date(vy, vm, 1).getDay(), n = new Date(vy, vm + 1, 0).getDate();
+    let h = "";
+    for (let i = 0; i < first; i++) h += "<span></span>";
+    for (let d = 1; d <= n; d++) {
+      const dt = new Date(vy, vm, d), sel = dt.getTime() === day0(draft).getTime();
+      h += '<button type="button" class="ndt-d' + (sel ? " sel" : "") + (dt.getTime() === today.getTime() ? " today" : "") + '" data-d="' + d + '"' + (dt < md ? " disabled" : "") + ">" + d + "</button>";
+    }
+    grid.innerHTML = h;
+  }
+  function drawTime(center) {
+    const md = minTime(), sameDay = day0(draft).getTime() === day0(md).getTime();
+    pop.querySelectorAll("[data-h]").forEach(b => { const h = +b.dataset.h; b.classList.toggle("sel", h === draft.getHours()); b.disabled = sameDay && h < md.getHours(); });
+    pop.querySelectorAll("[data-m]").forEach(b => {
+      const m = +b.dataset.m; b.classList.toggle("sel", m === draft.getMinutes());
+      b.disabled = sameDay && draft.getHours() === md.getHours() && m < md.getMinutes();
+    });
+    pop.querySelector(".ndt-sum").innerHTML = "<b>" + fmt(draft) + "</b>";
+    if (center) pop.querySelectorAll(".ndt-col").forEach(c => { const s = c.querySelector(".sel"); if (s) c.scrollTop = s.offsetTop - c.clientHeight / 2 + s.offsetHeight / 2; });
+  }
+  function setDraft(d, center) { draft = d; clamp(); vy = draft.getFullYear(); vm = draft.getMonth(); drawCal(); drawTime(center); }
+  function onClick(e) {
+    const t = e.target.closest("button"); if (!t || t.disabled) return;
+    if (t.dataset.d) { const d = new Date(draft); d.setFullYear(vy, vm, +t.dataset.d); draft = d; clamp(); drawCal(); drawTime(); return; }
+    if (t.dataset.h !== undefined) { const d = new Date(draft); d.setHours(+t.dataset.h); draft = d; clamp(); drawTime(); return; }
+    if (t.dataset.m !== undefined) { const d = new Date(draft); d.setMinutes(+t.dataset.m); draft = d; clamp(); drawTime(); return; }
+    const a = t.dataset.a;
+    if (a === "prev") { vm--; if (vm < 0) { vm = 11; vy--; } drawCal(); }
+    else if (a === "next") { vm++; if (vm > 11) { vm = 0; vy++; } drawCal(); }
+    else if (a === "clear") commit("");
+    else if (a === "set") commit(toVal(draft));
+  }
+  function commit(v) {
+    const inp = cur; if (!inp) return;
+    const changed = NAT.get.call(inp) !== v;
+    NAT.set.call(inp, v); refresh(inp);
+    const b = MAP.get(inp).btn; close(); b.focus();
+    if (changed) { inp.dispatchEvent(new Event("input", {bubbles: true})); inp.dispatchEvent(new Event("change", {bubbles: true})); }
+  }
+  function place() {
+    if (!pop || !cur) return;
+    const btn = MAP.get(cur).btn;
+    if (!btn.isConnected) { close(); return; }
+    const r = btn.getBoundingClientRect(), vh = window.innerHeight, vw = window.innerWidth, h = pop.offsetHeight;
+    const up = vh - r.bottom - 10 < h && r.top - 10 > vh - r.bottom - 10;
+    pop.classList.toggle("up", up);
+    pop.style.top = Math.max(8, up ? r.top - 6 - h : Math.min(r.bottom + 6, vh - h - 8)) + "px";
+    pop.style.left = Math.max(8, Math.min(r.left, vw - pop.offsetWidth - 8)) + "px";
+  }
+  function close() {
+    if (!cur) return;
+    const st = MAP.get(cur); if (st) { st.btn.classList.remove("open"); st.btn.setAttribute("aria-expanded", "false"); }
+    const p = pop; pop = null; cur = null;
+    if (p) { p.classList.remove("show"); setTimeout(() => p.remove(), 160); }
+  }
+  document.addEventListener("mousedown", e => { if (cur && !e.target.closest(".ndt-pop") && !e.target.closest(".ndt")) close(); }, true);
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && cur) close(); });
+  document.addEventListener("scroll", e => { if (cur && !(e.target.closest && e.target.closest(".ndt-pop"))) place(); }, true);
+  window.addEventListener("resize", () => { if (cur) place(); });
+  document.addEventListener("click", e => {
+    const l = e.target.closest && e.target.closest("label[for]"); if (!l) return;
+    const s = document.getElementById(l.htmlFor);
+    if (s && MAP.has(s)) { e.preventDefault(); MAP.get(s).btn.focus(); }
+  });
+  let queued = false;
+  new MutationObserver(() => { if (queued) return; queued = true; requestAnimationFrame(() => { queued = false; scan(); }); }).observe(document.body, {childList: true, subtree: true});
+  scan();
+})();
+</script>
 </body>
 </html>
 """
@@ -12963,6 +14991,10 @@ def make_handler(manager, allowed_hosts, any_host):
                     self._json(200, manager.console_read(q("host"), q("job"), q("offset")))
                 elif path == "/api/sites":
                     self._json(200, {"sites": list_site_profiles(), "current": manager.site_name})
+                elif path == "/api/diag":
+                    self._json(200, manager.diag_view())
+                elif path == "/api/ai/settings":
+                    self._json(200, manager.ai_settings_view())
                 elif path == "/api/topology":
                     self._json(200, manager.topology_view())
                 elif path == "/api/storage/list":
@@ -12973,6 +15005,10 @@ def make_handler(manager, allowed_hosts, any_host):
                     self._json(200, storage_backup_runs(qv("site"), qv("path")))
                 elif path == "/api/storage/compare":
                     self._json(200, storage_compare(qv("site"), qv("path"), qv("a"), qv("b"), qv("ignore") != "0", qv("cmd") or None))
+                elif path == "/api/storage/records":
+                    self._json(200, storage_records(qv("site"), qv("path")))
+                elif path == "/api/storage/rcompare":
+                    self._json(200, storage_record_compare(qv("site"), qv("path"), qv("a"), qv("b"), qv("ignore") != "0", qv("cmd") or None))
                 elif path == "/api/storage/read":
                     self._json(200, storage_read(qv("site"), qv("path"), qv("tail") == "1"))
                 elif path == "/api/storage/download":
@@ -13050,6 +15086,16 @@ def make_handler(manager, allowed_hosts, any_host):
                     result = manager.clear_notifications()
                 elif path == "/api/profile/delete":
                     result = manager.delete_profile(body.get("name"))
+                elif path == "/api/diag/commands":
+                    result = manager.start_diag_commands(body.get("hosts"), body.get("commands"), self._who())
+                elif path == "/api/diag/logs":
+                    result = manager.start_diag_logs(body.get("hosts"), body.get("lookback_hours"), self._who())
+                elif path == "/api/diag/ai":
+                    result = manager.diag_ai_advice(body.get("host"), self._who())
+                elif path == "/api/ai/settings":
+                    result = manager.update_ai_settings(body.get("values"), self._who())
+                elif path == "/api/ai/test":
+                    result = manager.test_ai_settings(body.get("values"), self._who())
                 elif path == "/api/topology/discover":
                     result = manager.start_topology_discovery(body.get("hosts"))
                 elif path == "/api/topology/root":
@@ -13067,12 +15113,12 @@ def make_handler(manager, allowed_hosts, any_host):
                     result = manager.start_readiness_check(body.get("hosts"), body.get("image_path"))
                 elif path == "/api/upgrade":
                     result = manager.start_upgrade(body.get("hosts"), body.get("image_path"),
-                                                   bool(body.get("backup_first")), body.get("action") or "full",
+                                                   True, body.get("action") or "full",
                                                    self._who(), bool(body.get("skip_image_check")),
                                                    bool(body.get("ignore_space")))
                 elif path == "/api/schedule":
                     result = manager.schedule_upgrade(body.get("hosts"), body.get("image_path"), body.get("run_at"),
-                                                      bool(body.get("backup_first")),
+                                                      True,
                                                       body.get("action") or "full",
                                                       self._who(), bool(body.get("skip_image_check")),
                                                       bool(body.get("ignore_space")))
@@ -13361,22 +15407,35 @@ def apply_access_control(base_handler, access):
         except Exception:
             traceback.print_exc()
 
-    CSS = ("*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;"
-           "justify-content:center;font-family:system-ui,Segoe UI,sans-serif;background:#f3f5f8;color:#1b2430}"
-           "main{background:#fff;padding:28px 30px;border-radius:12px;box-shadow:0 2px 14px #0002;"
-           "width:min(380px,92vw)}h1{font-size:20px;margin:0 0 6px}p{margin:6px 0 14px;color:#51606f}"
-           "label{display:block;font-size:13px;margin:10px 0 0}input{width:100%;padding:9px;margin-top:4px;"
-           "border:1px solid #b9c3cf;border-radius:6px;font-size:15px}button{width:100%;margin-top:16px;"
-           "padding:10px;border:0;border-radius:6px;background:#1f6feb;color:#fff;font-size:15px;cursor:pointer}"
-           ".err{background:#fde8e8;color:#9b1c1c;padding:8px 10px;border-radius:6px;font-size:14px}"
-           "@media(prefers-color-scheme:dark){body{background:#12171d;color:#e6ebf1}main{background:#1b232c}"
-           "p{color:#9fb0c1}input{background:#12171d;color:#e6ebf1;border-color:#3a4654}}"
+    CSS = ("*{box-sizing:border-box}"
+           ":root{--bg:#e9eff9;--bg2:#dfe8f8;--card:linear-gradient(160deg,#f1f6ff,#fff 45%);--bd:#d9e2f3;"
+           "--tx:#1b2430;--mu:#5d6c85;--field:#f4f7fd;--ac:#1f6bff;--errbg:#fde8e8;--err:#9b1c1c;--sh:0 8px 30px #1b2f6a18}"
+           "@media(prefers-color-scheme:dark){:root{--bg:#050a18;--bg2:#0a1630;"
+           "--card:linear-gradient(155deg,#12306b,#0c1a3a 34%,#0a1329);--bd:#1a2748;--tx:#eef3ff;--mu:#8d9cc2;"
+           "--field:#111c3a;--ac:#2f86ff;--errbg:#3a1a2c;--err:#ff8a9a;--sh:none}}"
+           "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+           "font-family:system-ui,Segoe UI,sans-serif;color:var(--tx);"
+           "background:radial-gradient(900px 480px at 12% -8%,var(--bg2),transparent 70%),"
+           "radial-gradient(800px 460px at 100% 0,var(--bg2),transparent 65%),var(--bg)}"
+           "main{background:var(--card);border:1px solid var(--bd);padding:30px 32px;border-radius:22px;"
+           "box-shadow:var(--sh);width:min(400px,92vw)}"
+           "h1{font-size:20px;margin:0 0 6px;font-weight:600}p{margin:6px 0 14px;color:var(--mu)}"
+           "label{display:block;font-size:13px;margin:12px 0 0;color:var(--mu)}"
+           "input{width:100%;padding:11px 14px;margin-top:5px;border:1px solid var(--bd);border-radius:12px;"
+           "font-size:15px;background:var(--field);color:var(--tx);outline:none}"
+           "input:focus{border-color:var(--ac);box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 22%,transparent)}"
+           "button{width:100%;margin-top:20px;padding:11px;border:0;border-radius:999px;"
+           "background:linear-gradient(180deg,#4a97ff,#1d6bff);color:#fff;font-size:15px;font-weight:600;"
+           "cursor:pointer;box-shadow:0 6px 22px #1f6bff55}button:hover{filter:brightness(1.08)}"
+           ".err{background:var(--errbg);color:var(--err);padding:9px 12px;border-radius:12px;font-size:14px}"
            ".brand{display:flex;align-items:center;gap:14px;margin:0 0 18px;padding-bottom:16px;"
-           "border-bottom:1px solid #d5dce4}.brand img{width:52px;height:52px;object-fit:contain;flex:none}"
-           ".brand b{display:block;font-size:24px;font-weight:600;line-height:1.1}"
-           ".brand small{display:block;margin-top:3px;font-size:12px;color:#6b7a8c}"
-           ".credit{margin:18px 0 0;padding-top:12px;border-top:1px solid #d5dce4;font-size:12px;"
-           "text-align:center;color:#6b7a8c}.credit a{color:#1f6feb;text-decoration:none;font-weight:600}")
+           "border-bottom:1px solid var(--bd)}"
+           ".brand img{width:48px;height:48px;object-fit:contain;flex:none;padding:7px;border-radius:50%;"
+           "background:var(--field);border:1px solid var(--bd)}"
+           ".brand b{display:block;font-size:22px;font-weight:600;line-height:1.1}"
+           ".brand small{display:block;margin-top:3px;font-size:12px;color:var(--mu)}"
+           ".credit{margin:18px 0 0;padding-top:12px;border-top:1px solid var(--bd);font-size:12px;"
+           "text-align:center;color:var(--mu)}.credit a{color:var(--ac);text-decoration:none;font-weight:600}")
 
     def page(title, inner, script=""):
         return ("<!doctype html><html><head><meta charset='utf-8'>"
