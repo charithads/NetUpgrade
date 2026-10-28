@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output
+build/
+dist/
+*.spec
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+settings.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local logs and backups
+*.log
+*.bak
+
+# Local test dependencies
+.deps/
+.pip-temp/

@@ -1,0 +1,144 @@
+name: CI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  checks:
+    name: Python ${{ matrix.python-version }} checks
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install pinned runtime and lint dependencies
+        run: python -m pip install -r requirements.txt flake8==7.4.1
+
+      - name: Check syntax and undefined names
+        run: python -m flake8 ios_xe_upgrade_manager.py launcher.py update_service.py updater_helper.py --select=E9,F63,F7,F82 --show-source
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Run application smoke tests
+        run: python tests/smoke_test.py
+
+  dependency-audit:
+    name: Dependency vulnerability audit
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install audit tool
+        run: python -m pip install pip-audit==2.10.1
+
+      - name: Audit pinned dependencies
+        run: pip-audit -r requirements.txt
+
+  build:
+    name: Windows installer build
+    needs: [checks, dependency-audit]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install pinned dependencies and builder
+        run: python -m pip install -r requirements.txt pyinstaller==6.22.3
+
+      - name: Build application and updater executables
+        shell: pwsh
+        run: |
+          $pyArgs = @("--noconsole", "--onefile", "--name", "NetUpgrade",
+                    "--hidden-import", "ios_xe_upgrade_manager",
+                    "--collect-all", "netmiko", "--collect-all", "cryptography")
+          if (Test-Path app.ico) { $pyArgs += @("--icon", "app.ico", "--add-data", "app.ico;.") }
+          python -m PyInstaller @pyArgs launcher.py
+          python -m PyInstaller --noconsole --onefile --name NetUpgradeUpdater --hidden-import psutil updater_helper.py
+
+      - name: Build per-user Windows installer
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.7.1 --yes --no-progress
+          $versionMatch = [regex]::Match((Get-Content launcher.py -Raw), 'APP_VERSION = "([^"]+)"')
+          $version = $versionMatch.Groups[1].Value
+          if (-not $version) { throw "Could not read application version" }
+          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag $env:GITHUB_REF_NAME does not match application version v$version"
+          }
+          $iscc = (Get-Command ISCC.exe -ErrorAction Stop).Source
+          & $iscc "/DAppVersion=$version" NetUpgrade.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compiler failed" }
+          if (-not (Test-Path "dist/NetUpgrade-Setup-v$version.exe")) { throw "Installer was not created" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: NetUpgrade
+          path: dist/NetUpgrade.exe
+          retention-days: 7
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: NetUpgrade-Installer
+          path: dist/NetUpgrade-Setup-v*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release-asset:
+    name: Attach installer to GitHub Release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v4
+        with:
+          name: NetUpgrade-Installer
+          path: dist
+
+      - name: Attach installer to the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        shell: pwsh
+        run: |
+          $installer = @(Get-ChildItem dist -Filter "NetUpgrade-Setup-v*.exe")
+          if ($installer.Count -ne 1) { throw "Expected exactly one versioned installer" }
+          gh release upload $env:RELEASE_TAG $installer[0].FullName --repo $env:GITHUB_REPOSITORY --clobber
