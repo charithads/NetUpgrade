@@ -1,7 +1,7 @@
 #define MyAppName "NetUpgrade"
 #define MyAppPublisher "Innovate Nexus"
 #ifndef AppVersion
-  #define AppVersion "5.16.0"
+  #define AppVersion "5.17.0"
 #endif
 
 [Setup]
