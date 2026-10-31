@@ -16287,3 +16287,335 @@ setInterval(async function(){
             self.send_response(303)
             self.send_header("Location", location)
             self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            for k, v in extra:
+                self.send_header(k, v)
+            self.end_headers()
+            self.close_connection = True
+
+        def _token(self):
+            for part in self.headers.get("Cookie", "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == COOKIE:
+                    return v
+            return None
+
+        def _user(self, ip, local):
+            return session_user(self._token(), ip, local)
+
+        def _body(self, limit):
+            try:
+                length = min(int(self.headers.get("Content-Length", "0") or 0), limit)
+            except ValueError:
+                length = 0
+            return self.rfile.read(length).decode("utf-8", "replace") if length else ""
+
+        def send_header(self, keyword, value):
+            # The dashboard is shown inside a same-origin wrapper frame.
+            k = keyword.lower()
+            if k == "x-frame-options":
+                value = "SAMEORIGIN"
+            elif k == "content-security-policy":
+                value = re.sub(r"frame-ancestors[^;]*", "frame-ancestors 'self'", value)
+            super().send_header(keyword, value)
+
+        # ---- the guard -----------------------------------------------------
+        def parse_request(self):
+            if not super().parse_request():
+                return False
+            try:
+                return self._guard()
+            except Exception:
+                traceback.print_exc()
+                try:
+                    self._gsend(500, "Access control error", "text/plain")
+                except Exception:
+                    pass
+                return False          # fail closed
+
+        def _guard(self):
+            ip = self.client_address[0]
+            local = ip in ("127.0.0.1", "::1") or ip == self.connection.getsockname()[0]
+            path = self.path.split("?", 1)[0]
+            dest = self.headers.get("Sec-Fetch-Dest", "").lower()
+            wants_page = dest in ("document", "iframe") or (
+                not dest and "text/html" in self.headers.get("Accept", ""))
+            public = bool(access.get("public", False))
+            users = access.get("users") or {}
+
+            if path.startswith("/__guard/"):
+                self._guard_route(ip, local, path, public, users)
+                return False
+
+            if not users:                                  # no accounts yet: nobody gets in
+                if wants_page:
+                    self._gsend(503, setup_page())
+                else:
+                    self._gsend(503, "Setup needed: create the admin account first.", "text/plain")
+                return False
+            if not local:                                  # this PC is not subject to Block / allowed IPs
+                if not public:
+                    if wants_page:
+                        self._gsend(403, blocked_page().replace("</script>", KICK + "</script>"))
+                    else:
+                        self._gsend(403, "Public access is turned off.", "text/plain")
+                    return False
+                if not ip_allowed(ip):
+                    self._gsend(403, "Your address is not allowed to use this tool.", "text/plain")
+                    return False
+            user = self._user(ip, local)
+            if not user:
+                if dest == "iframe":
+                    self._gsend(401, f"<script>{KICK}</script>")
+                elif wants_page:
+                    self._redirect("/__guard/login?next=" + urllib.parse.quote(self.path))
+                else:
+                    self._gsend(401, "Login required.", "text/plain")
+                return False
+            self.guard_user = user                         # lets the dashboard record who did what
+            role = role_of(users[user])
+            self.guard_role = role
+            allowed, why = role_allows(role, self.command, self.path)
+            if not allowed:                                # enforced here, whatever the page shows
+                audit(user, ip, f"DENIED ({role}) {self.command} {path}")
+                if path.startswith("/api/"):
+                    self._gsend(403, json.dumps({"error": why}), "application/json")
+                else:
+                    self._gsend(403, why, "text/plain")
+                return False
+            if self.command not in ("GET", "HEAD"):        # record every action that changes something
+                audit(user, ip, f"{self.command} {path}")
+            if (dest == "document" and self.command == "GET"
+                    and (path in ("/", "/index.html") or path.endswith(".html"))):
+                self._gsend(200, shell_page(self.path, user, role))
+                return False
+            return True
+
+        def _guard_route(self, ip, local, path, public, users):
+            remote_blocked = (not local) and (not public or not ip_allowed(ip))
+            if path == "/__guard/status":
+                if not users:
+                    state = "setup"
+                elif remote_blocked:
+                    state = "blocked"
+                elif not self._user(ip, local):
+                    state = "login"
+                else:
+                    state = "ok"
+                self._gsend(200, json.dumps({"state": state}), "application/json")
+                return
+            if path == "/__guard/logout":
+                token = self._token()
+                with lock:
+                    s = sessions.pop(token, None)
+                if s:
+                    audit(s["user"], ip, "logout")
+                self._redirect("/__guard/login", [("Set-Cookie", cookie_hdr(None))])
+                return
+            if path == "/__guard/audit":                   # button clicks reported by the wrapper page
+                user = self._user(ip, local) if self.command == "POST" else None
+                if not user:
+                    self._gsend(401, "Login required.", "text/plain")
+                    return
+                text = self._body(300)
+                now = time.time()
+                with lock:
+                    win = ui_rate.get(user)
+                    if not win or now - win[0] > 60:
+                        win = ui_rate[user] = [now, 0]
+                    win[1] += 1
+                    allowed_now = win[1] <= 120
+                if allowed_now and text:
+                    audit(user, ip, "ui " + text)
+                self._gsend(204, "", "text/plain")
+                return
+            if path != "/__guard/login":
+                self._gsend(404, "Not found.", "text/plain")
+                return
+            if not users:
+                self._gsend(503, setup_page())
+                return
+            if remote_blocked:
+                self._gsend(403, blocked_page())
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if self.command != "POST":
+                nxt = safe_next(query.get("next", ["/"])[0])
+                if self._user(ip, local):
+                    self._redirect(nxt)
+                else:
+                    self._gsend(200, login_page(nxt))
+                return
+            # ---- POST: check the login form
+            form = urllib.parse.parse_qs(self._body(4096))
+            user = form.get("username", [""])[0].strip().lower()
+            pw = form.get("password", [""])[0]
+            nxt = safe_next(form.get("next", ["/"])[0])
+            now = time.time()
+            with lock:
+                recent = [t for t in failures.get(ip, []) if now - t < WINDOW]
+                failures[ip] = recent
+                locked = len(recent) >= MAX_FAILS
+            if locked:
+                self._gsend(429, login_page(nxt, "Too many wrong logins. Try again in a few minutes."))
+                return
+            if check_password(user, pw):
+                token = new_session(user, ip, local)
+                with lock:
+                    failures.pop(ip, None)
+                audit(user, ip, "login ok")
+                self._redirect(nxt, [("Set-Cookie", cookie_hdr(token))])
+            else:
+                with lock:
+                    failures.setdefault(ip, []).append(now)
+                audit(user, ip, "login FAILED")
+                self._gsend(401, login_page(nxt, "Wrong username or password."))
+
+    return Guarded
+
+
+apply_access_control.version = 5      # the launcher checks this to detect an out-of-date script
+
+
+def gui_main(embedded=False, argv=None, access=None, tls=None):
+    if getattr(sys, "frozen", False):
+        sys.excepthook = _frozen_excepthook
+    p = argparse.ArgumentParser(description="NetUpgrade - monitor, back up and upgrade "
+                                            "Cisco C9200 switches.")
+    p.add_argument("--version", action="version", version=f"{APP_NAME} v{APP_VERSION}")
+    p.add_argument("excel", nargs="?", default=None,
+                   help="Optional: a .xlsx file to seed a site profile's device list with on "
+                        "first activation. Only used together with --site; otherwise devices "
+                        "are uploaded or added by hand from the dashboard.")
+    p.add_argument("--site", default=None,
+                   help="Activate this site profile automatically on startup (creating it if "
+                        "new). Without it, select or create a site from the dashboard.")
+    p.add_argument("--sheet", help="Sheet name (default: first sheet)")
+    p.add_argument("--column", help="Header of the IP/hostname column (default: auto-detect)")
+    p.add_argument("--mode", choices=["icmp", "tcp"], default="icmp",
+                   help="Availability check: icmp = ping (default); tcp = TCP connect to --port")
+    p.add_argument("--port", type=int, default=22, help="TCP port for --mode tcp (default: 22)")
+    p.add_argument("--interval", type=float, default=5.0, help="Seconds between check cycles (default: 5)")
+    p.add_argument("--timeout", type=float, default=2.0, help="Per-check timeout in seconds (default: 2)")
+    p.add_argument("--duration", type=float, default=0,
+                   help=f"Stop monitoring after this many minutes (min {MIN_DURATION_MIN}); "
+                        "0 = keep monitoring until stopped (default). Monitoring can be restarted in the GUI.")
+    p.add_argument("--fail-threshold", type=int, default=2,
+                   help="Consecutive failed checks before a switch is marked DOWN (default: 2)")
+    p.add_argument("--host", default="127.0.0.1", help="Dashboard bind address (default: 127.0.0.1)")
+    p.add_argument("--allow-remote", action="store_true",
+                   help="Request remote binding; requires the desktop launcher's login and HTTPS controls")
+    p.add_argument("--web-port", type=int, default=8080, help="Dashboard port (default: 8080)")
+    p.add_argument("--open", action="store_true", help="Open the dashboard in your browser")
+    args = p.parse_args(argv)
+
+    if args.duration != 0 and args.duration < MIN_DURATION_MIN:
+        p.error(f"--duration must be at least {MIN_DURATION_MIN} minutes (or 0 for no limit)")
+    if args.interval <= 0 or args.timeout <= 0 or args.fail_threshold < 1:
+        p.error("--interval and --timeout must be > 0 and --fail-threshold must be >= 1")
+    loopback = args.host in ("127.0.0.1", "localhost", "::1")
+    exposure_error = dashboard_exposure_error(args.host, args.allow_remote, access, tls)
+    if exposure_error:
+        p.error(exposure_error)
+    if args.mode == "icmp" and shutil.which("ping") is None:
+        sys.exit("The 'ping' command was not found. Install it or use: --mode tcp --port 22")
+
+    print(f"{APP_NAME} v{APP_VERSION}  |  Developed by {APP_AUTHOR}  |  {APP_REPO_URL}")
+    events = EventLog()
+    monitor = Monitor([], events, args.mode, args.port, args.interval, args.timeout,
+                      args.duration, args.fail_threshold)
+    manager = Manager(monitor, events)
+
+    if args.site:
+        try:
+            manager.switch_site(args.site)
+        except ApiError as exc:
+            sys.exit(f"Could not activate site '{args.site}': {exc}")
+        print(f"Active site: {manager.site_name} ({len(manager.order)} device(s) loaded)")
+        if args.excel:
+            try:
+                seed_hosts = load_hosts(args.excel, args.sheet, args.column)
+                added, skipped = manager.add_devices_bulk(seed_hosts, Path(args.excel).name)
+                print(f"Seeded from {args.excel}: {added} device(s) added"
+                     + (f", {skipped} already present" if skipped else ""))
+            except SystemExit:
+                raise
+    else:
+        if args.excel:
+            print("NOTE: a switch list file was given but no --site was specified, so it is "
+                 "being ignored. Pass --site NAME to activate a site and seed it from this "
+                 "file, or choose/create a site from the dashboard and upload it there.")
+        print("No site profile selected yet - choose or create one from the dashboard.")
+
+    EMAILER.cfg_provider = manager.email_live_config
+    legacy = (access or {}).get("email_legacy")          # e-mail settings the launcher's old Notifications tab saved
+    if isinstance(legacy, dict) and legacy.get("host") and not email_settings_path().exists():
+        try:
+            merged = dict(EMAIL_DEFAULTS)
+            merged.update({k: legacy[k] for k in EMAIL_DEFAULTS if k in legacy})
+            save_email_settings(merged)
+            manager.email_cfg = load_email_settings()
+            print("E-mail notification settings moved from the launcher to Settings > Notifications.", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not move the old e-mail settings: {type(exc).__name__}", flush=True)
+    allowed = {"localhost", "127.0.0.1", "::1"}
+    handler = make_handler(manager, allowed, any_host=not loopback)
+    if access is not None:
+        access["notify"] = lambda kind, title, text: manager._notify("-", kind, title, text)
+        access["https"] = bool(tls)
+        handler = apply_access_control(handler, access)
+    try:
+        if tls:
+            server = make_tls_server((args.host, args.web_port), handler, tls[0], tls[1])
+        else:
+            server = ThreadingHTTPServer((args.host, args.web_port), handler)
+    except OSError as exc:
+        sys.exit(f"Could not start the dashboard on {args.host}:{args.web_port}: {exc}\n"
+                 "Try a different port with --web-port.")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # Monitoring no longer starts on its own - the person clicks "Start Monitoring" in the GUI.
+
+    shown = "127.0.0.1" if args.host in ("0.0.0.0", "") else args.host
+    url = f"{'https' if tls else 'http'}://{shown}:{args.web_port}"
+
+    # When started from the launcher window, hand control back instead of
+    # blocking here; the launcher opens the browser and handles Exit.
+    if embedded:
+        def shutdown():
+            monitor.stop()
+            server.shutdown()
+            server.server_close()
+            manager.close()
+        return url, shutdown
+
+    print(f"Dashboard: {url}")
+    if not loopback:
+        print("WARNING: the dashboard is reachable from the network and has no login.")
+    print("Press Ctrl+C to stop.\n")
+    if args.open or getattr(sys, "frozen", False):
+        webbrowser.open(url)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down ...")
+
+    running = manager.active_upgrades()
+    if running:
+        print(f"NOTE: {len(running)} upgrade(s) are still running in the background and will "
+              f"continue (logs are in the site's Runs folder): {', '.join(running)}")
+    monitor.stop()
+    server.shutdown()
+    manager.close()
+
+
+if __name__ == '__main__':
+    if len(sys.argv) == 3 and sys.argv[1] == '--job':
+        sys.exit(job_main(sys.argv[2]))            # per-switch worker (launched by the GUI)
+    elif '--cli' in sys.argv:
+        sys.argv.remove('--cli')
+        interactive_main()                         # original no-GUI batch upgrade flow
+    else:
+        gui_main()                                 # web GUI (default)
