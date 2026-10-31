@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v1.0.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v1.0.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -98,13 +98,16 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "1.0.0"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "1.0.1"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
-# Features included in this first public version, shown under Settings > About.
+# Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
+    {"version": "1.0.1", "date": "2026-10-31", "features": [
+        "Add Google Gemini as an optional AI analysis provider.",
+        "Improve AI error messages and refine the Troubleshoot and Settings screens."]},
     {"version": "1.0.0", "date": "2026-10-28", "features": [
         "Upgrade multiple Cisco switches at the same time, with a configurable limit and queued jobs.",
         "Check and upload IOS-XE images, run readiness checks, schedule upgrades, and verify switches after reload.",
@@ -2637,8 +2640,9 @@ SETTINGS_GROUPS = [
      "intro": "How long the tool waits for a switch before it gives up. Raise a value when a production switch is slow "
               "to return a command's output or to save its configuration. The default is shown next to each value "
               "(click it to put the default back). A change applies to everything that starts after you save; an "
-              "upgrade that is already running keeps the values it started with. Command duration profiles "
-              "keep named sets of these values, and the Command time test can measure a switch to build one."},
+              "upgrade that is already running keeps the values it started with. Choose a Command duration profile "
+              "below and press Apply to use it. Profiles are created in the Troubleshoot tab, where the "
+              "Command time test can measure a switch to build one."},
     {"id": "notifications", "title": "Notifications",
      "intro": "E-mail copies of the notifications shown under the bell icon. Off until you switch it on. Gmail: "
               "smtp.gmail.com, port 587 (STARTTLS) and an App password (2-Step Verification > App passwords) - "
@@ -2775,7 +2779,7 @@ _POSTCHECK_STEPS = ([("show version", "show_cmd"), ("show processes cpu", "healt
 G_PRE, G_PREP, G_INST, G_INST1, G_POST = ("1. Pre-Check", "2. Prepare The Switch", "3. Install - Activate/Distribute",
                                           "3. Install - Full Upgrade", "4. Post-Check")
 COMMAND_TEST_PRESETS = [
-    {"id": "precheck_bundle", "title": "Pre-Check Bundle", "command": "show version, show boot, snapshot and health commands",
+    {"id": "precheck_bundle", "title": "Run The Pre-Upgrade Checks", "command": "show version, show boot, snapshot and health commands",
      "group": G_PRE, "kind": "bundle", "steps": _PRECHECK_STEPS,
      "desc": "Everything the upgrade reads before it changes anything. Each command and the total are timed."},
     {"id": "dir_flash", "title": "Check free space", "command": "dir flash:", "group": G_PREP, "kind": "command",
@@ -2822,7 +2826,7 @@ COMMAND_TEST_PRESETS = [
      "desc": "The one-command path the upgrade normally uses. Use it INSTEAD of the three-step path above (Add, Activate, "
              "Commit) - running both would upgrade the switch twice. After the reload the test checks the version and "
              "whether the image is committed."},
-    {"id": "postcheck_bundle", "title": "Post-Check Bundle", "command": "version, health and snapshot commands",
+    {"id": "postcheck_bundle", "title": "Run The Post-Upgrade Checks", "command": "version, health and snapshot commands",
      "group": G_POST, "kind": "bundle", "steps": _POSTCHECK_STEPS,
      "desc": "What the upgrade checks after the reload. Each command and the total are timed."},
 ]
@@ -5897,8 +5901,9 @@ def build_diag_report(fmt, analyses, site=""):
 
 # ---- optional cloud AI second opinion (Settings > AI Analysis). Off by default; the local rules never need it. ----
 AI_SETTINGS_FILENAME = "ai_settings.json"
-AI_PROVIDERS = {"anthropic": "Anthropic (Claude)", "openai": "OpenAI-compatible (any server with /chat/completions)"}
+AI_PROVIDERS = {"anthropic": "Anthropic (Claude)", "gemini": "Google Gemini", "openai": "OpenAI-compatible (any server with /chat/completions)"}
 AI_DEFAULTS = {"enabled": False, "provider": "anthropic", "model": "claude-sonnet-5-5", "base_url": "", "api_key_enc": "", "mask": True}
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 AI_MAX_PROMPT_CHARS = 14000
 AI_TIMEOUT = 90
 AI_SYSTEM_PROMPT = (
@@ -6039,8 +6044,8 @@ def ai_describe_error(exc):
             detail = " ".join(str(detail).split())[:200]
         except Exception:  # noqa: BLE001
             detail = ""
-        hint = {401: " - the API key was rejected.", 403: " - access denied for this key or model.", 404: " - check the model name and the base URL.",
-                429: " - rate limit or quota reached."}.get(exc.code, "")
+        hint = {401: " - the API key was rejected.", 403: " - access denied for this key or model.", 404: " - check the model name (and the base URL, if one is used).",
+                400: " - the request was rejected (check the API key and model name).", 429: " - rate limit or quota reached."}.get(exc.code, "")
         return f"The API answered HTTP {exc.code}{hint}" + (f" ({detail})" if detail else "")
     if isinstance(exc, urllib.error.URLError):
         return "Could not reach the API server (" + type(exc.reason).__name__ + ") - check the base URL and your internet / proxy access."
@@ -6060,6 +6065,13 @@ def ai_call(cfg, api_key, system, user, max_tokens=900):
         url = "https://api.anthropic.com/v1/messages"
         headers = {"content-type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
         body = {"model": cfg["model"], "max_tokens": max_tokens, "system": system, "messages": [{"role": "user", "content": user}]}
+    elif cfg["provider"] == "gemini":
+        import urllib.parse
+        url = "https://generativelanguage.googleapis.com/v1beta/models/" + urllib.parse.quote(cfg["model"], safe="") + ":generateContent"
+        headers = {"content-type": "application/json", "x-goog-api-key": api_key}
+        body = {"systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "generationConfig": {"maxOutputTokens": max(max_tokens, 2048)}}
     else:
         url = cfg["base_url"].rstrip("/") + "/chat/completions"
         headers = {"content-type": "application/json", "authorization": "Bearer " + api_key}
@@ -6070,6 +6082,9 @@ def ai_call(cfg, api_key, system, user, max_tokens=900):
         data = json.loads(resp.read(2_000_000).decode("utf-8", "replace"))
     if cfg["provider"] == "anthropic":
         text = "".join(b.get("text", "") for b in data.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
+    elif cfg["provider"] == "gemini":
+        parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
+        text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
     else:
         text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     text = str(text).strip()
@@ -8489,7 +8504,7 @@ class Manager:
                            "base_url": cfg["base_url"], "mask": cfg["mask"]},
                 "key_saved": bool(cfg.get("api_key_enc")),
                 "providers": [{"key": k, "label": v} for k, v in AI_PROVIDERS.items()],
-                "defaults": {"anthropic_model": AI_DEFAULTS["model"]}}
+                "defaults": {"anthropic_model": AI_DEFAULTS["model"], "gemini_model": GEMINI_DEFAULT_MODEL}}
 
     def update_ai_settings(self, values, who=None):
         if not isinstance(values, dict):
@@ -9271,19 +9286,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ib { background:none; border:0; color:var(--tx); border-radius:8px; width:36px; height:36px; display:grid;
         place-items:center; cursor:pointer; }
   .ib:hover { background:var(--acs); }
-  .mstate { font-size:12px; font-weight:600; padding:5px 13px; border-radius:999px; background:var(--t-a);
-            color:var(--c-a); border:1px solid var(--c-a); white-space:nowrap; }
-  .mdot { width:11px; height:11px; border-radius:50%; background:var(--mu); flex:none; margin-right:-4px; }
-  .mdot.running { background:var(--gr); animation:mon-blink 1.3s ease-in-out infinite; }
-  @keyframes mon-blink { 0% { box-shadow:0 0 0 0 rgba(34,170,90,.65); opacity:1; } 50% { opacity:.45; }
-                         100% { box-shadow:0 0 0 9px rgba(34,170,90,0); opacity:1; } }
-  @media (prefers-reduced-motion:reduce) { .mdot.running { animation:none; } }
   /* status note: floats over the page (no layout space) and fades out by itself */
   .mainmsg { position:fixed; right:18px; bottom:18px; z-index:1200; max-width:min(520px,calc(100vw - 36px));
              margin:0; padding:9px 14px; border-radius:8px; background:var(--pn); border:1px solid var(--bd);
              box-shadow:0 6px 20px rgba(0,0,0,.25); pointer-events:none; }
   .mainmsg:has(#msg:empty) { display:none; } .mainmsg .msg { margin:0; }
-  .mstate.running { background:var(--t-gn); color:var(--gr); border-color:var(--gr); }
 
   /* site badge + dropdown */
   .badge { display:inline-block; padding:6px 14px; border-radius:999px; font-size:13px; font-weight:500;
@@ -9716,7 +9723,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dx-rep[hidden] { display:none; }
   .dx-rep .sp { margin-left:auto; display:flex; gap:6px; }
   @media (max-width: 900px) { .dx-grid { grid-template-columns:1fr; } .dx-pick { border-right:0; border-bottom:1px solid var(--bd); max-height:260px; } }
-  .dg-side { width:300px; }
+  .dg-side { width:266px; }
   .dg-sec { padding:0 14px 14px; }
   .dg-actions { position:sticky; top:0; z-index:3; display:flex; gap:8px; margin:8px -14px 0; padding:8px 14px; background:var(--pn2); border-bottom:1px solid var(--bd); }
   .dg-actions .btn { flex:1; min-width:0; justify-content:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -9875,7 +9882,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .user-pop a[hidden] { display:none; }
   @media (max-width:900px) { .userbtn .uname { display:none; } }
   /* ---- roles: the server enforces them; this only hides what a role cannot use ---- */
-  body.role-viewer #side, body.role-viewer #storage, body.role-viewer #tab-storage, body.role-viewer #diagram, body.role-viewer #tab-diagram, body.role-viewer #diagnosis, body.role-viewer #tab-diagnosis, body.role-viewer #btn-mon,
+  body.role-viewer #side, body.role-viewer #storage, body.role-viewer #tab-storage, body.role-viewer #diagram, body.role-viewer #tab-diagram, body.role-viewer #diagnosis, body.role-viewer #tab-diagnosis, body.role-viewer #troubleshoot, body.role-viewer #tab-troubleshoot, body.role-viewer #btn-mon,
   body.role-viewer #sel-count, body.role-viewer #btn-version, body.role-viewer #btn-delete-devices,
   body.role-viewer .ck, body.role-viewer #note-clear { display:none !important; }
   body.role-viewer #site-badge { pointer-events:none; cursor:default; }
@@ -9936,6 +9943,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .nt-kinds { display:flex; flex-wrap:wrap; gap:6px 18px; margin:6px 0 8px; max-width:720px; }
   .nt-kinds label { display:flex; align-items:center; gap:6px; margin:0; font-size:13px; color:var(--tx); }
   .nt-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:14px; }
+  #nt-root .set-ctl input[type=text], #nt-root .set-ctl input[type=password] { flex:1; min-width:0; width:auto; }
+  #nt-root .set-ctl #nt-port { flex:none; width:80px; }
+  #nt-root .set-ctl .nsel, #nt-root .set-ctl select { flex:1; width:auto; min-width:0; }
+  #nt-root .set-ctl .set-def { padding:5px 10px; }
+  #nt-root .set-def:not(:disabled) { cursor:pointer; }
+  #nt-root .set-label label { cursor:default; }
   .nt-last { color:var(--mu); font-size:12px; margin-top:10px; }
   .nt-last.ok { color:var(--gr); } .nt-last.bad { color:var(--rd); }
   .card.e { cursor:default; }
@@ -9973,6 +9986,58 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tp-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(290px, 1fr)); gap:2px 18px; margin-top:6px; }
   .tp-grid span:nth-child(odd) { color:var(--tx); }
   /* ---- command time test: step list | step detail + console | results ---- */
+  /* Troubleshoot dashboard (same building blocks as Home: widget cards, then cards) */
+  /* static (non-scrolling) page: the grid fills the window, each panel scrolls inside itself */
+  #troubleshoot main { overflow:hidden; }
+  .tr-grid { display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr); gap:12px; flex:1 1 auto; min-height:0; }
+  .tr-right { min-width:0; min-height:0; display:flex; flex-direction:column; gap:12px; }
+  .tr-side .ct-rail { border:0; background:none; padding:0 8px 12px; flex:none; }
+  .tr-top { flex:1 1 55%; min-height:0; overflow:visible; }
+  .tr-tabs { display:flex; gap:4px; align-items:center; }
+  .tr-tab { background:none; border:0; border-bottom:2px solid transparent; color:var(--mu); font:inherit; font-size:14px; font-weight:600; padding:2px 10px 6px; cursor:pointer; }
+  .tr-tab:hover { color:var(--tx); }
+  .tr-tab[aria-selected="true"] { color:var(--ac); border-bottom-color:var(--ac); }
+  .tr-pane[hidden] { display:none; }
+  .tr-pane { flex:1; min-height:0; }
+  .tr-pane-detail { overflow:auto; }
+  .tr-setup { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px 16px; align-items:start; padding:12px 18px 16px; }
+  .tr-fields { display:contents; }
+  .tr-setup .ct-f { min-width:0; }
+  .tr-setup .tr-profile { min-width:0; }
+  .tr-top.is-setup { flex:0 0 auto; }
+  /* every field = one label line (same height) + one 38px control, so rows line up */
+  .tr-setup .ct-f > label { display:flex; align-items:center; gap:6px; height:18px; margin:0 0 5px; }
+  .tr-setup select, .tr-setup .btn, .tr-setup .site-btn { height:38px; box-sizing:border-box; }
+  .tr-setup .btn { white-space:nowrap; padding-top:0; padding-bottom:0; }
+  .tr-f-switch { order:1; } .tr-f-image { order:2; } .tr-setup .tr-profile { order:3; }
+  .tr-f-type { order:4; } .tr-cred-f { order:5; } .tr-f-btn { order:6; }
+  .tr-f-btn .btn { width:auto; justify-self:start; }
+  .tr-prof-row { min-height:38px; }
+  .tr-dev-f { order:7; grid-column:1 / -1; }
+  .tr-dev { display:flex; flex-wrap:wrap; align-items:center; gap:4px 32px; min-height:38px; box-sizing:border-box; font-size:13px; border:1px solid var(--bd); border-radius:8px; padding:6px 14px; background:var(--pn2); }
+  .tr-dev b { font-weight:600; }
+  .tr-dev .ok { color:var(--gr); } .tr-dev .bad { color:var(--rd); } .tr-dev .mu { color:var(--mu); font-weight:400; }
+  .tr-req { color:var(--rd); }
+  .tr-prof-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-height:36px; }
+  .tr-setup-btns { display:flex; flex-wrap:wrap; gap:8px; padding:4px 18px 14px; }
+  #tr-msg { margin:0 18px 8px; }
+  #tr-detail .ct-d { border:0; background:none; padding:12px 18px 16px; }
+  .tr-console { flex:1 1 45%; min-height:150px; overflow:hidden; }
+  .tr-console > #cc-slot { display:flex; flex-direction:column; flex:1; min-height:0; }
+  .tr-console #cc-root { display:flex; flex-direction:column; flex:1; min-height:0; }
+  .tr-console .cc:not(.max) { flex:1; height:auto; min-height:0; max-height:none; resize:none; }
+  /* Results And Profile: minimizable, minimized by default */
+  .tr-res { flex:none; }
+  .tr-res > h4 { align-items:center; }
+  .tr-res-btn { margin-left:auto; width:28px; height:28px; display:inline-grid; place-items:center; border:0; background:none; color:var(--mu); border-radius:8px; cursor:pointer; }
+  .tr-res-btn:hover { background:var(--pn2); color:var(--tx); }
+  .tr-res-btn svg { width:18px; height:18px; transition:transform .15s; }
+  .tr-res.collapsed .tr-res-btn svg { transform:rotate(180deg); }
+  .tr-res.collapsed > h4 { padding-bottom:16px; }
+  .tr-res.collapsed #tr-result { display:none; }
+  #tr-result { padding:6px 18px 18px; max-height:38vh; overflow:auto; }
+  #tr-result .ct-result-g { margin-top:6px; }
+  @media (max-width:1000px) { .tr-setup { grid-template-columns:minmax(0,1fr); } #troubleshoot main { overflow:auto; } .tr-grid { grid-template-columns:minmax(0,1fr); flex:none; } .tr-top, .tr-console { flex:none; } .tr-console .cc:not(.max) { height:300px; } }
   .ct-toggle { display:flex; align-items:center; gap:8px; width:100%; background:none; border:0; color:var(--tx); font:inherit; font-weight:600; font-size:14px; cursor:pointer; padding:0; text-align:left; }
   .ct-toggle .sub { font-weight:400; font-size:12px; color:var(--mu); }
   .ct-toggle .car { margin-left:auto; transition:transform .15s; display:inline-grid; }
@@ -9998,7 +10063,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ct-r-v { font-size:11.5px; font-weight:400; color:var(--mu); font-variant-numeric:tabular-nums; white-space:nowrap; }
   .ct-n { flex:none; width:22px; height:22px; border-radius:50%; background:var(--pn2); border:1px solid var(--bd); display:grid; place-items:center; font-size:11px; font-weight:700; color:var(--mu); }
   .ct-r.done .ct-n { background:var(--gr); border-color:var(--gr); color:#fff; }
+  .ct-r.done.h2 .ct-n { background:var(--am); border-color:var(--am); color:#1b1500; }
+  .ct-r.done.h3 .ct-n { background:#e8731a; border-color:#e8731a; color:#fff; }
   .ct-r.bad .ct-n { background:var(--rd); border-color:var(--rd); color:#fff; }
+  .ct-legend { display:flex; flex-wrap:wrap; gap:4px 12px; padding:2px 14px 12px; font-size:11px; color:var(--mu); }
+  .ct-legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; vertical-align:-1px; }
   .ct-r.run .ct-n { background:var(--ac); border-color:var(--ac); color:#fff; }
   .ct-main { min-width:0; display:flex; flex-direction:column; gap:14px; }
   .ct-d { border:1px solid var(--bd); border-radius:10px; background:var(--pn); padding:14px 16px; }
@@ -10048,28 +10117,28 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* Colour-coded function buttons: green = run / save / add, blue = check / read / refresh, amber = schedule / reset,
      red = delete / cancel / stop. They reuse the theme colours, so light and dark mode both match. */
   .btn.ok, .btn.in, .btn.wn, .btn.dg, #btn-backup, #btn-upgrade, #btn-add-device, #btn-upload-devices, #btn-prof-save,
-  #btn-upload-image, #btn-site-create, #set-save, #nt-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
+  #btn-upload-image, #btn-site-create, #btn-prof-create, #set-save, #nt-save, #ai-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
   [data-ct="saveform"], #ck-save, #btn-prof-assign, #btn-prof-test, #btn-readiness, #btn-version, #dg-run, #st-refresh,
-  #img-refresh, #dg-refresh, [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test, #btn-schedule, #set-reset,
+  #img-refresh, #dg-refresh, [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test, #ai-test, #btn-schedule, #set-reset,
   [data-tp="update"], #btn-delete-devices, #btn-prof-delete, #btn-unschedule, [data-tp="delete"], [data-ct="stop"],
   #ck-add-pre, #ck-add-post { font-weight:600; }
   .btn.ok, #btn-backup, #btn-upgrade, #btn-add-device, #btn-upload-devices, #btn-prof-save, #btn-upload-image,
-  #btn-site-create, #set-save, #nt-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
+  #btn-site-create, #btn-prof-create, #set-save, #nt-save, #ai-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
   [data-ct="saveform"], #ck-save, #ck-add-pre, #ck-add-post { background:var(--t-gn); border-color:var(--gr); color:var(--gr); }
   .btn.in, #btn-prof-assign, #btn-prof-test, #btn-readiness, #btn-version, #dg-run, #st-refresh, #img-refresh, #dg-refresh,
-  [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test { background:var(--acs); border-color:var(--ac); color:var(--ac); }
+  [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test, #ai-test { background:var(--acs); border-color:var(--ac); color:var(--ac); }
   .btn.wn, #btn-schedule, #set-reset, [data-tp="update"] { background:var(--t-a); border-color:var(--am); color:var(--c-a); }
   .btn.dg, #btn-delete-devices, #btn-prof-delete, #btn-unschedule, [data-tp="delete"], [data-ct="stop"] { background:var(--t-r); border-color:var(--rd); color:var(--rd); }
   .btn.ok:hover:not(:disabled), #btn-backup:hover:not(:disabled), #btn-upgrade:hover:not(:disabled), #btn-add-device:hover:not(:disabled),
   #btn-upload-devices:hover:not(:disabled), #btn-prof-save:hover:not(:disabled), #btn-upload-image:hover:not(:disabled),
-  #btn-site-create:hover:not(:disabled), #set-save:hover:not(:disabled), #nt-save:hover:not(:disabled), #rep-go:hover:not(:disabled),
+  #btn-site-create:hover:not(:disabled), #btn-prof-create:hover:not(:disabled), #set-save:hover:not(:disabled), #nt-save:hover:not(:disabled), #ai-save:hover:not(:disabled), #rep-go:hover:not(:disabled),
   [data-tp="create"]:hover:not(:disabled), [data-ct="run"]:hover:not(:disabled), [data-ct="save"]:hover:not(:disabled),
   [data-ct="saveform"]:hover:not(:disabled), #ck-save:hover:not(:disabled), #ck-add-pre:hover:not(:disabled), #ck-add-post:hover:not(:disabled)
     { border-color:var(--gr); box-shadow:0 0 0 3px color-mix(in srgb, var(--gr) 22%, transparent); }
   .btn.in:hover:not(:disabled), #btn-prof-assign:hover:not(:disabled), #btn-prof-test:hover:not(:disabled), #btn-readiness:hover:not(:disabled),
   #btn-version:hover:not(:disabled), #dg-run:hover:not(:disabled), #st-refresh:hover:not(:disabled), #img-refresh:hover:not(:disabled),
   #dg-refresh:hover:not(:disabled), [data-verify]:hover:not(:disabled), [data-tp="apply"]:hover:not(:disabled),
-  #cmp-go, #st-compare:hover:not(:disabled), #nt-test:hover:not(:disabled) { box-shadow:0 0 0 3px color-mix(in srgb, var(--ac) 22%, transparent); }
+  #cmp-go, #st-compare:hover:not(:disabled), #nt-test:hover:not(:disabled), #ai-test:hover:not(:disabled) { box-shadow:0 0 0 3px color-mix(in srgb, var(--ac) 22%, transparent); }
   .btn.wn:hover:not(:disabled), #btn-schedule:hover:not(:disabled), #set-reset:hover:not(:disabled), [data-tp="update"]:hover:not(:disabled)
     { border-color:var(--am); box-shadow:0 0 0 3px color-mix(in srgb, var(--am) 22%, transparent); }
   .btn.dg:hover:not(:disabled), #btn-delete-devices:hover:not(:disabled), #btn-prof-delete:hover:not(:disabled), #btn-unschedule:hover:not(:disabled),
@@ -10199,7 +10268,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .card > h4 .ib.mx { border:0; background:none; border-radius:8px; }
   .userbtn { height:44px; padding:0 14px 0 5px; border-radius:999px; background:var(--glass); border:1px solid var(--bd); }
   .userbtn svg { width:32px; height:32px; padding:6px; border-radius:50%; background:linear-gradient(135deg,#3b8cff,#7c5cff); color:#fff; }
-  .mstate, .badge { border-radius:999px; }
+  .badge { border-radius:999px; }
   .badge { background:var(--glass); }
   .site-pop, .note-pop, .user-pop, .col-pop { border-radius:16px; }
 
@@ -10244,13 +10313,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .modal-card { border-radius:20px; }
 
   /* fit fixes */
-  .badge, #btn-mon, .mstate { white-space:nowrap; }
+  .badge, #btn-mon { white-space:nowrap; }
   .row .btn { padding:6px 8px; }
   .row .btn { padding:6px 4px; min-width:0; font-size:12px; }
   #btn-mon.ok { background:var(--t-gn); border-color:var(--gr); color:var(--gr); box-shadow:none; }
   #btn-mon.ok:hover:not(:disabled) { filter:none; box-shadow:0 0 0 3px color-mix(in srgb, var(--gr) 22%, transparent); }
 
-  /* ================= Modern controls (v-ui): sliding tabs, gear spin, file picker, checkboxes, switches, dropdowns ================= */
+  /* ================= Modern controls (v-ui): sliding tabs, file picker, checkboxes, switches, dropdowns ================= */
   /* sliding tab indicator (only when the script that moves it is running: .tabs.js) */
   .tabs { position:relative; }
   .tab { position:relative; z-index:1; transition:color .25s ease, background .2s ease; }
@@ -10261,13 +10330,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
              background:linear-gradient(180deg,#4a97ff,#1d6bff); box-shadow:var(--glow), inset 0 1px 0 #ffffff55; }
   .tab-ind.show { opacity:1; }
   .tab-ind.ready { transition:transform .5s cubic-bezier(.5,1.35,.4,1), width .5s cubic-bezier(.5,1.35,.4,1), opacity .2s ease; }
-
-  /* settings gear: spins once on every click, turns a little on hover, rests rotated while Settings is open */
-  #btn-settings svg { transition:transform .5s cubic-bezier(.34,1.4,.5,1); transform-origin:50% 50%; }
-  #btn-settings:hover svg { transform:rotate(45deg); }
-  #btn-settings.on svg { transform:rotate(90deg); }
-  #btn-settings.spin svg { animation:gear-spin .8s cubic-bezier(.45,.05,.25,1); }
-  @keyframes gear-spin { from { transform:rotate(0deg); } to { transform:rotate(360deg); } }
 
   /* file picker: dashed drop area with a pill button */
   input[type=file] { width:100%; padding:8px 10px; border:1.5px dashed color-mix(in srgb, var(--mu) 45%, transparent); border-radius:14px;
@@ -10347,8 +10409,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .nsel-opt.sel .nsel-k { opacity:1; }
   .nsel-grp { padding:8px 10px 4px; font-size:11px; font-weight:600; color:var(--mu); text-transform:uppercase; letter-spacing:.04em; }
   @media (prefers-reduced-motion: reduce) {
-    .tab-ind.ready, .nsel-pop, .nsel-c, #btn-settings svg, input[type=checkbox]::after, input[type=radio]::after { transition:none; }
-    #btn-settings.spin svg { animation:none; }
+    .tab-ind.ready, .nsel-pop, .nsel-c, input[type=checkbox]::after, input[type=radio]::after { transition:none; }
   }
 
   /* ================= Date & time picker (schedule) ================= */
@@ -10419,12 +10480,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <button type="button" class="tab on" id="tab-home" role="tab" aria-selected="true" data-view="home"><span data-i="home"></span>Home</button>
     <button type="button" class="tab" id="tab-diagram" role="tab" aria-selected="false" data-view="diagram"><span data-i="diagram"></span>Diagram</button>
     <button type="button" class="tab" id="tab-diagnosis" role="tab" aria-selected="false" data-view="diagnosis"><span data-i="diagnosis"></span>Diagnosis</button>
+    <button type="button" class="tab" id="tab-troubleshoot" role="tab" aria-selected="false" data-view="troubleshoot"><span data-i="troubleshoot"></span>Troubleshoot</button>
     <button type="button" class="tab" id="tab-storage" role="tab" aria-selected="false" data-view="storage"><span data-i="storage"></span>Storage</button>
   </nav>
   <span class="sp"></span>
   <span class="lost" id="lost"></span>
-  <span class="mdot" id="mon-dot" role="img" aria-label="Monitoring status" title="Monitoring status"></span>
-  <span id="state" class="mstate">Monitor starting</span>
   <button class="btn p ok" id="btn-mon" style="padding:7px 14px">Start Monitoring</button>
   <span class="notemenu"><button class="ib" id="btn-bell" title="Notifications - upgrades started and completed" aria-haspopup="true" aria-expanded="false" style="position:relative"><span data-i="bell"></span><span class="nbadge" id="bell-count" hidden>0</span></button><div class="note-pop" id="note-pop" role="dialog" aria-label="Notifications" hidden><div class="nh"><span>Notifications</span><span><button type="button" id="note-sound" title="Play a sound for new alerts (not for logins)">Sound: On</button> <button type="button" id="note-clear">Clear All</button></span></div><div class="nl" id="note-list"></div></div></span>
   <button class="ib" id="btn-settings" title="Settings" aria-label="Settings"><span data-i="gear"></span></button>
@@ -10744,6 +10804,55 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </main>
 </div>
 
+<div class="app" id="troubleshoot" hidden>
+  <aside class="side st-side tr-side" id="tr-side" aria-label="Troubleshoot steps">
+    <div class="sh"><span data-i="troubleshoot"></span><span class="shl">Steps</span></div>
+    <nav class="ct-rail" id="tr-rail" aria-label="Steps"></nav>
+  </aside>
+  <main id="tr-body">
+    <div class="tr-grid">
+      <div class="tr-right">
+        <div class="card tr-top is-setup" id="tr-top">
+          <h4>
+            <div class="tr-tabs" role="tablist" aria-label="Troubleshoot panels">
+              <button type="button" class="tr-tab" id="tr-tab-setup" role="tab" aria-selected="true" data-ct="tab" data-t="setup">Test Setup</button>
+              <button type="button" class="tr-tab" id="tr-tab-detail" role="tab" aria-selected="false" data-ct="tab" data-t="detail">Run &amp; Output</button>
+            </div>
+            <span class="tip" data-tip="Run the steps from top to bottom on a TEST switch: it is a real upgrade done by hand. Pick a step on the left, press Execute, read the output here and in the console, then go on with Next step. The image is needed for the copy, the MD5 check and the add step. Steps marked as changing the switch ask first; Activate RELOADS the switch. Run a step again to get a second sample - the slowest time of each step is the one that counts."></span>
+            <span class="a">
+              <button type="button" class="btn sm" id="tr-expand" data-ct="stages" data-v="1" disabled>Expand All</button>
+              <button type="button" class="btn sm" id="tr-collapse" data-ct="stages" data-v="0" disabled>Collapse All</button>
+              <button type="button" class="btn sm" id="tr-clear" data-ct="clear" disabled>Clear Results</button>
+            </span>
+          </h4>
+          <div class="msg" id="tr-msg" role="status" aria-live="polite"></div>
+          <div class="tr-pane" id="tr-pane-setup" role="tabpanel" aria-labelledby="tr-tab-setup">
+            <div class="tr-setup">
+              <div class="tr-fields" id="tr-fields"></div>
+              <div class="ct-f tr-profile">
+          <label>Command duration profile<span class="tip" data-tip="A profile is a named set of the command timeouts. Pick one here, or create a new one from the timeouts now in use; the results of the test can then be saved into it. To use a profile, choose it in Settings > Command Outputs and press Apply (that is also where a profile is deleted)."></span></label>
+          <div class="tr-prof-row">
+            <span class="sitemenu"><button type="button" id="prof-badge" class="badge accent site-btn" aria-haspopup="true" aria-expanded="false" title="Select or create a command duration profile">Profile: Default</button><div id="prof-pop" class="site-pop" role="menu" hidden></div></span>
+            <span class="tp-state" id="tr-state"></span>
+          </div>
+        </div>
+            </div>
+          </div>
+          <div class="tr-pane tr-pane-detail" id="tr-pane-detail" role="tabpanel" aria-labelledby="tr-tab-detail" hidden><div id="tr-detail"></div></div>
+        </div>
+        <div class="card tr-console"><div id="cc-slot"></div></div>
+      </div>
+    </div>
+
+    <div class="card tr-res collapsed" id="tr-res-card">
+      <h4>Results And Profile
+        <button type="button" class="tr-res-btn" id="tr-res-btn" data-ct="restoggle" aria-expanded="false" aria-controls="tr-result" title="Show or hide Results And Profile" aria-label="Show or hide Results And Profile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+      </h4>
+      <div id="tr-result"></div>
+    </div>
+  </main>
+</div>
+
 <div class="app" id="settings" hidden>
   <aside class="side st-side" aria-label="Settings menu">
     <div class="sh"><span data-i="gear"></span><span class="shl">Settings</span></div>
@@ -10826,6 +10935,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+<div id="prof-modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-labelledby="prof-modal-title">
+    <h2 id="prof-modal-title">Create New Profile</h2>
+    <label for="prof-new">Profile name</label>
+    <input type="text" id="prof-new" placeholder="e.g. Colombo site, Production ..." maxlength="40" autocomplete="off">
+    <label for="prof-note" style="margin-top:8px">Note (optional)</label>
+    <input type="text" id="prof-note" maxlength="300" autocomplete="off">
+    <div class="msg" id="prof-msg" role="status" aria-live="polite" style="margin-top:8px"></div>
+    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:8px;">
+      <button class="btn" id="btn-prof-cancel" type="button">Cancel</button>
+      <button class="btn p" id="btn-prof-create" type="button">Create Profile</button>
+    </div>
+  </div>
+</div>
 <div id="toasts" role="status" aria-live="polite"></div>
 
 <aside id="drawer" class="drawer" role="dialog" aria-label="Switch details" hidden>
@@ -10881,6 +11004,7 @@ const IC = {
   home: I('<path d="M3 11 12 3l9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>'),
   diagram: I('<rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-4h12v4"/>'),
   diagnosis: I('<path d="M3 12h4l2-6 4 12 2-6h6"/>'),
+  troubleshoot: I('<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/>'),
   storage: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   folder: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   file: I('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>'),
@@ -11343,24 +11467,24 @@ function ntRender() {
   if (!NT.data) { root.innerHTML = '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" style="margin-top:14px">' + esc(NT.msg ? NT.msg.text : "Loading ...") + "</div>"; return; }
   const d = NT.draft, dis = SET_CAN_EDIT ? "" : " disabled";
   const secOpts = NT.data.security_options.map(o => '<option value="' + esc(o.key) + '"' + (o.key === d.security ? " selected" : "") + ">" + esc(o.label) + "</option>").join("");
-  const kinds = NT.data.kinds.map(k => '<label><input type="checkbox" data-nt-kind="' + esc(k.key) + '" data-nt-dep' + (d.kinds.includes(k.key) ? " checked" : "") + ">" + esc(k.label) + "</label>").join("");
   const last = NT.data.last && NT.data.last.time ? '<div class="nt-last ' + (NT.data.last.ok ? "ok" : "bad") + '">Last e-mail ' + esc(NT.data.last.time) + ": " + esc(NT.data.last.detail || "") + "</div>" : "";
+  const row = (label, help, ctl, id) => '<div class="set-row"><div class="set-info"><div class="set-label">' + (id ? '<label for="' + id + '" style="margin:0;font:inherit">' + label + "</label>" : label) + "</div>" +
+    (help ? '<div class="set-help">' + help + "</div>" : "") + '</div><div class="set-ctl">' + ctl + "</div></div>";
+  const sw = (id, on, txt, extra) => '<label class="chk set-chk"><input type="checkbox"' + (id ? ' id="' + id + '"' : "") + (extra || "") + (on ? " checked" : "") + "><span>" + txt + "</span></label>";
+  const kinds = NT.data.kinds.map(k => row(esc(k.label), "", sw("", d.kinds.includes(k.key), d.kinds.includes(k.key) ? "On" : "Off", ' data-nt-kind="' + esc(k.key) + '" data-nt-dep'))).join("");
   root.innerHTML =
-    '<div class="nt-form">' +
-    '<label for="nt-enabled">Send e-mail notifications</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="nt-enabled"' + (d.enabled ? " checked" : "") + dis + "><span>" + (d.enabled ? "On" : "Off") + "</span></label>" +
-    '<label for="nt-host">SMTP server</label><input type="text" id="nt-host" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.host) + '">' +
-    '<label for="nt-port">Port / security</label><div class="nt-inline"><input type="text" id="nt-port" data-nt-dep inputmode="numeric" maxlength="5" value="' + esc(String(d.port)) + '"><select id="nt-sec" data-nt-dep>' + secOpts + "</select></div>" +
-    '<label for="nt-user">Gmail address</label><input type="text" id="nt-user" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.username) + '">' +
-    '<label for="nt-pw">App password</label><input type="password" id="nt-pw" data-nt-dep autocomplete="new-password" maxlength="200" value="' + esc(NT.pw) + '">' +
-    '<div class="nt-hint">' + (NT.data.password_saved ? "Password saved - leave empty to keep it. " : "") + "</div>" +
-    '<label for="nt-to">Send to</label><input type="text" id="nt-to" data-nt-dep autocomplete="off" spellcheck="false" maxlength="2000" value="' + esc(d.to) + '">' +
-    '<div class="nt-hint">Several recipients: separate them with commas.</div></div>' +
-    '<div class="set-sec">E-mail me about</div><div class="nt-kinds">' + kinds + "</div>" +
-    '<div class="nt-actions"><button type="button" class="btn sm" data-nt-q="all" data-nt-dep>Select All</button>' +
-    '<button type="button" class="btn sm" data-nt-q="problems" data-nt-dep>Problems Only</button>' +
-    '<button type="button" class="btn sm" data-nt-q="none" data-nt-dep>Clear</button></div>' +
-    '<div class="nt-actions"><button type="button" class="btn sm" id="nt-test" data-nt-dep>Send Test E-Mail</button>' +
-    '<button type="button" class="btn p sm" id="nt-save"' + dis + ">Save Notification Settings</button></div>" +
+    '<div class="set-sec">E-mail delivery</div>' +
+    row("Send e-mail notifications", "Copies of the notifications shown under the bell icon.", sw("nt-enabled", d.enabled, d.enabled ? "On" : "Off", dis)) +
+    row("SMTP server", "Mail server that sends the e-mails.", '<input type="text" id="nt-host" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.host) + '">', "nt-host") +
+    row("Port / security", "Gmail: 587 with STARTTLS, or 465 with SSL.", '<input type="text" id="nt-port" data-nt-dep inputmode="numeric" maxlength="5" value="' + esc(String(d.port)) + '"><select id="nt-sec" data-nt-dep>' + secOpts + "</select>", "nt-port") +
+    row("Gmail address", "The account the e-mails are sent from.", '<input type="text" id="nt-user" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.username) + '">', "nt-user") +
+    row("App password", NT.data.password_saved ? "Password saved - leave empty to keep it." : "Use a Gmail app password, not your normal password.", '<input type="password" id="nt-pw" data-nt-dep autocomplete="new-password" maxlength="200" value="' + esc(NT.pw) + '">', "nt-pw") +
+    row("Send to", "Several recipients: separate them with commas.", '<input type="text" id="nt-to" data-nt-dep autocomplete="off" spellcheck="false" maxlength="2000" value="' + esc(d.to) + '">', "nt-to") +
+    '<div class="set-sec">E-mail me about</div>' +
+    row("Quick select", "Choose the notification types in one click.", '<button type="button" class="set-def" data-nt-q="all" data-nt-dep>Select All</button><button type="button" class="set-def" data-nt-q="problems" data-nt-dep>Problems Only</button><button type="button" class="set-def" data-nt-q="none" data-nt-dep>Clear</button>') +
+    kinds +
+    '<div class="set-sec">Test and save</div>' +
+    row("E-mail settings", "Send a test e-mail first, then save.", '<button type="button" class="btn sm" id="nt-test" data-nt-dep>Send Test E-Mail</button><button type="button" class="btn p sm" id="nt-save"' + dis + ">Save Notification Settings</button>") +
     '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" id="nt-msg" role="status" aria-live="polite" style="margin:10px 0 0">' + esc(NT.msg ? NT.msg.text : "") + "</div>" + last;
   ntEnabledState();
 }
@@ -11397,7 +11521,7 @@ document.addEventListener("click", async e => {
 document.addEventListener("change", e => {
   const root = $("nt-root"); if (!root || !root.contains(e.target) || !SET_CAN_EDIT || !NT.data) return;
   if (e.target.id === "nt-enabled") { ntCollect(); NT.draft.enabled = e.target.checked; e.target.parentNode.querySelector("span").textContent = e.target.checked ? "On" : "Off"; ntEnabledState(); }
-  else if (e.target.dataset.ntKind) { const k = e.target.dataset.ntKind, set = new Set(NT.draft.kinds); e.target.checked ? set.add(k) : set.delete(k); NT.draft.kinds = NT.data.kinds.map(x => x.key).filter(x => set.has(x)); }
+  else if (e.target.dataset.ntKind) { const lb = e.target.parentNode.querySelector("span"); if (lb) lb.textContent = e.target.checked ? "On" : "Off"; const k = e.target.dataset.ntKind, set = new Set(NT.draft.kinds); e.target.checked ? set.add(k) : set.delete(k); NT.draft.kinds = NT.data.kinds.map(x => x.key).filter(x => set.has(x)); }
   else if (e.target.id === "nt-sec") {
     ntCollect();
     if (["", "587", "465"].includes(String(NT.draft.port))) NT.draft.port = e.target.value === "ssl" ? "465" : "587";
@@ -11415,8 +11539,6 @@ function render(d) {
   for (const h of [...selected]) if (!d.hosts.some(x => x.host === h)) selected.delete(h);
 
   const m = d.monitor;
-  const st = $("state"); st.textContent = "Monitor " + m.state; st.className = "mstate " + m.state;
-  const md = $("mon-dot"); md.className = "mdot " + m.state;
   $("meta").textContent = "Check: " + m.mode + " every " + m.interval + "s" + (m.started_at ? "  |  started " + m.started_at : "");
   $("btn-mon").textContent = m.state === "running" ? "Stop Monitoring" : "Start Monitoring";
   $("btn-mon").className = "btn " + (m.state === "running" ? "dg" : "p ok");
@@ -11449,10 +11571,6 @@ function render(d) {
       : "Monitoring is " + m.state;
   }
   $("p-cycles").textContent = m.cycles + " check cycles";
-  { // static text only (no timers or counters): a title that changes every poll makes the browser tooltip flicker
-    const tip = "Monitoring is " + m.state + " - Check: " + m.mode + " every " + m.interval + "s";
-    const md2 = $("mon-dot");
-    if (md2.title !== tip) { md2.title = tip; md2.setAttribute("aria-label", tip); $("state").title = tip; } }
 
   fillProfileLists(d);
   syncNotes(d);
@@ -12271,6 +12389,7 @@ async function refresh() {
   try {
     const r = await fetch("/api/status", {cache: "no-store"});
     render(await r.json());
+    try { ctDeviceSync(); } catch (e) {}
     $("lost").textContent = "";
   } catch (e) { $("lost").textContent = "Lost connection to the script"; }
   refreshImages();
@@ -12453,16 +12572,17 @@ function stSay(kind, text) { const m = $("st-msg"); m.className = "msg " + kind;
 
 function showView(view, push) {
   if (view === "settings" && ME.role === "viewer") view = "home";
-  if ((view === "diagram" || view === "diagnosis") && ME.role === "viewer") view = "home";
-  if (view !== "storage" && view !== "settings" && view !== "diagram" && view !== "diagnosis") view = "home";
-  const storage = view === "storage", settings = view === "settings", diagram = view === "diagram", diagnosis = view === "diagnosis";
-  if (storage || settings || diagram || diagnosis) { try { closeDrawer(); } catch (e) {} }
-  $("dashboard").hidden = storage || settings || diagram || diagnosis;
+  if ((view === "diagram" || view === "diagnosis" || view === "troubleshoot") && ME.role === "viewer") view = "home";
+  if (view !== "storage" && view !== "settings" && view !== "diagram" && view !== "diagnosis" && view !== "troubleshoot") view = "home";
+  const storage = view === "storage", settings = view === "settings", diagram = view === "diagram", diagnosis = view === "diagnosis", trouble = view === "troubleshoot";
+  if (storage || settings || diagram || diagnosis || trouble) { try { closeDrawer(); } catch (e) {} }
+  $("dashboard").hidden = storage || settings || diagram || diagnosis || trouble;
   $("storage").hidden = !storage;
   $("diagram").hidden = !diagram;
   $("diagnosis").hidden = !diagnosis;
+  $("troubleshoot").hidden = !trouble;
   $("settings").hidden = !settings;
-  for (const [id, on] of [["tab-home", view === "home"], ["tab-diagram", diagram], ["tab-diagnosis", diagnosis], ["tab-storage", storage]]) {
+  for (const [id, on] of [["tab-home", view === "home"], ["tab-diagram", diagram], ["tab-diagnosis", diagnosis], ["tab-troubleshoot", trouble], ["tab-storage", storage]]) {
     $(id).classList.toggle("on", on);
     $(id).setAttribute("aria-selected", String(on));
   }
@@ -12472,6 +12592,7 @@ function showView(view, push) {
   if (settings) openSettings();
   if (diagram) openDiagram(); else dgStop();
   if (diagnosis) openDiagnosis(); else dxStop();
+  if (trouble) openTroubleshoot();
 }
 document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => showView(b.dataset.view)));
 
@@ -12877,7 +12998,7 @@ const SET = {data: null, draft: {}, tab: "rollout"};
 const SET_CAN_EDIT = ME.role !== "operator" && ME.role !== "viewer";
 if (ME.role === "viewer") $("btn-settings").hidden = true;
 $("btn-settings").addEventListener("click", () => showView($("settings").hidden ? "settings" : "home"));
-function setSay(kind, text) { const m = $("set-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
+function setSay(kind, text) { const m = $("troubleshoot").hidden ? $("set-msg") : $("tr-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
 const setUnit = (item, v) => item.type === "bool" ? (v ? "On" : "Off") : v + " " + item.unit;
 function setMinutes(item, v) {
   if (item.unit !== "s" || !(v >= 120)) return "";
@@ -12922,7 +13043,7 @@ function renderSettings() {
   $("set-title").textContent = g.title;
   $("set-note").hidden = SET_CAN_EDIT;
   let html = '<div class="set-intro">' + esc(g.intro) + "</div>" +
-    (g.id === "timeouts" ? '<div id="tp-root"></div><div id="ct-root"></div>' : "") +
+    (g.id === "timeouts" ? '<div id="tp-root"></div>' : "") +
     (g.id === "notifications" ? '<div id="nt-root"></div>' : "") +
     (g.id === "ai" ? '<div id="ai-root"></div>' : "") +
     (g.id === "about" ? '<div id="ab-root"></div>' : ""), sec = null;
@@ -12932,7 +13053,7 @@ function renderSettings() {
     html += setRow(item);
   }
   $("set-body").innerHTML = html;
-  if (g.id === "timeouts") { tpRender(); ctRender(); }
+  if (g.id === "timeouts") tpRender();
   if (g.id === "notifications") { ntRender(); if (!NT.data && !NT.loading) { NT.loading = true; ntLoad().finally(() => { NT.loading = false; }); } }
   if (g.id === "ai") { aiRender(); if (!AIS.data && !AIS.loading) aiLoad(); }
   if (g.id === "about") aboutRender();
@@ -13002,14 +13123,26 @@ $("set-save").addEventListener("click", async () => {
   } catch (e) { setSay("err", e.message); }
 });
 
+async function openTroubleshoot() {
+  setSay("", "");
+  try {
+    const r = await fetch("/api/settings", {cache: "no-store"});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Could not load the settings.");
+    SET.data = d; SET.draft = {...d.values};
+    tpRender(); ctRender();
+    tpLoad();
+  } catch (e) { setSay("err", e.message); }
+}
+
 // ============================================================================================
-// Command duration profiles + Command time test (Settings > Command Outputs).
+// Command duration profiles (Settings > Command Outputs picks and applies them) + Command time test (Troubleshoot tab).
 //  - Profiles: named sets of the command timeouts. "Default" is built in. Apply copies a profile into the settings.
 //  - Command time test: run the preset commands on one switch with the Execute buttons, see each result and note
 //    the time it took. The numbers can become a report (CSV / printable page) or a new profile.
 // ============================================================================================
 const TP = {data: null, sel: "Default", form: false};
-const CT = {open: false, host: null, image: "", results: {}, outs: {}, running: null, margin: 3, keepDefault: true, form: false, sel: null, railClosed: {}, path: "three"};
+const CT = {tab: "setup", open: true, host: null, image: "", results: {}, outs: {}, running: null, margin: 3, keepDefault: true, form: false, sel: null, railClosed: {}, path: "", picks: {}, credBusy: false, sig: ""};
 try {
   const saved = JSON.parse(localStorage.getItem("ct") || "null");
   if (saved && typeof saved === "object") {
@@ -13017,9 +13150,19 @@ try {
     CT.host = saved.host || null;
     CT.image = saved.image || "";
     if (saved.margin >= 1 && saved.margin <= 20) CT.margin = saved.margin;
+    if (saved.path === "one" || saved.path === "three") CT.path = saved.path;
+    if (typeof saved.sel === "string") CT.sel = saved.sel;
+    if (saved.tab === "detail") CT.tab = "detail";
+    if (saved.outs && typeof saved.outs === "object") CT.outs = saved.outs;
+    if (saved.picks && typeof saved.picks === "object") CT.picks = saved.picks;
   }
 } catch (e) {}
-function ctPersist() { try { localStorage.setItem("ct", JSON.stringify({results: CT.results, host: CT.host, image: CT.image, margin: CT.margin})); } catch (e) {} }
+function ctOn(type, fn) { for (const el of [$("set-body"), $("tr-body"), $("tr-side")]) el.addEventListener(type, fn); }
+function ctPersist() {      // everything the test has measured survives a page refresh (results, outputs, choices)
+  const base = {results: CT.results, host: CT.host, image: CT.image, margin: CT.margin, path: CT.path, sel: CT.sel, tab: CT.tab, picks: CT.picks};
+  try { localStorage.setItem("ct", JSON.stringify({...base, outs: CT.outs})); return; } catch (e) {}
+  try { localStorage.setItem("ct", JSON.stringify(base)); } catch (e) {}      // outputs too big for the browser storage: keep the times at least
+}
 const tmoItems = () => SET.data ? SET.data.items.filter(i => i.group === "timeouts") : [];
 const fmtS = n => typeof n === "number" ? n.toFixed(2) : "";
 function tipsIn(id) { const r = $(id); if (r) r.querySelectorAll(".tip").forEach(tipInit); }
@@ -13036,14 +13179,15 @@ async function tpLoad() {
 }
 function tpDraftValues() {
   const out = {};
-  for (const i of tmoItems()) {
-    const v = SET.draft[i.key];
+  for (const i of tmoItems()) {                  // the timeouts in use (saved in Settings)
+    const v = SET.data.values[i.key];
     if (!Number.isInteger(v) || v < i.min || v > i.max) throw new Error(i.label + " must be a whole number from " + i.min + " to " + i.max + ".");
     out[i.key] = v;
   }
   return out;
 }
-function tpRender() {
+function tpRender() { tpRenderSettings(); trProfRender(); }
+function tpRenderSettings() {
   const root = $("tp-root"); if (!root || !SET.data) return;
   if (!TP.data) { root.innerHTML = '<div class="tp-bar tp-state">Loading the profiles ...</div>'; return; }
   const list = TP.data.profiles, active = TP.data.active;
@@ -13059,26 +13203,71 @@ function tpRender() {
        cur.source === "command test" ? "built from a command time test" + (cur.switch ? " on " + cur.switch : "") : "typed in by hand"]
       .filter(Boolean).join(" | ");
   const grid = tmoItems().map(i => "<span>" + esc(i.label) + "</span><span>" + cur.values[i.key] + " s</span>").join("");
+  const tip = "A profile is a named set of the command timeouts below. Apply puts its values into the settings and saves them. Delete removes a saved profile (the timeouts now in use do not change). Profiles are created in the Troubleshoot tab, for example from a Command time test measured on a real switch.";
   root.innerHTML = '<div class="tp-bar">' +
-    '<div class="tp-row"><label for="tp-sel">Command duration profile<span class="tip" data-tip="A profile is a named set of the command timeouts below. Apply puts its values into the settings and saves them. Create profiles from the values on this page, or from a Command time test measured on a real switch (for example one profile per site)."></span></label>' +
+    '<div class="tp-row"><label for="tp-sel">Command duration profile<span class="tip" data-tip="' + esc(tip) + '"></span></label>' +
     '<select id="tp-sel">' + opts + "</select>" +
     '<button type="button" class="btn p sm" data-tp="apply"' + (SET_CAN_EDIT && cur.name !== active ? "" : " disabled") + ' title="Use the values of this profile now">Apply</button>' +
-    '<button type="button" class="btn sm" data-tp="new"' + dis + ' title="Save the values shown below as a new profile">New From Page Values...</button>' +
-    '<button type="button" class="btn sm" data-tp="update"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ' title="Replace the values of this profile with the values shown below">Update From Page Values</button>' +
-    '<button type="button" class="btn sm" data-tp="delete"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ">Delete</button>" +
+    '<button type="button" class="btn sm" data-tp="delete"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ' title="Delete this profile">Delete</button>' +
     '<span class="tp-state">' + state + "</span></div>" +
-    (TP.form ? '<div class="tp-row"><input type="text" id="tp-name" maxlength="40" placeholder="Profile name, e.g. Colombo site" aria-label="New profile name">' +
-      '<input type="text" id="tp-note" maxlength="300" placeholder="Note (optional)" aria-label="Note" style="min-width:260px">' +
-      '<button type="button" class="btn p sm" data-tp="create">Save Profile</button><button type="button" class="btn sm" data-tp="cancel">Cancel</button></div>' : "") +
     '<div class="tp-info">' + esc(meta) + "</div>" +
     '<details class="tp-vals"><summary>Values in this profile</summary><div class="tp-grid">' + grid + "</div></details></div>";
   tipsIn("tp-root");
 }
+// Troubleshoot tab: profile selection and creation, the same way as the site menu in the header
+function trProfRender() {
+  const pop = $("prof-pop"), badge = $("prof-badge"); if (!pop) return;
+  tipsIn("troubleshoot");
+  if (!TP.data) { badge.textContent = "Profile: loading ..."; pop.innerHTML = ""; return; }
+  const list = TP.data.profiles, active = TP.data.active;
+  if (!list.some(p => p.name === TP.sel)) TP.sel = active || "Default";
+  badge.textContent = "Profile: " + TP.sel;
+  $("tr-state").innerHTML = active ? "In use: <b>" + esc(active) + "</b>" : "In use: <b>Custom values</b>";
+  pop.innerHTML = "";
+  for (const p of list) {
+    const b = document.createElement("button");
+    b.type = "button"; b.setAttribute("role", "menuitem");
+    b.className = p.name === TP.sel ? "cur" : "";
+    b.textContent = (p.name === TP.sel ? "\u2713 " : "") + p.name + (p.builtin ? " (built-in)" : "");
+    b.title = p.name;
+    b.addEventListener("click", () => { trCloseProf(); TP.sel = p.name; tpRender(); ctRender(); });
+    pop.appendChild(b);
+  }
+  pop.appendChild(document.createElement("hr"));
+  const add = document.createElement("button");
+  add.type = "button"; add.className = "newsite"; add.setAttribute("role", "menuitem"); add.disabled = !SET_CAN_EDIT;
+  add.textContent = "+ Create New Profile\u2026";
+  add.addEventListener("click", () => { trCloseProf(); trOpenProfModal(); });
+  pop.appendChild(add);
+}
+function trCloseProf() { $("prof-pop").hidden = true; $("prof-badge").setAttribute("aria-expanded", "false"); }
+function profSay(kind, text) { const m = $("prof-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
+function trOpenProfModal() { $("prof-new").value = ""; $("prof-note").value = ""; profSay("", ""); $("prof-modal").hidden = false; $("prof-new").focus(); }
+function trCloseProfModal() { $("prof-modal").hidden = true; }
+$("prof-badge").addEventListener("click", e => {
+  e.stopPropagation();
+  const open = $("prof-pop").hidden;
+  $("prof-pop").hidden = !open; $("prof-badge").setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("click", e => { if (!e.target.closest("#troubleshoot .sitemenu")) trCloseProf(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { trCloseProf(); trCloseProfModal(); } });
+$("btn-prof-cancel").addEventListener("click", trCloseProfModal);
+$("prof-modal").addEventListener("click", e => { if (e.target === $("prof-modal")) trCloseProfModal(); });
+$("prof-new").addEventListener("keydown", e => { if (e.key === "Enter") $("btn-prof-create").click(); });
+$("btn-prof-create").addEventListener("click", async () => {
+  const name = $("prof-new").value.trim(), note = $("prof-note").value.trim();
+  if (!name) { profSay("err", "Enter a name for the new profile."); return; }
+  if (!TP.data || TP.data.profiles.some(p => p.name.toLowerCase() === name.toLowerCase())) { profSay("err", "A profile with this name already exists."); return; }
+  $("btn-prof-create").disabled = true;
+  try {
+    const r = await post("/api/timeout-profiles/save", {name, values: tpDraftValues(), note, source: "manual", site: siteName || "", overwrite: false});
+    TP.data = r; TP.sel = r.saved; tpRender(); ctRender(); trCloseProfModal(); setSay("ok", r.message);
+  } catch (e) { profSay("err", e.message); }
+  finally { $("btn-prof-create").disabled = false; }
+});
 async function tpAction(act) {
   try {
     if (!TP.data) return;
-    if (act === "new") { TP.form = true; tpRender(); const n = $("tp-name"); if (n) n.focus(); return; }
-    if (act === "cancel") { TP.form = false; tpRender(); return; }
     if (act === "apply") {
       if (setDirtyKeys().length && !confirm("There are unsaved changes on this page. Applying the profile replaces the timeout values and saves them. Continue?")) return;
       const r = await post("/api/timeout-profiles/apply", {name: TP.sel});
@@ -13089,21 +13278,6 @@ async function tpAction(act) {
       if (!confirm("Delete the profile '" + TP.sel + "'? The timeouts now in use do not change.")) return;
       const r = await post("/api/timeout-profiles/delete", {name: TP.sel});
       TP.data = r; TP.sel = "Default"; tpRender(); setSay("ok", r.message); return;
-    }
-    if (act === "update" || act === "create") {
-      const values = tpDraftValues();
-      let name = TP.sel, note = "", overwrite = true;
-      if (act === "create") {
-        name = ($("tp-name").value || "").trim(); note = ($("tp-note").value || "").trim();
-        const ex = TP.data.profiles.find(p => p.name.toLowerCase() === name.toLowerCase());
-        overwrite = !!ex;
-        if (ex && !ex.builtin && !confirm("A profile named '" + ex.name + "' already exists. Replace its values?")) return;
-      } else {
-        if (!confirm("Replace the values of '" + name + "' with the values shown on this page?")) return;
-        note = (TP.data.profiles.find(p => p.name === name) || {}).note || "";
-      }
-      const r = await post("/api/timeout-profiles/save", {name, values, note, source: "manual", site: siteName || "", overwrite});
-      TP.data = r; TP.sel = r.saved; TP.form = false; tpRender(); setSay("ok", r.message);
     }
   } catch (e) { setSay("err", e.message); }
 }
@@ -13198,9 +13372,68 @@ function ctSelected(presets) {            // the step shown on the right: your c
 }
 const CT_PATH_GROUP = {"3. Install - Activate/Distribute": "three", "3. Install - Full Upgrade": "one"};
 function ctPathOff(g) { return !!CT_PATH_GROUP[g] && CT_PATH_GROUP[g] !== CT.path; }   // the install path you did not choose
+const CT_PATHS = [["three", "Install - Activate/Distribute"], ["one", "Install - Full Upgrade"]];
+function ctPresets() { return (TP.data && CT.path) ? TP.data.presets.filter(p => !ctPathOff(p.group)) : []; }   // only the steps of the chosen test type
+function ctGateOk() { const h = ctHostInfo(); return !!(h && h.profile && h.creds && h.creds.state === "ok"); }   // a credential profile is attached and its login works
+function ctDevHtml(h) {
+  if (!h) return '<span class="mu">No switch selected.</span>';
+  const c = h.creds || {state: "idle"}, mode = h.boot && h.boot.mode;
+  const login = !h.profile ? '<span class="bad">No credential profile attached</span>'
+    : c.state === "ok" ? '<span class="ok">Login OK</span>' : c.state === "testing" ? '<span class="mu">Testing ...</span>'
+    : c.state === "failed" ? '<span class="bad" title="' + esc(c.detail || "") + '">Login failed</span>' : '<span class="mu">Not tested yet</span>';
+  return "<span>Login: <b>" + login + "</b></span><span>Version: <b>" + esc(h.version || "-") + "</b>" + (h.model ? ' <span class="mu">(' + esc(h.model) + ")</span>" : "") +
+    "</span><span>Boot mode: <b>" + esc(mode || "-") + "</b></span>";
+}
+function ctFieldsHtml(hosts, images, busy) {
+  const h = ctHostInfo(), profs = (last && last.profiles) || [], dis = busy ? " disabled" : "";
+  const cur = (CT.picks[CT.host] && profs.some(x => x.name === CT.picks[CT.host])) ? CT.picks[CT.host] : ((h && h.profile) || "");
+  return '<div class="ct-f tr-f-switch"><label for="ct-host">Switch</label><select id="ct-host"' + dis + ">" + hosts.map(x => '<option value="' + esc(x.host) + '"' + (x.host === CT.host ? " selected" : "") + ">" +
+      esc(x.host + (x.label ? " - " + x.label : "") + (x.platform ? " (" + x.platform + ")" : "")) + "</option>").join("") + "</select></div>" +
+    '<div class="ct-f tr-f-image"><label for="ct-image">Image</label><select id="ct-image"' + dis + '><option value="">- choose the image to test with -</option>' +
+      images.map(n => '<option value="' + esc(n) + '"' + (n === CT.image ? " selected" : "") + ">" + esc(n) + "</option>").join("") + "</select></div>" +
+    '<div class="ct-f tr-f-type"><label for="ct-path">Test type<span class="tr-req"> *</span></label><select id="ct-path"' + dis + '><option value="">- choose what to test -</option>' +
+      CT_PATHS.map(x => '<option value="' + x[0] + '"' + (x[0] === CT.path ? " selected" : "") + ">" + esc(x[1]) + "</option>").join("") + "</select></div>" +
+    '<div class="ct-f tr-cred-f"><label for="ct-cred">Credential profile<span class="tr-req"> *</span></label><select id="ct-cred"' + dis + ">" +
+      '<option value="">- choose a profile -</option>' + profs.map(x => '<option value="' + esc(x.name) + '"' + (x.name === cur ? " selected" : "") + ">" + esc(x.name + " (" + x.username + ", " + (x.protocol === "telnet" ? "Telnet" : "SSH") + ")") + "</option>").join("") + "</select></div>" +
+    '<div class="ct-f tr-f-btn"><label>&nbsp;</label><button type="button" class="btn p" id="ct-cred-test" data-ct="credtest"' + ((busy || CT.credBusy || !profs.length) ? " disabled" : "") + ">" + (CT.credBusy ? "Testing ..." : "Test Credentials") + "</button></div>" +
+    '<div class="ct-f tr-dev-f"><label>Switch details (read automatically)</label><div class="tr-dev" id="ct-dev">' + ctDevHtml(h) + "</div></div>";
+}
+async function ctCredTest() {
+  const h = ctHostInfo(), sel = $("ct-cred"), name = sel ? sel.value : "";
+  if (!h || CT.credBusy || CT.running) return;
+  if (!name) { setSay("err", "Choose a credential profile first."); return; }
+  CT.credBusy = true; ctRender(); setSay("", "");
+  try {
+    if (h.profile !== name) await post("/api/profile/assign", {hosts: [CT.host], profile: name});
+    await post("/api/test-credentials", {hosts: [CT.host]});
+    let row = null;
+    for (let i = 0; i < 60; i++) {
+      await sleep(1500); await refresh();
+      const r = ctHostInfo(); if (r && r.creds && r.creds.state !== "testing") { row = r; break; }
+    }
+    if (!row || row.creds.state !== "ok") { setSay("err", "Login failed: " + ((row && row.creds && row.creds.detail) || "no answer from the switch") + "."); return; }
+    setSay("ok", "Login OK. Reading the version and boot mode ...");
+    const before = row.version_note || "";
+    await post("/api/version", {hosts: [CT.host]});
+    for (let i = 0; i < 25; i++) {
+      await sleep(2000); await refresh();
+      const r = ctHostInfo(); if (r && (r.version_note || "") !== before) { row = r; break; }
+    }
+    row = ctHostInfo() || row;
+    setSay("ok", "Ready: " + (row.version ? "version " + row.version : "version not read") + ((row.boot && row.boot.mode) ? ", " + row.boot.mode + " boot mode" : "") + ".");
+  } catch (e) { setSay("err", e.message); }
+  CT.credBusy = false; ctRender();
+}
+function ctDeviceSync() {           // keep the switch details and the Execute gate in step with the status poll (no re-render while a list is open)
+  if ($("troubleshoot").hidden) return;
+  const h = ctHostInfo(), box = $("ct-dev"); if (box) box.innerHTML = ctDevHtml(h);
+  const sig = [CT.host, h && h.profile, h && h.creds && h.creds.state, ctGateOk(), (last && last.profiles || []).map(x => x.name).join(",")].join("|");
+  if (sig !== CT.sig) { CT.sig = sig; const a = document.activeElement; if (!(a && a.tagName === "SELECT" && $("troubleshoot").contains(a))) ctRender(); }
+}
 function ctRailHtml(presets) {
   const busy = !!CT.running && CT.running.host === CT.host;
-  let html = "", num = 0;
+  let html = "", num = 0, top = 0;
+  for (const q of presets) { const m = ctStats(ctRuns(CT.host, q.id)).max; if (typeof m === "number" && m > top) top = m; }   // slowest measured step: the 100% mark for the colours
   for (const g of [...new Set(presets.map(p => p.group))]) {
     const steps = presets.filter(p => p.group === g), open = !CT.railClosed[g], done = steps.filter(ctStepDone).length;
     const off = ctPathOff(g);
@@ -13210,21 +13443,22 @@ function ctRailHtml(presets) {
       num++;
       if (!open) continue;
       const st = ctStats(ctRuns(CT.host, p.id)), running = busy && CT.running.id === p.id;
-      const cls = (off ? " off" : "") + (p.id === CT.sel ? " sel" : "") + (running ? " run" : st.last ? (ctStepDone(p) ? " done" : " bad") : "");
-      html += '<button type="button" class="ct-r' + cls + '" data-ct="sel" data-id="' + esc(p.id) + '" title="' + esc(p.title) + '"><span class="ct-n">' + (ctStepDone(p) && !running ? "&#10003;" : num) + '</span>' +
+      const cls = (off ? " off" : "") + (p.id === CT.sel ? " sel" : "") + (running ? " run" : st.last ? (ctStepDone(p) ? " done" + ((st.max != null && top > 0) ? (st.max / top < 0.25 ? " h1" : st.max / top < 0.6 ? " h2" : " h3") : "") : " bad") : "");
+      html += '<button type="button" class="ct-r' + cls + '" data-ct="sel" data-id="' + esc(p.id) + '" title="' + esc(p.title) + '"><span class="ct-n">' + num + '</span>' +
         '<span class="ct-r-t">' + esc(p.title) + '</span><span class="ct-r-v">' + (running ? Math.round(CT.running.elapsed) + " s" : st.max != null ? fmtS(st.max) + " s" : "") + "</span></button>";
     }
     html += "</div>";
   }
-  return html;
+  return html + '<div class="ct-legend"><span><i style="background:var(--gr)"></i>Fast</span><span><i style="background:var(--am)"></i>Medium</span><span><i style="background:#e8731a"></i>Slow</span><span><i style="background:var(--rd)"></i>Failed</span></div>';
 }
 function ctDetailHtml(p, num, total) {
   const host = CT.host, runs = ctRuns(host, p.id), st = ctStats(runs), key = host + "|" + p.id, busy = !!CT.running;
   const running = busy && CT.running.host === host && CT.running.id === p.id;
   const badges = (p.warn ? (p.kind === "activate" ? '<span class="ct-badge d">reloads the switch</span>' : '<span class="ct-badge">changes the switch</span>') : "") +
-    (p.needs_image && !CT.image ? '<span class="ct-badge n">choose an image above</span>' : "");
+    (p.needs_image && !CT.image ? '<span class="ct-badge n">choose an image in Test Setup</span>' : "") +
+    (ctGateOk() ? "" : '<span class="ct-badge n">test the credentials in Test Setup first</span>');
   const act = running ? '<button type="button" class="btn dg" data-ct="stop"' + (CT.running.stopping ? " disabled" : "") + ">" + (CT.running.stopping ? "Stopping ..." : "Stop") + "</button>"
-    : '<button type="button" class="btn p" data-ct="run" data-id="' + esc(p.id) + '"' + (busy ? " disabled" : "") + ">Execute</button>";
+    : '<button type="button" class="btn p" data-ct="run" data-id="' + esc(p.id) + '"' + ((busy || !ctGateOk()) ? " disabled" : "") + (ctGateOk() ? "" : ' title="Attach a credential profile and test it in Test Setup first"') + ">Execute</button>";
   const idx = TP.data.presets.findIndex(x => x.id === p.id), nxt = TP.data.presets.slice(idx + 1).find(x => !ctPathOff(x.group));
   const chips = p.keys.length ? p.keys.map(k => '<span class="ct-chip">' + esc(ctFeeds([k])) + "</span>").join("") : '<span class="ct-chip">no timeout setting - for your information</span>';
   const body = running ? '<div class="ct-panel" id="ct-live">' + ctLiveHtml() + "</div>"
@@ -13239,38 +13473,55 @@ function ctDetailHtml(p, num, total) {
     '</b></div><div class="ct-tile"><span>Average</span><b>' + (st.avg != null ? fmtS(st.avg) + " s" : "-") + '</b></div><div class="ct-tile"><span>Runs</span><b>' + st.n + "</b></div></div>" +
     (running || st.last ? '<div class="ct-status">' + (running ? '<span class="dot warn"></span>Running on ' + esc(host) : ctStatusHtml(st.last)) + "</div>" : "") + body + "</div>";
 }
+function ctTabs() {
+  const empty = !ctHosts().length || !(TP.data && TP.data.presets.length);
+  const tab = empty ? "detail" : (CT.tab === "detail" ? "detail" : "setup");
+  const top = $("tr-top"); if (top) { top.classList.toggle("is-setup", tab === "setup"); }
+  for (const t of ["setup", "detail"]) {
+    const pane = $("tr-pane-" + t), btn = $("tr-tab-" + t);
+    if (pane) pane.hidden = t !== tab;
+    if (btn) btn.setAttribute("aria-selected", t === tab ? "true" : "false");
+  }
+}
 function ctRender() {
-  const root = $("ct-root"); if (!root || !SET.data) return;
-  const presets = TP.data ? TP.data.presets : [], hosts = ctHosts(), images = TP.data ? TP.data.images : [];
+  if (!SET.data || !$("tr-rail")) return;
+  const all = TP.data ? TP.data.presets : [], presets = ctPresets(), hosts = ctHosts(), images = TP.data ? TP.data.images : [];
   if (!hosts.some(h => h.host === CT.host)) CT.host = hosts.length ? hosts[0].host : null;
   if (CT.image && !images.includes(CT.image)) CT.image = "";
-  let html = '<div class="ct-card' + (CT.open ? " open" : "") + '"><button type="button" class="ct-toggle" data-ct="toggle" aria-expanded="' + CT.open + '">' +
-    '<span>Command time test</span><span class="sub">upgrade ONE switch by hand, step by step, and time every step</span><span class="car">' + IC.dn + "</span></button>";
-  if (CT.open) {
-    if (!hosts.length || !presets.length) {
-      html += '<div class="ct-note">There are no switches in the device list yet. Add the test switch in the Device list and give it a credentials profile, then come back.</div>';
-    } else {
-      const busy = !!CT.running, p = ctSelected(presets), num = presets.indexOf(p) + 1;
-      const connect = (CT.results[CT.host] || {})._connect || [];
-      html += '<div class="ct-bar"><div class="ct-f"><label for="ct-host">Switch</label><select id="ct-host"' + (busy ? " disabled" : "") + ">" + hosts.map(h => '<option value="' + esc(h.host) + '"' + (h.host === CT.host ? " selected" : "") + ">" +
-          esc(h.host + (h.label ? " - " + h.label : "") + (h.platform ? " (" + h.platform + ")" : "")) + "</option>").join("") + "</select></div>" +
-        '<div class="ct-f"><label for="ct-image">Image</label><select id="ct-image"' + (busy ? " disabled" : "") + '><option value="">- choose the image to test with -</option>' +
-        images.map(n => '<option value="' + esc(n) + '"' + (n === CT.image ? " selected" : "") + ">" + esc(n) + "</option>").join("") + "</select></div>" +
-        '<div class="ct-bar-r"><span class="tip" data-tip="Run the steps from top to bottom on a TEST switch: it is a real upgrade done by hand. Pick a step on the left, press Execute, read the output here and in the console, then go on with Next step. The image is needed for the copy, the MD5 check and the add step. Steps marked as changing the switch ask first; Activate RELOADS the switch. Run a step again to get a second sample - the slowest time of each step is the one that counts."></span>' +
-        '<button type="button" class="btn sm" data-ct="stages" data-v="1">Expand All</button><button type="button" class="btn sm" data-ct="stages" data-v="0">Collapse All</button>' +
-        '<button type="button" class="btn sm" data-ct="clear"' + (busy ? " disabled" : "") + ">Clear Results</button></div></div>";
-      html += '<div class="ct-wb"><nav class="ct-rail" aria-label="Steps">' + ctRailHtml(presets) + '</nav><div class="ct-main">' + ctDetailHtml(p, num, presets.length) + '<div id="cc-slot"></div></div></div>';
-      html += '<div class="ct-result"><div class="ct-result-t">Results And Profile</div><div class="ct-result-g"><div id="ct-sugg-t"></div><div class="ct-side">' +
-        '<div class="ct-sg-h"><label for="ct-margin">Safety margin &times;<span class="tip" data-tip="The suggested timeout is the slowest measured time multiplied by this number, rounded up to 5 seconds. A switch is slower during a busy upgrade than during your test, so keep some room (3 is a good start)."></span></label>' +
-        '<input type="number" id="ct-margin" min="1" max="20" step="0.5" value="' + CT.margin + '">' +
-        '<label class="chk"><input type="checkbox" id="ct-keep"' + (CT.keepDefault ? " checked" : "") + '><span>Never go below the default</span></label></div>' +
-        '<div class="ct-note">Every Execute also times the SSH login' + (connect.length ? " (" + connect.length + " sample" + (connect.length > 1 ? "s" : "") + ", slowest " + fmtS(Math.max(...connect)) + " s)" : "") + ".</div>" +
-        '<div id="ct-sugg-a"></div></div></div></div>';
-    }
+  const busy = !!CT.running;
+  CT.sig = [CT.host, (ctHostInfo() || {}).profile, ((ctHostInfo() || {}).creds || {}).state, ctGateOk(), (last && last.profiles || []).map(x => x.name).join(",")].join("|");
+  ["tr-expand", "tr-collapse", "tr-clear"].forEach(id => { const b = $(id); if (b) b.disabled = !hosts.length || !presets.length || (id === "tr-clear" && busy); });
+  if (!hosts.length || !all.length) {
+    $("tr-fields").innerHTML = ""; $("tr-rail").innerHTML = ""; $("tr-result").innerHTML = "";
+    $("tr-detail").innerHTML = '<div class="ct-note" style="padding:14px 18px">' + (TP.data ? "There are no switches in the device list yet. Add the test switch in the Device list on the Home page and give it a credentials profile, then come back." : "Loading ...") + "</div>";
+    ctTabs(); tipsIn("troubleshoot"); ccSync();
+    return;
   }
-  root.innerHTML = html + "</div>";
+  $("tr-fields").innerHTML = ctFieldsHtml(hosts, images, busy);
+  if (!presets.length) {
+    $("tr-rail").innerHTML = '<div class="ct-note" style="padding:6px 14px 14px">Choose the <b>Test type</b> in Test Setup. The steps for it appear here.</div>';
+    $("tr-detail").innerHTML = '<div class="ct-note" style="padding:14px 18px">Choose the <b>Test type</b> in Test Setup first (Install - Activate/Distribute or Install - Full Upgrade). The steps to run appear on the left.</div>';
+    $("tr-result").innerHTML = "";
+    ctTabs(); tipsIn("troubleshoot");
+    const slot0 = $("cc-slot"); if (slot0) slot0.appendChild(CC_EL);
+    ccSync();
+    return;
+  }
+  const p = ctSelected(presets), num = presets.indexOf(p) + 1;
+  const connect = (CT.results[CT.host] || {})._connect || [];
+  $("tr-rail").innerHTML = ctRailHtml(presets);
+  $("tr-detail").innerHTML = ctDetailHtml(p, num, presets.length);
+  let resHtml = "";
+    resHtml = '<div class="ct-result-g"><div id="ct-sugg-t"></div><div class="ct-side">' +
+      '<div class="ct-sg-h"><label for="ct-margin">Safety margin &times;<span class="tip" data-tip="The suggested timeout is the slowest measured time multiplied by this number, rounded up to 5 seconds. A switch is slower during a busy upgrade than during your test, so keep some room (3 is a good start)."></span></label>' +
+      '<input type="number" id="ct-margin" min="1" max="20" step="0.5" value="' + CT.margin + '">' +
+      '<label class="chk"><input type="checkbox" id="ct-keep"' + (CT.keepDefault ? " checked" : "") + '><span>Never go below the default</span></label></div>' +
+      '<div class="ct-note">Every Execute also times the SSH login' + (connect.length ? " (" + connect.length + " sample" + (connect.length > 1 ? "s" : "") + ", slowest " + fmtS(Math.max(...connect)) + " s)" : "") + ".</div>" +
+      '<div id="ct-sugg-a"></div></div></div>';
+  $("tr-result").innerHTML = resHtml;
   ctRenderSuggest();
-  tipsIn("ct-root");
+  ctTabs();
+  tipsIn("troubleshoot");
   const slot = $("cc-slot"); if (slot) slot.appendChild(CC_EL);
   ccSync();
 }
@@ -13284,12 +13535,13 @@ function ctRenderSuggest() {
     '<div class="ct-note">' + (tmoItems().length - sg.rows.length) + " timeout(s) have no measurement and keep their default value in the profile (for example the backup commands, which this test does not run).</div>";
   act.innerHTML = '<div class="ct-actions"><button type="button" class="btn p" data-ct="saveform"' + dis + (SET_CAN_EDIT ? "" : ' title="Only an Administrator can save profiles"') + ">Save As Profile...</button>" +
     '<button type="button" class="btn sm" data-ct="csv">Report (CSV)</button><button type="button" class="btn sm" data-ct="print">Printable Report</button></div>' +
-    (CT.form ? '<div class="ct-actions"><input type="text" id="ct-pname" maxlength="40" placeholder="Profile name, e.g. Production" aria-label="Profile name">' +
+    (CT.form ? '<div class="ct-actions"><input type="text" id="ct-pname" maxlength="40" placeholder="Profile name, e.g. Production" aria-label="Profile name" value="' + esc(((TP.data && TP.data.profiles.find(p => p.name === TP.sel)) || {builtin: true}).builtin ? "" : TP.sel) + '">' +
       '<button type="button" class="btn p sm" data-ct="save"' + dis + '>Save</button><button type="button" class="btn sm" data-ct="cancelform">Cancel</button></div>' : "");
 }
 async function ctRun(id) {
   if (CT.running || !CT.host || !TP.data) return;
   const p = TP.data.presets.find(x => x.id === id); if (!p) return;
+  if (!ctGateOk()) { setSay("err", "Attach a credential profile to the switch and test it in Test Setup first."); return; }
   const host = CT.host;
   if (p.needs_image && !CT.image) { setSay("err", "Choose the image to test with first."); return; }
   if (p.warn && !confirm("'" + p.title + "' " + p.warn.replace("{host}", host) + "\n\nContinue?")) return;
@@ -13504,19 +13756,22 @@ async function ctSaveProfile() {
     if (ex && !ex.builtin && !confirm("A profile named '" + ex.name + "' already exists. Replace its values?")) return;
     const note = "Measured on " + CT.host + (h && h.label ? " (" + h.label + ")" : "") + ", margin x" + CT.margin + (CT.keepDefault ? ", never below the default" : "");
     const r = await post("/api/timeout-profiles/save", {name, values: sg.values, note, source: "command test", site: siteName || "", switch: CT.host, overwrite: !!ex});
-    TP.data = r; TP.sel = r.saved; CT.form = false; renderSettings(); setSay("ok", r.message);
+    TP.data = r; TP.sel = r.saved; CT.form = false; tpRender(); ctRender(); setSay("ok", r.message);
   } catch (e) { setSay("err", e.message); }
 }
-$("set-body").addEventListener("click", e => {
+ctOn("click", e => {
   const t = e.target.closest("[data-tp]"); if (t) { tpAction(t.dataset.tp); return; }
   const c = e.target.closest("[data-ct]"); if (!c) return;
   switch (c.dataset.ct) {
     case "toggle": CT.open = !CT.open; ctRender(); break;
-    case "run": ctRun(c.dataset.id); break;
+    case "tab": CT.tab = c.dataset.t === "detail" ? "detail" : "setup"; ctTabs(); ctPersist(); break;
+    case "restoggle": { const card = $("tr-res-card"), shut = card.classList.toggle("collapsed"); c.setAttribute("aria-expanded", shut ? "false" : "true"); break; }
+    case "run": CT.tab = "detail"; ctTabs(); ctRun(c.dataset.id); break;
     case "stop": ctStop(); break;
-    case "sel": { CT.sel = c.dataset.id; const sp = TP.data.presets.find(x => x.id === CT.sel); if (sp && CT_PATH_GROUP[sp.group]) CT.path = CT_PATH_GROUP[sp.group]; ctRender(); break; }
+    case "sel": { CT.tab = "detail"; CT.sel = c.dataset.id; ctPersist(); ctRender(); break; }
+    case "credtest": ctCredTest(); break;
     case "next": { const ps = TP.data.presets, i = ps.findIndex(x => x.id === CT.sel); let j = i + 1; while (ps[j] && ctPathOff(ps[j].group)) j++;
-      if (ps[j]) { CT.sel = ps[j].id; CT.railClosed[ps[j].group] = false; ctRender(); } break; }
+      if (ps[j]) { CT.tab = "detail"; CT.sel = ps[j].id; CT.railClosed[ps[j].group] = false; ctRender(); } break; }
     case "stage": CT.railClosed[c.dataset.g] = !CT.railClosed[c.dataset.g]; ctRender(); break;
     case "stages": { for (const g of new Set(TP.data.presets.map(p => p.group))) CT.railClosed[g] = c.dataset.v !== "1"; ctRender(); break; }
     case "clear": if (confirm("Clear the measured times of " + CT.host + "?")) {
@@ -13529,13 +13784,15 @@ $("set-body").addEventListener("click", e => {
     case "save": ctSaveProfile(); break;
   }
 });
-$("set-body").addEventListener("change", e => {
-  if (e.target.id === "tp-sel") { TP.sel = e.target.value; tpRender(); }
+ctOn("change", e => {
+  if (e.target.id === "tp-sel" || e.target.id === "tr-sel") { TP.sel = e.target.value; tpRender(); }
   else if (e.target.id === "ct-host") { CT.host = e.target.value; CT.form = false; ctPersist(); ctRender(); }
   else if (e.target.id === "ct-image") { CT.image = e.target.value; ctPersist(); ctRender(); }
+  else if (e.target.id === "ct-path") { CT.path = e.target.value; CT.sel = null; ctPersist(); ctRender(); }
+  else if (e.target.id === "ct-cred") { CT.picks[CT.host] = e.target.value; ctPersist(); }
   else if (e.target.id === "ct-keep") { CT.keepDefault = e.target.checked; ctRenderSuggest(); }
 });
-$("set-body").addEventListener("input", e => {
+ctOn("input", e => {
   if (e.target.id !== "ct-margin") return;
   const v = Number(e.target.value);
   if (v >= 1 && v <= 20) { CT.margin = v; ctPersist(); ctRenderSuggest(); }
@@ -14331,7 +14588,7 @@ function aiCollect() {
 function aiBody(key) { const d = AIS.draft, c = $("ai-clear"); return {enabled: d.enabled, provider: d.provider, model: d.model, base_url: d.base_url, mask: d.mask, api_key: key, clear_key: !!(c && c.checked)}; }
 document.addEventListener("change", e => {
   const root = $("ai-root"); if (!root || !root.contains(e.target) || !AIS.data) return;
-  if (e.target.id === "ai-prov") { aiCollect(); if (AIS.draft.provider === "anthropic" && !AIS.draft.model) AIS.draft.model = AIS.data.defaults.anthropic_model; aiRender(); }
+  if (e.target.id === "ai-prov") { aiCollect(); { const dm = AIS.data.defaults, prev = [dm.anthropic_model, dm.gemini_model]; if (AIS.draft.provider === "anthropic" && (!AIS.draft.model || prev.includes(AIS.draft.model))) AIS.draft.model = dm.anthropic_model; if (AIS.draft.provider === "gemini" && (!AIS.draft.model || prev.includes(AIS.draft.model))) AIS.draft.model = dm.gemini_model; } aiRender(); }
   else if (e.target.id === "ai-enabled" || e.target.id === "ai-mask") { aiCollect(); aiRender(); }
 });
 document.addEventListener("click", async e => {
@@ -14350,6 +14607,7 @@ document.addEventListener("click", async e => {
 
 if (location.hash === "#storage") showView("storage", false);
 else if (location.hash === "#diagnosis") showView("diagnosis", false);
+else if (location.hash === "#troubleshoot") showView("troubleshoot", false);
 else if (location.hash === "#diagram") showView("diagram", false);
 else if (location.hash === "#settings") showView("settings", false);
 
@@ -14908,7 +15166,7 @@ refresh();
 setInterval(refresh, 2000);
 </script>
 <script>
-// Modern UI helpers: sliding header tabs, gear spin, drag-over file pickers and custom dropdowns.
+// Modern UI helpers: sliding header tabs, drag-over file pickers and custom dropdowns.
 (function () {
   "use strict";
   // ---- sliding tab indicator ----
@@ -14932,15 +15190,6 @@ setInterval(refresh, 2000);
     window.addEventListener("resize", place);
     if (window.ResizeObserver) new ResizeObserver(place).observe(tabs);
     if (document.fonts && document.fonts.ready) document.fonts.ready.then(place);
-  }
-
-  // ---- gear icon: one full turn on every click ----
-  const gear = document.getElementById("btn-settings");
-  if (gear) {
-    gear.addEventListener("click", () => {
-      gear.classList.remove("spin"); void gear.offsetWidth; gear.classList.add("spin");
-    });
-    gear.addEventListener("animationend", () => gear.classList.remove("spin"));
   }
 
   // ---- file pickers: highlight while a file is dragged over ----
