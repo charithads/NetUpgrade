@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v1.0.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v1.0.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -98,13 +98,16 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "1.0.0"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "1.0.1"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
-# Features included in this first public version, shown under Settings > About.
+# Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
+    {"version": "1.0.1", "date": "2026-10-31", "features": [
+        "Add Google Gemini as an optional AI analysis provider.",
+        "Improve AI error messages and refine the Troubleshoot and Settings screens."]},
     {"version": "1.0.0", "date": "2026-10-28", "features": [
         "Upgrade multiple Cisco switches at the same time, with a configurable limit and queued jobs.",
         "Check and upload IOS-XE images, run readiness checks, schedule upgrades, and verify switches after reload.",
@@ -2637,8 +2640,9 @@ SETTINGS_GROUPS = [
      "intro": "How long the tool waits for a switch before it gives up. Raise a value when a production switch is slow "
               "to return a command's output or to save its configuration. The default is shown next to each value "
               "(click it to put the default back). A change applies to everything that starts after you save; an "
-              "upgrade that is already running keeps the values it started with. Command duration profiles "
-              "keep named sets of these values, and the Command time test can measure a switch to build one."},
+              "upgrade that is already running keeps the values it started with. Choose a Command duration profile "
+              "below and press Apply to use it. Profiles are created in the Troubleshoot tab, where the "
+              "Command time test can measure a switch to build one."},
     {"id": "notifications", "title": "Notifications",
      "intro": "E-mail copies of the notifications shown under the bell icon. Off until you switch it on. Gmail: "
               "smtp.gmail.com, port 587 (STARTTLS) and an App password (2-Step Verification > App passwords) - "
@@ -2775,7 +2779,7 @@ _POSTCHECK_STEPS = ([("show version", "show_cmd"), ("show processes cpu", "healt
 G_PRE, G_PREP, G_INST, G_INST1, G_POST = ("1. Pre-Check", "2. Prepare The Switch", "3. Install - Activate/Distribute",
                                           "3. Install - Full Upgrade", "4. Post-Check")
 COMMAND_TEST_PRESETS = [
-    {"id": "precheck_bundle", "title": "Pre-Check Bundle", "command": "show version, show boot, snapshot and health commands",
+    {"id": "precheck_bundle", "title": "Run The Pre-Upgrade Checks", "command": "show version, show boot, snapshot and health commands",
      "group": G_PRE, "kind": "bundle", "steps": _PRECHECK_STEPS,
      "desc": "Everything the upgrade reads before it changes anything. Each command and the total are timed."},
     {"id": "dir_flash", "title": "Check free space", "command": "dir flash:", "group": G_PREP, "kind": "command",
@@ -2822,7 +2826,7 @@ COMMAND_TEST_PRESETS = [
      "desc": "The one-command path the upgrade normally uses. Use it INSTEAD of the three-step path above (Add, Activate, "
              "Commit) - running both would upgrade the switch twice. After the reload the test checks the version and "
              "whether the image is committed."},
-    {"id": "postcheck_bundle", "title": "Post-Check Bundle", "command": "version, health and snapshot commands",
+    {"id": "postcheck_bundle", "title": "Run The Post-Upgrade Checks", "command": "version, health and snapshot commands",
      "group": G_POST, "kind": "bundle", "steps": _POSTCHECK_STEPS,
      "desc": "What the upgrade checks after the reload. Each command and the total are timed."},
 ]
@@ -5897,8 +5901,9 @@ def build_diag_report(fmt, analyses, site=""):
 
 # ---- optional cloud AI second opinion (Settings > AI Analysis). Off by default; the local rules never need it. ----
 AI_SETTINGS_FILENAME = "ai_settings.json"
-AI_PROVIDERS = {"anthropic": "Anthropic (Claude)", "openai": "OpenAI-compatible (any server with /chat/completions)"}
+AI_PROVIDERS = {"anthropic": "Anthropic (Claude)", "gemini": "Google Gemini", "openai": "OpenAI-compatible (any server with /chat/completions)"}
 AI_DEFAULTS = {"enabled": False, "provider": "anthropic", "model": "claude-sonnet-5-5", "base_url": "", "api_key_enc": "", "mask": True}
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
 AI_MAX_PROMPT_CHARS = 14000
 AI_TIMEOUT = 90
 AI_SYSTEM_PROMPT = (
@@ -6039,8 +6044,8 @@ def ai_describe_error(exc):
             detail = " ".join(str(detail).split())[:200]
         except Exception:  # noqa: BLE001
             detail = ""
-        hint = {401: " - the API key was rejected.", 403: " - access denied for this key or model.", 404: " - check the model name and the base URL.",
-                429: " - rate limit or quota reached."}.get(exc.code, "")
+        hint = {401: " - the API key was rejected.", 403: " - access denied for this key or model.", 404: " - check the model name (and the base URL, if one is used).",
+                400: " - the request was rejected (check the API key and model name).", 429: " - rate limit or quota reached."}.get(exc.code, "")
         return f"The API answered HTTP {exc.code}{hint}" + (f" ({detail})" if detail else "")
     if isinstance(exc, urllib.error.URLError):
         return "Could not reach the API server (" + type(exc.reason).__name__ + ") - check the base URL and your internet / proxy access."
@@ -6060,6 +6065,13 @@ def ai_call(cfg, api_key, system, user, max_tokens=900):
         url = "https://api.anthropic.com/v1/messages"
         headers = {"content-type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
         body = {"model": cfg["model"], "max_tokens": max_tokens, "system": system, "messages": [{"role": "user", "content": user}]}
+    elif cfg["provider"] == "gemini":
+        import urllib.parse
+        url = "https://generativelanguage.googleapis.com/v1beta/models/" + urllib.parse.quote(cfg["model"], safe="") + ":generateContent"
+        headers = {"content-type": "application/json", "x-goog-api-key": api_key}
+        body = {"systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": user}]}],
+                "generationConfig": {"maxOutputTokens": max(max_tokens, 2048)}}
     else:
         url = cfg["base_url"].rstrip("/") + "/chat/completions"
         headers = {"content-type": "application/json", "authorization": "Bearer " + api_key}
@@ -6070,6 +6082,9 @@ def ai_call(cfg, api_key, system, user, max_tokens=900):
         data = json.loads(resp.read(2_000_000).decode("utf-8", "replace"))
     if cfg["provider"] == "anthropic":
         text = "".join(b.get("text", "") for b in data.get("content", []) if isinstance(b, dict) and b.get("type") == "text")
+    elif cfg["provider"] == "gemini":
+        parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts")) or []
+        text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and not p.get("thought"))
     else:
         text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     text = str(text).strip()
@@ -7592,2682 +7607,13 @@ class Manager:
                                "which needs SSH - switch the device to an SSH profile first. (Backups, credential tests, "
                                "readiness checks, the console and topology discovery work over Telnet.)")
             if self.info[h]["type"] != "cisco-xe":
-                raise ApiError(f"{h} is type '{self.info[h]['type']}' - only cisco-xe switches "
-                               "can be upgraded.")
-            if self._upgrade_active(h):
-                raise ApiError(f"{h} is already upgrading right now.", 409)
-
-    def start_upgrade(self, hosts, image_path, backup_first=True, action="full",
-                      started_by=None, skip_image_check=False, ignore_space=False):
-        """action: 'full' (upload+activate+reload, default) | 'distribute' (upload+add to flash
-        only, no reload - stage it ahead of time) | 'activate' (activate an image already
-        distributed to flash and reload - no image_path needed).
-        The configuration backup (the defined backup commands) always runs first, whatever the caller passes."""
-        backup_first = True
-        self._require_site()
-        hosts = self._validate_hosts(hosts)
-        if not self.monitor.running:
-            raise ApiError("Monitoring is stopped. Upgrades only run while monitoring is on - "
-                           "click 'Start monitoring' first.", 409)
-        cm = self._creds_map(hosts)
-        if action not in ("full", "distribute", "activate"):
-            raise ApiError("Invalid action.")
-        if action == "activate":
-            image, size = None, 0
-        else:
-            image, size = self._check_image(image_path)
-        verb = self.ACTION_VERB.get(action, "Upgrade")
-        with self.lock:
-            self._poll_all()
-            self._check_upgradable(hosts)
-            run_hosts, queued_hosts = list(hosts), []
-            if action in ("full", "activate"):           # these reload the switch: respect the parallel limit
-                free = max(0, self.max_parallel - self._active_reload_count())
-                run_hosts, queued_hosts = list(hosts[:free]), list(hosts[free:])
-            if not backup_first:                 # a backup-first run reads the platform itself
-                self._require_platform_known(hosts)
-            if image:
-                self._enforce_image_check(hosts, image, skip_image_check, started_by)
-            if not backup_first:
-                for h in hosts:
-                    if self.ops[h]["backup"]["state"] in ("queued", "running"):
-                        raise ApiError(f"A backup is still running for {h} - wait for it to finish.", 409)
-            for h in hosts:
-                self.schedule.pop(h, None)   # a manual start replaces any pending schedule
-                self._rollout_forget(h)
-            rid = self._new_rollout(hosts, started_by) if (action in ("full", "activate") and len(hosts) > 1) else None
-            for h in queued_hosts:               # waits for a free slot; started by the scheduler loop
-                self.schedule[h] = {"run_at": time.time(), "image_path": image, "created": now_str(),
-                                    "backup_first": bool(backup_first), "action": action,
-                                    "scheduled_by": started_by or "local", "queued": True, "rollout": rid,
-                                    "ignore_space": bool(ignore_space)}
-            self._save_schedule()
-            queue_note = ""
-            if queued_hosts:
-                queue_note = (f" {len(queued_hosts)} more switch(es) are queued and start as running ones finish "
-                              f"({self.max_parallel} at a time"
-                              + ("; the queue stops if one fails)." if self.stop_on_failure else ")."))
-            if not run_hosts:
-                return {"message": f"All {self.max_parallel} upgrade slot(s) are busy - "
-                                   f"{len(queued_hosts)} switch(es) queued; each starts when a slot frees up."
-                                   + (" The queue stops if one fails." if self.stop_on_failure else "")}
-
-            if backup_first:
-                # start_backup() itself refuses a host it sees as "already upgrading", so the
-                # backup must be kicked off BEFORE this placeholder state is set, not after.
-                backup_result = self.start_backup(run_hosts)
-                for h in run_hosts:
-                    self.ops[h]["upgrade"] = {**self._new_ops()["upgrade"], "state": "starting",
-                                              "phase": "waiting_backup", "started": now_str(),
-                                              "started_ts": time.time(), "action": action,
-                                              "started_by": started_by or "local", "with_backup": True,
-                                              "message": "Backing up before the upgrade starts ..."}
-                threading.Thread(target=self._launch_after_backup,
-                                 args=(list(run_hosts), cm, image, action, started_by or "local", ignore_space),
-                                 daemon=True).start()
-                return {"message": f"Backing up {len(run_hosts)} switch(es) first ({backup_result['message']}) "
-                                   f"- each switch's {verb.lower()} will start automatically once its "
-                                   "backup finishes, and will be skipped if the backup fails." + queue_note,
-                       }
-
-            self.runs_dir.mkdir(parents=True, exist_ok=True)
-            for h in run_hosts:
-                self._launch_job(h, *cm[h], image, action, started_by, ignore_space)
-        msg = f"{verb} started on {len(run_hosts)} switch(es)"
-        msg += f" with {Path(image).name} ({size / 1_048_576:.0f} MB)." if image else "."
-        msg += queue_note + " "
-        msg += "A live web console opens at the bottom of this page for each switch."
-        return {"message": msg}
-
-    def _launch_after_backup(self, hosts, cm, image, action="full", started_by=None, ignore_space=False):
-        """Background watcher for backup_first upgrades: launches each device's action the
-        moment its own backup finishes, or marks it failed (skipped) if the backup failed."""
-        pending = set(hosts)
-        while pending and not self._stop.is_set():
-            time.sleep(2)
-            with self.lock:
-                done_now = [h for h in pending
-                           if h in self.ops and self.ops[h]["backup"]["state"] in ("completed", "failed")]
-                for h in done_now:
-                    pending.discard(h)
-                    if self.ops[h]["backup"]["state"] == "completed":
-                        self.runs_dir.mkdir(parents=True, exist_ok=True)
-                        self._launch_job(h, *cm[h], image, action, started_by, ignore_space)
-                        self.ops[h]["upgrade"]["with_backup"] = True      # the Backup stage of the progress bar was done
-                        self._copy_backup_to_record(h)                    # keep that backup with this run's pre-/post-check
-                    else:
-                        self.ops[h]["upgrade"] = {**self._new_ops()["upgrade"], "started_by": started_by,
-                                                  "action": action, "phase": "waiting_backup", "with_backup": True}
-                        self._finish(h, "failed", "Upgrade skipped: the pre-upgrade backup failed")
-
-    def _copy_backup_to_record(self, host):
-        """Copy the backup that was just taken (newest config_backup_*.txt of the device) into this upgrade's
-        record folder as pre-upgrade-backup_<stamp>.txt. Best-effort: never blocks or fails the upgrade."""
-        try:
-            job = self.jobs.get(host) or {}
-            record_dir = job.get("record_dir")
-            if not record_dir or self.backup_dir is None:
-                return
-            device_dir = self.backup_dir / device_folder_name(self.label(host), host)
-            newest = None
-            for e in os.scandir(device_dir):
-                if e.is_file() and e.name.startswith(BACKUP_FILE_PREFIX + "_") and e.name.endswith(".txt"):
-                    mt = e.stat().st_mtime
-                    if newest is None or mt > newest[0]:
-                        newest = (mt, e.path)
-            if newest is None or time.time() - newest[0] > 3600:      # nothing recent: not this run's backup
-                return
-            stamp = os.path.basename(record_dir)
-            Path(record_dir).mkdir(parents=True, exist_ok=True)
-            shutil.copy2(newest[1], os.path.join(record_dir, f"pre-upgrade-backup_{stamp}.txt"))
-        except Exception as exc:  # noqa: BLE001
-            print(f"Could not copy the pre-upgrade backup of {host} to its upgrade record: {type(exc).__name__}", flush=True)
-
-    # ---- scheduled upgrade --------------------------------------------------- #
-    def schedule_upgrade(self, hosts, image_path, run_at, backup_first=True, action="full",
-                         started_by=None, skip_image_check=False, ignore_space=False):
-        backup_first = True                    # the pre-upgrade backup is mandatory
-        self._require_site()
-        hosts = self._validate_hosts(hosts)
-        self._creds_map(hosts)          # every device needs a profile now; read again when the run starts
-        if action not in ("full", "distribute", "activate"):
-            raise ApiError("Invalid action.")
-        image = None
-        if action != "activate":
-            image, size = self._check_image(image_path)      # must exist now; re-checked at run time
-        if not isinstance(run_at, (int, float)):
-            raise ApiError("Invalid scheduled time.")
-        if run_at < time.time() + MIN_SCHEDULE_LEAD:
-            raise ApiError("The scheduled time must be at least "
-                           f"{MIN_SCHEDULE_LEAD} seconds in the future.")
-        with self.lock:
-            self._poll_all()
-            self._check_upgradable(hosts)
-            if not backup_first:
-                self._require_platform_known(hosts)
-            if image:
-                self._enforce_image_check(hosts, image, skip_image_check, started_by)
-            rid = None
-            if action in ("full", "activate") and len(hosts) > 1:
-                rid = self._new_rollout(hosts, started_by)
-            else:
-                for h in hosts:
-                    self._rollout_forget(h)
-            for h in hosts:
-                self.schedule[h] = {"run_at": run_at, "image_path": image, "created": now_str(),
-                                    "backup_first": bool(backup_first), "action": action,
-                                    "scheduled_by": started_by or "local", "queued": False, "rollout": rid,
-                                    "ignore_space": bool(ignore_space)}
-            self._save_schedule()
-        when = datetime.fromtimestamp(run_at).strftime("%Y-%m-%d %H:%M")
-        verb = self.ACTION_VERB.get(action, "Upgrade")
-        for h in hosts:
-            self.events.add(h, self.label(h), f"{verb} scheduled for {when}", "info")
-        msg = f"{verb} scheduled for {len(hosts)} switch(es) at {when}."
-        if not self.monitor.running:
-            msg += " NOTE: monitoring is stopped - scheduled upgrades only run while monitoring is on."
-        return {"message": msg}
-
-    def cancel_schedule(self, hosts):
-        hosts = self._validate_hosts(hosts)
-        with self.lock:
-            cancelled = [h for h in hosts if self.schedule.pop(h, None) is not None]
-            for h in cancelled:
-                self._rollout_forget(h)
-            self._save_schedule()
-        for h in cancelled:
-            self.events.add(h, self.label(h), "Scheduled upgrade cancelled", "info")
-        if not cancelled:
-            raise ApiError("None of the selected switches had a pending scheduled upgrade.")
-        return {"message": f"Cancelled the scheduled upgrade for {len(cancelled)} switch(es)."}
-
-    def _scheduler_loop(self):
-        while not self._stop.is_set():
-            due = []
-            with self.lock:
-                self._poll_all()
-                self._check_rollouts()
-                now = time.time()
-                mon_on = bool(self.monitor.running)       # nothing is started while monitoring is stopped
-                for h, entry in list(self.schedule.items()):
-                    if entry["run_at"] <= now and mon_on:
-                        due.append((h, entry))
-                for h, entry in due:
-                    if self._upgrade_active(h) or self.ops[h]["backup"]["state"] in ("queued", "running"):
-                        # busy right this second (e.g. a manual backup just started) - try again shortly
-                        entry["run_at"] = now + SCHEDULE_POLL
-                        continue
-                    action = entry.get("action") or "full"
-                    if action in ("full", "activate") and self._active_reload_count() >= self.max_parallel:
-                        entry["run_at"] = now + SCHEDULE_POLL
-                        continue
-                    del self.schedule[h]
-                    self._save_schedule()
-                    by = f"{entry.get('scheduled_by') or 'local'} (scheduled)"
-                    if entry.get("image_path") and not Path(entry["image_path"]).is_file():
-                        self.ops[h]["upgrade"] = self._new_ops()["upgrade"]
-                        self._finish(h, "failed", "Scheduled run failed: the image file is no "
-                                     f"longer at {entry['image_path']}")
-                        entry.clear()
-                        continue
-                    try:
-                        cm = self._creds_map([h])     # the profile as it is NOW (it may have been edited)
-                    except ApiError as exc:
-                        self.ops[h]["upgrade"] = self._new_ops()["upgrade"]
-                        self._finish(h, "failed", f"Scheduled run failed: {exc}")
-                        entry.clear()
-                        continue
-                    if True:                          # the pre-upgrade backup is mandatory (older schedule entries may lack the flag)
-                        try:
-                            self.start_backup([h])
-                        except ApiError as exc:
-                            self._finish(h, "failed", f"Scheduled run: could not start the "
-                                         f"pre-upgrade backup ({exc})")
-                            entry.clear()
-                            continue
-                        self.ops[h]["upgrade"] = {**self._new_ops()["upgrade"], "state": "starting",
-                                                  "phase": "waiting_backup", "started": now_str(),
-                                                  "started_ts": time.time(), "action": action,
-                                                  "started_by": by,
-                                                  "message": "Backing up before the upgrade starts ..."}
-                        threading.Thread(target=self._launch_after_backup,
-                                         args=([h], cm, entry["image_path"], action, by, bool(entry.get("ignore_space"))),
-                                         daemon=True).start()
-                    else:
-                        self.runs_dir.mkdir(parents=True, exist_ok=True)
-                        self._launch_job(h, *cm[h], entry["image_path"], action, by, bool(entry.get("ignore_space")))
-                    entry.clear()
-            self._stop.wait(SCHEDULE_POLL)
-
-    ACTION_VERB = {"full": "Firmware upgrade", "distribute": "Image distribution",
-                  "activate": "Image activation"}
-
-    def _launch_job(self, host, username, password, secret, image, action="full", started_by=None, ignore_space=False):
-        """Start the upgrade worker for one switch (output goes to its web console).
-        Called with self.lock held.
-        action: 'full' (upload+activate+reload, default) | 'distribute' (upload+add only,
-        no reload) | 'activate' (activate an already-distributed image, no image needed)."""
-        self.term_close_host(host)                  # no console may stay open on a switch that is about to reload
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = self.runs_dir / f"upgrade_{safe_name(host)}_{stamp}"
-        record_dir = self.upgrade_dir / device_folder_name(self.label(host), host) / stamp if self.upgrade_dir else None
-        if record_dir is not None:
-            try:
-                record_dir.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                record_dir = None
-        job = {"id": stamp, "record_dir": str(record_dir) if record_dir else "", "status_path": f"{base}.status.json", "log_path": f"{base}.log",
-               "job_path": os.path.join(self.job_tmp, f"{safe_name(host)}_{stamp}.job.json"),
-               "console_log": f"{base}.console.txt", "beat": time.time(), "proc": None, "direct": False}
-        verb = self.ACTION_VERB.get(action, "Firmware upgrade")
-        self.ops[host]["postcheck"] = {"state": "idle", "detail": "", "checks": {}, "time": None}
-        up = self.ops[host]["upgrade"] = {
-            "state": "starting", "phase": "starting", "message": f"Starting {verb.lower()} ...",
-            "old_version": None, "new_version": None, "started": now_str(), "finished": None,
-            "started_ts": time.time(), "finished_ts": None,
-            "image": Path(image).name if image else None, "action": action,
-            "started_by": started_by or "local", "phase_times": []}
-        self._notify(host, "started", f"{verb} started",
-                     (f"with {Path(image).name}" if image else "") or "Worker launched")
-        payload = {"ip": host, "name": self.label(host) or host, "action": action,
-                   "username": username, "password": password, "secret": secret,
-                   "status_path": job["status_path"], "log_path": job["log_path"],
-                   "timeouts": dict(TIMEOUTS)}
-        if record_dir is not None:
-            payload["record_dir"] = str(record_dir)
-        _rec = self.profiles.get(self.assign.get(host)) or {}
-        if _rec.get("port") and _rec.get("port") != default_port("ssh"):
-            payload["port"] = int(_rec["port"])         # custom SSH port: the worker (and its SCP copy) must use it too
-        if image:
-            payload["image_path"] = image
-        if ignore_space:
-            payload["ignore_space"] = True
-            self.events.add(host, self.label(host), "Flash space check will be ignored for this run "
-                            f"(chosen by {started_by or 'local'})", "warn")
-        try:
-            fd = os.open(job["job_path"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
-            argv = self_invoke_argv("--job", job["job_path"])
-            proc = launch_background_worker(argv, job["console_log"])
-            job.update(proc=proc, direct=True)
-        except Exception as exc:  # noqa: BLE001
-            self.jobs[host] = job
-            self._finish(host, "failed", f"Could not start the {verb.lower()} worker: {type(exc).__name__}: {exc}")
-            return
-        finally:
-            payload.clear()
-        self.jobs[host] = job
-        detail = f" ({Path(image).name})" if image else ""
-        self.events.add(host, self.label(host), f"{verb} started{detail}", "info")
-        up["message"] = f"{verb} started - see the live console ..."
-
-    CONSOLE_CHUNK = 65536          # most bytes returned to the browser per poll
-
-    def console_read(self, host, job_id, offset):
-        """Web console feed: the text a switch's upgrade worker has printed since byte `offset`.
-        The browser polls this with the offset it was last given. If `job_id` is not the
-        switch's current run (a new upgrade started), reading restarts from the beginning and
-        `reset` tells the browser to clear its console first."""
-        with self.lock:
-            if host not in self.info:
-                raise ApiError("Unknown switch.", 404)
-            job = self.jobs.get(host)
-            if job is None:
-                return {"job_id": None, "offset": 0, "text": "", "reset": False, "ended": True}
-            path, current, proc = job["console_log"], job["id"], job.get("proc")
-        try:
-            offset = max(0, int(offset))
-        except (TypeError, ValueError):
-            offset = 0
-        reset = job_id != current
-        if reset:
-            offset = 0
-        ended = proc is not None and proc.poll() is not None
-        try:
-            with open(path, "rb") as fh:
-                fh.seek(offset)
-                chunk = fh.read(self.CONSOLE_CHUNK)
-        except OSError:
-            chunk = b""
-        # Only hand out whole lines (so a multi-byte character is never split between two
-        # polls); a trailing partial line waits for its newline unless the worker has ended.
-        if ended:
-            pass                                       # worker is done: hand out everything left
-        elif b"\n" in chunk:
-            chunk = chunk[:chunk.rindex(b"\n") + 1]
-        elif len(chunk) < self.CONSOLE_CHUNK:
-            chunk = b""                                # a partial line: wait for its newline
-        text = chunk.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
-        return {"job_id": current, "offset": offset + len(chunk), "text": text, "reset": reset,
-                "ended": ended}
-
-    def _poll_all(self):
-        for h in self.order:
-            self._poll_job(h)
-
-    def _poll_job(self, host):
-        """Refresh one upgrade from its status file. Called with self.lock held."""
-        job, up = self.jobs.get(host), self.ops[host]["upgrade"]
-        if job is None or up["state"] in TERMINAL:
-            return
-        if up.get("phase") == "waiting_backup":
-            return          # the pre-upgrade backup is still running: self.jobs still holds the PREVIOUS run's worker, whose old status must not overwrite this run's progress
-        data = read_json_file(job["status_path"])
-        if data:
-            self._apply_status(host, job, data)
-        if up["state"] in TERMINAL:
-            return
-        proc = job.get("proc")
-        if job["direct"] and proc is not None and proc.poll() is not None:
-            data = read_json_file(job["status_path"])  # final state may have been written just now
-            if data:
-                self._apply_status(host, job, data)
-            if up["state"] not in TERMINAL:
-                self._finish(host, "attention", "The upgrade process ended "
-                             f"unexpectedly (exit code {proc.returncode}). Check the switch manually.")
-        elif time.time() - job["beat"] > STALE_SECONDS:
-            self._finish(host, "attention", "Lost contact with the upgrade process. "
-                         "Check the switch manually.")
-
-    def _apply_status(self, host, job, data):
-        up, o = self.ops[host]["upgrade"], self.ops[host]
-        job["beat"] = data.get("updated") or job["beat"]
-        up["phase"] = data.get("phase") or up["phase"]
-        up["message"] = data.get("message") or up["message"]
-        if isinstance(data.get("phase_times"), list):      # how long each phase took (Command time test uses it)
-            up["phase_times"] = [{"phase": str(p.get("phase") or "")[:30], "seconds": float(p.get("seconds") or 0)}
-                                 for p in data["phase_times"][:60]
-                                 if isinstance(p, dict) and isinstance(p.get("seconds"), (int, float))]
-        if data.get("old_version"):
-            up["old_version"] = data["old_version"]
-            if not o["version"]:
-                o["version"], o["version_note"] = data["old_version"], "read before upgrade"
-        if data.get("new_version"):
-            up["new_version"] = data["new_version"]
-        if data.get("model"):
-            o["model"] = data["model"]
-        if isinstance(data.get("boot"), dict):
-            self._set_boot(host, data["boot"])           # before / after the boot variable fix / after reload
-        pc = data.get("postcheck")
-        if isinstance(pc, dict) and pc.get("state") in ("passed", "warning", "failed"):
-            if o["postcheck"].get("time") != pc.get("time") or o["postcheck"].get("state") != pc["state"]:
-                o["postcheck"] = {"state": pc["state"], "detail": str(pc.get("detail") or ""),
-                                  "checks": pc.get("checks") if isinstance(pc.get("checks"), dict) else {},
-                                  "time": pc.get("time")}
-                title = {"passed": "Post-check passed", "warning": "Post-check found differences",
-                         "failed": "Post-check failed"}[pc["state"]]
-                self._notify(host, {"passed": "completed", "warning": "attention", "failed": "failed"}[pc["state"]],
-                             title, o["postcheck"]["detail"], category="postcheck")
-                self.events.add(host, self.label(host), f"{title}: {o['postcheck']['detail']}",
-                                {"passed": "ok", "warning": "warn", "failed": "bad"}[pc["state"]])
-        elif data.get("phase") == "postcheck" and up["state"] in ACTIVE and o["postcheck"]["state"] in ("idle", "checking"):
-            o["postcheck"] = {"state": "checking", "detail": data.get("message") or "", "checks": {}, "time": None}
-        state = data.get("state")
-        if state == "running" and up["state"] in ACTIVE:
-            up["state"] = "running"
-        elif state in TERMINAL:
-            self._finish(host, state, up["message"])
-
-    def _notes_view(self):
-        with self.notes_lock:
-            return list(reversed(self.notes[-100:]))          # newest first
-
-    def _notify(self, host, kind, title, text, category=None):
-        """Store a notification (shown under the bell icon) and save it with the site, so it is
-        still there after a restart. Never raises - notifications must not break an upgrade."""
-        try:
-            with self.notes_lock:
-                nid = max(int(time.time() * 1000), (self.notes[-1]["id"] + 1) if self.notes else 0)   # always rising
-                self.notes.append({"id": nid, "time": now_str(), "host": host,
-                                   "label": (self.info.get(host) or {}).get("label") or "",
-                                   "kind": kind, "title": title, "text": text})
-                del self.notes[:-NOTES_MAX]
-                if self.site_name:
-                    try:
-                        site_notes_path(self.site_name).write_text(json.dumps(self.notes), encoding="utf-8")
-                    except OSError:
-                        pass
-        except Exception:  # noqa: BLE001
-            pass
-        EMAILER.submit(self.site_name, host, (self.info.get(host) or {}).get("label") or "",
-                       kind, category, title, text)      # optional e-mail copy; returns at once
-
-    def clear_notifications(self):
-        with self.notes_lock:
-            self.notes = []
-            if self.site_name:
-                try:
-                    site_notes_path(self.site_name).write_text("[]", encoding="utf-8")
-                except OSError:
-                    pass
-        return {"message": "Notifications cleared."}
-
-    def _finish(self, host, state, message):
-        """Mark an upgrade finished and release its slot. Called with self.lock held."""
-        up, o = self.ops[host]["upgrade"], self.ops[host]
-        if up["state"] in TERMINAL:
-            return
-        up.update(state=state, message=message, finished=now_str(), finished_ts=time.time())
-        new, old = up.get("new_version"), up.get("old_version")
-        if new:
-            o["prev_version"] = old if old and old != new else None
-            o["version"], o["version_note"] = new, f"after upgrade {now_str()}"
-            save_known_version(host, self.label(host), new, o.get("model"))
-        job = self.jobs.get(host)
-        if job:
-            try:
-                os.remove(job["job_path"])  # leftover credential file, if the worker never read it
-            except OSError:
-                pass
-        level = {"completed": "ok", "failed": "bad", "attention": "warn"}[state]
-        self.events.add(host, self.label(host), message, level)
-        action = up.get("action")
-        title = ({"distribute": "Image distributed", "activate": "Image activated - upgrade completed"}.get(action, "Upgrade completed")
-                 if state == "completed" else "Upgrade failed" if state == "failed" else "Upgrade needs attention")
-        self._notify(host, state, title, message)
-        self._record_history(host)
-
-    # ---- views ------------------------------------------------------------- #
-    def _stage_map(self):
-        """compute_image_stage() for the current site, re-read only when the history file changes."""
-        if not self.site_name:
-            return {}
-        try:
-            stamp = os.path.getmtime(site_history_path(self.site_name))
-        except OSError:
-            stamp = None
-        fresh = FRESH_START
-        key = (self.site_name, stamp, fresh)
-        if getattr(self, "_stage_key", None) != key:
-            history = load_history(self.site_name)
-            if fresh:                       # only what this tool did since it was launched
-                history = [r for r in history if str(r.get("finished") or "") >= self.session_started]
-            self._stage_cache = compute_image_stage(history)
-            self._stage_key = key
-        return self._stage_cache
-
-    def snapshot(self):
-        mon = self.monitor.snapshot()
-        if not self.monitor.running:
-            # Up/down is only monitored while monitoring is enabled: otherwise every device reads as DOWN.
-            mon = dict(mon)
-            mon["hosts"] = [{**h, "status": "DOWN"} for h in mon["hosts"]]
-            mon["summary"] = {**mon["summary"], "up": 0, "down": len(mon["hosts"]), "pending": 0}
-        by_host = {h["host"]: h for h in mon["hosts"]}
-        with self.lock:
-            self._poll_all()
-            stage_map = self._stage_map()
-            hosts = []
-            for host in self.order:
-                m = dict(by_host[host])
-                o = self.ops[host]
-                sched = self.schedule.get(host)
-                m.update(profile=self.assign.get(host), label=self.info[host]["label"], type=self.info[host]["type"],
-                         platform=o.get("model") or self.info[host].get("platform", ""),
-                         boot=dict(o.get("boot") or {}),
-                         version=o["version"], prev_version=o["prev_version"],
-                         version_note=o["version_note"], backup=dict(o["backup"]),
-                         creds=dict(o["creds"]), readiness=dict(o["readiness"]), postcheck=dict(o["postcheck"]),
-                         stage=stage_map.get(host) or {"staged": None, "upgraded": None},
-                         upgrade={**o["upgrade"], "job_id": (self.jobs.get(host) or {}).get("id")},
-                         scheduled=None if sched is None else {
-                             "run_at": sched["run_at"],
-                             "run_at_str": datetime.fromtimestamp(sched["run_at"]).strftime("%Y-%m-%d %H:%M"),
-                             "queued": bool(sched.get("queued"))})
-                hosts.append(m)
-            active = sum(1 for h in self.order if self._upgrade_active(h))
-            scheduled_count = len(self.schedule)
-            completed_count = sum(1 for h in self.order
-                                  if self.ops[h]["upgrade"]["state"] == "completed"
-                                  and self.ops[h]["upgrade"]["action"] != "distribute")
-            run = self.backup_run
-            run_info = None if run is None else {
-                "total": run["total"], "done": run["done"], "ok": run["ok"], "failed": run["failed"],
-                "running": run["done"] < run["total"], "started": run["started"], "finished": run["finished"],
-                "commands": run["commands"][-200:]}
-        return {"app_version": APP_VERSION, "site": self.site_name, "monitor": mon["monitor"], "summary": mon["summary"], "hosts": hosts,
-                "profiles": self.profile_list(),
-                "keep_awake": self.keep_awake.active, "monitoring_on": bool(self.monitor.running),
-                "notifications": self._notes_view(),
-                "events": self.events.items(), "upgrade": {"active": active, "scheduled": scheduled_count,
-                            "completed": completed_count, "settings": self.upgrade_settings_view()},
-                "backup_run": run_info}
-
-    # ---- Diagram tab: CDP topology ------------------------------------------- #
-    def _topology_load(self):
-        data = read_json_file(site_topology_path(self.site_name)) if self.site_name else None
-        data = data if isinstance(data, dict) else {}
-        devices = data.get("devices") if isinstance(data.get("devices"), dict) else {}
-        roots = [r for r in (data.get("roots") or []) if isinstance(r, str)]
-        return {"devices": devices, "roots": roots}
-
-    def _topology_save(self, store):
-        try:
-            site_dir(self.site_name).mkdir(parents=True, exist_ok=True)
-            tmp = site_topology_path(self.site_name).with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(store, indent=1), encoding="utf-8")
-            tmp.replace(site_topology_path(self.site_name))
-        except OSError as exc:
-            print(f"Could not save the topology for site '{self.site_name}': {exc}", flush=True)
-
-    def topology_view(self):
-        """Everything the Diagram tab draws: the saved CDP graph plus one row per device for the picker."""
-        with self.lock:
-            site = self.site_name
-            order = list(self.order)
-            info = {h: dict(self.info[h]) for h in order}
-            cred_ok = {h: self.assign.get(h) in self.profiles for h in order}
-            profile = {h: self.assign.get(h) for h in order}
-        with self.topo_lock:
-            store = self._topology_load()
-            run = self.topo_run if (self.topo_run and self.topo_run.get("site") == site) else None
-            run_copy = None if run is None else {
-                "started": run["started"], "finished": run["finished"], "total": run["total"], "done": run["done"],
-                "hosts": {h: dict(v) for h, v in run["hosts"].items()}}
-        graph = build_topology_graph(info, order, store["devices"], set(store["roots"]))
-        devices = []
-        for h in order:
-            scan = store["devices"].get(h) if isinstance(store["devices"].get(h), dict) else {}
-            devices.append({"host": h, "label": info[h].get("label") or h, "platform": info[h].get("platform") or "",
-                            "has_creds": cred_ok[h], "profile": profile[h] if cred_ok[h] else None,
-                            "scan_ok": scan.get("ok"), "scan_time": scan.get("time") or "",
-                            "scan_error": scan.get("error") or "", "neighbors": len(scan.get("neighbors") or [])})
-        return {"site": site, "devices": devices, "graph": graph, "run": run_copy}
-
-    def start_topology_discovery(self, hosts):
-        """Read 'show cdp neighbors detail' from the selected switches (each must have a credentials profile)."""
-        self._require_site()
-        hosts = self._validate_hosts(hosts)
-        with self.lock:
-            missing = [h for h in hosts if self.assign.get(h) not in self.profiles]
-        if missing:
-            shown = ", ".join(self.label(h) for h in missing[:5]) + (f" (+{len(missing) - 5} more)" if len(missing) > 5 else "")
-            raise ApiError(f"No credentials profile is attached to: {shown}. Assign a profile on the Home page "
-                           "first - the topology is read from the switches with it.")
-        cm = self._creds_map(hosts)
-        with self.lock:
-            self._poll_all()
-            busy = {h for h in hosts if self._upgrade_active(h)}
-        with self.topo_lock:
-            if self.topo_run and self.topo_run.get("site") == self.site_name and not self.topo_run["finished"]:
-                raise ApiError("A topology scan is already running - wait for it to finish.", 409)
-            # The diagram shows only the switches selected for this discovery: drop stored scans of the rest.
-            store = self._topology_load()
-            keep = set(hosts)
-            stale = [h for h in list(store["devices"]) if h not in keep]
-            if stale:
-                for h in stale:
-                    store["devices"].pop(h, None)
-                self._topology_save(store)
-            run = {"site": self.site_name, "started": now_str(), "finished": None, "total": len(hosts), "done": 0,
-                   "hosts": {h: {"state": "queued", "detail": ""} for h in hosts}}
-            for h in busy:
-                run["hosts"][h] = {"state": "skipped", "detail": "Upgrade in progress - kept the previous result"}
-                run["done"] += 1
-            if run["done"] >= run["total"]:
-                run["finished"] = now_str()
-            self.topo_run = run
-        todo = [h for h in hosts if h not in busy]
-        for h in todo:
-            self.pool.submit(self._topology_one, h, self.site_name, *cm[h])
-        self.events.add("-", "", f"Topology scan started on {len(todo)} device(s)", "info")
-        msg = f"Reading CDP neighbours from {len(todo)} switch(es) ..."
-        if busy:
-            msg += f" {len(busy)} skipped because an upgrade is running on them."
-        return {"message": msg}
-
-    @activity("Topology scan")
-    def _topology_one(self, host, site, username, password, secret):
-        with self.topo_lock:
-            if self.topo_run and self.topo_run.get("site") == site and host in self.topo_run["hosts"]:
-                self.topo_run["hosts"][host] = {"state": "running", "detail": "Connecting ..."}
-        info = self.info.get(host) or {}
-        device = {"device_type": BACKUP_DEVICE_TYPES.get(info.get("type"), "cisco_xe"), "host": host,
-                  "username": username, "password": password, "secret": secret,
-                  "conn_timeout": 15, "auth_timeout": 15, "banner_timeout": 15}
-        ok, detail, neighbors, hostname = False, "", [], ""
-        try:
-            with ConnectHandler(**device) as conn:
-                if secret:
-                    conn.enable()
-                hostname = re.sub(r"\(.*?\)|[#>\s]+$", "", conn.find_prompt()).strip()
-                raw = conn.send_command("show cdp neighbors detail", read_timeout=tmo('show_cmd'))
-            if re.search(r"CDP is not enabled|Invalid input", raw or "", re.I):
-                detail = "CDP is not enabled on this switch (cdp run)"
-            else:
-                neighbors = parse_cdp_neighbors_detail(raw)
-                ok, detail = True, f"{len(neighbors)} CDP neighbour(s)"
-        except NetmikoAuthenticationException:
-            detail = "Authentication failed"
-        except NetmikoTimeoutException:
-            detail = "Connection timed out"
-        except Exception as exc:  # noqa: BLE001
-            detail = f"{type(exc).__name__}: {exc}"[:160]
-        with self.topo_lock:
-            if self.site_name == site:                       # the site was switched meanwhile: drop the result
-                store = self._topology_load()
-                old = store["devices"].get(host) if isinstance(store["devices"].get(host), dict) else {}
-                if ok:
-                    store["devices"][host] = {"hostname": hostname, "time": now_str(), "ok": True, "error": "",
-                                              "neighbors": neighbors}
-                else:                                        # keep what we knew; only note why the scan failed
-                    store["devices"][host] = {"hostname": old.get("hostname", ""), "time": old.get("time", ""),
-                                              "ok": False, "error": detail, "neighbors": old.get("neighbors") or []}
-                self._topology_save(store)
-            run = self.topo_run
-            if run and run.get("site") == site and host in run["hosts"]:
-                run["hosts"][host] = {"state": "ok" if ok else "failed", "detail": detail}
-                run["done"] += 1
-                if run["done"] >= run["total"] and not run["finished"]:
-                    run["finished"] = now_str()
-        self.events.add(host, self.label(host) if host in self.info else host, f"Topology scan: {detail}",
-                        "ok" if ok else "bad")
-
-    # ---- Diagnosis tab: custom read-only commands + log analysis (never part of an upgrade) ------------------- #
-    def _diag_state_path(self):
-        return site_dir(self.site_name) / "diagnosis.json"
-
-    def _diag_commands_saved(self):
-        data = read_json_file(self._diag_state_path()) if self.site_name else None
-        text = data.get("commands") if isinstance(data, dict) else ""
-        return text if isinstance(text, str) else ""
-
-    def _diag_commands_save(self, text):
-        try:
-            site_dir(self.site_name).mkdir(parents=True, exist_ok=True)
-            tmp = self._diag_state_path().with_suffix(".json.tmp")
-            tmp.write_text(json.dumps({"commands": text[:20000]}, indent=1), encoding="utf-8")
-            tmp.replace(self._diag_state_path())
-        except OSError:
-            pass                                          # remembering the text is a convenience only
-
-    def diag_view(self):
-        """Everything the Diagnosis tab draws: the device picker, the run in progress, the analyses so far."""
-        with self.lock:
-            site = self.site_name
-            order = list(self.order)
-            info = {h: dict(self.info[h]) for h in order}
-            cred_ok = {h: self.assign.get(h) in self.profiles for h in order}
-            profile = {h: self.assign.get(h) for h in order}
-        with self.diag_lock:
-            runs = {}
-            for kind, run in self.diag_runs.items():
-                runs[kind] = None if (run is None or run.get("site") != site) else {
-                    k: (v if k != "hosts" else {h: dict(x) for h, x in v.items()}) for k, v in run.items()}
-            results = {h: a for h, a in self.diag_results.items() if h in info} if site else {}
-        devices = [{"host": h, "label": info[h].get("label") or h, "platform": info[h].get("platform") or "",
-                    "has_creds": cred_ok[h], "profile": profile[h] if cred_ok[h] else None} for h in order]
-        cfg = self.ai_cfg
-        return {"site": site, "devices": devices, "runs": runs, "results": results,
-                "commands": self._diag_commands_saved() if site else "",
-                "lookbacks": list(DIAG_LOOKBACK_HOURS), "log_commands": list(DIAG_LOG_COMMANDS),
-                "allowed_words": list(DIAG_COMMAND_WORDS), "max_commands": DIAG_MAX_COMMANDS,
-                "ai": {"enabled": bool(cfg["enabled"] and cfg.get("api_key_enc")), "provider": AI_PROVIDERS[cfg["provider"]],
-                       "model": cfg["model"], "mask": bool(cfg["mask"])}}
-
-    def _diag_start(self, kind, hosts, extra):
-        self._require_site()
-        hosts = self._validate_hosts(hosts)
-        cm = self._creds_map(hosts)
-        with self.lock:
-            self._poll_all()
-            busy = {h for h in hosts if self._upgrade_active(h)}
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        with self.diag_lock:
-            cur = self.diag_runs.get(kind)
-            if cur and cur.get("site") == self.site_name and not cur["finished"]:
-                raise ApiError("A " + ("Run Commands" if kind == "commands" else "Log Analysis") + " run is already in progress - wait for it to finish.", 409)
-            run = {"kind": kind, "site": self.site_name, "stamp": stamp, "started": now_str(), "finished": None,
-                   "total": len(hosts), "done": 0, "hosts": {h: {"state": "queued", "detail": "", "file": ""} for h in hosts}}
-            run.update(extra)
-            for h in busy:
-                run["hosts"][h] = {"state": "skipped", "detail": "Upgrade in progress - not touched", "file": ""}
-                run["done"] += 1
-            if run["done"] >= run["total"]:
-                run["finished"] = now_str()
-            self.diag_runs[kind] = run
-            if kind == "logs":
-                for h in hosts:
-                    self.diag_results.pop(h, None)
-        return cm, [h for h in hosts if h not in busy], stamp, busy
-
-    def _diag_write(self, site, host, name, text):
-        folder = site_diag_dir(site) / device_folder_name(self.label(host), host)
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / name).write_text(text, encoding="utf-8")
-        return f"{SITE_DIAG_SUBDIR}/{folder.name}/{name}"
-
-    def _diag_set(self, site, kind, host, state, detail, file=""):
-        with self.diag_lock:
-            run = self.diag_runs.get(kind)
-            if run and run.get("site") == site and host in run["hosts"]:
-                run["hosts"][host] = {"state": state, "detail": detail, "file": file}
-                if state in ("ok", "failed"):
-                    run["done"] += 1
-                    if run["done"] >= run["total"] and not run["finished"]:
-                        run["finished"] = now_str()
-
-    def start_diag_commands(self, hosts, commands_text, who=None):
-        """Run the typed read-only commands on the selected switches and save every output under Diagnosis/<switch>/."""
-        cmds, problems = parse_diag_commands(commands_text)
-        if problems:
-            raise ApiError(" ".join(problems[:4]) + (f" (+{len(problems) - 4} more problem(s))" if len(problems) > 4 else ""))
-        cm, todo, stamp, busy = self._diag_start("commands", hosts, {"commands": cmds})
-        self._diag_commands_save(str(commands_text))
-        for h in todo:
-            self.pool.submit(self._diag_commands_one, h, self.site_name, stamp, cmds, *cm[h])
-        self.events.add("-", "", f"Diagnosis: {len(cmds)} command(s) on {len(todo)} switch(es) started by {who or 'local'}", "info")
-        msg = f"Running {len(cmds)} command(s) on {len(todo)} switch(es) ..."
-        if busy:
-            msg += f" {len(busy)} skipped because an upgrade is running on them."
-        return {"message": msg}
-
-    def _diag_connect_kwargs(self, host, username, password, secret):
-        info = self.info.get(host) or {}
-        return {"device_type": BACKUP_DEVICE_TYPES.get(info.get("type"), "cisco_xe"), "host": host, "username": username,
-                "password": password, "secret": secret}
-
-    def _diag_collect(self, host, username, password, secret, commands):
-        """[(command, output, error)] - one login, every command tried even if an earlier one failed."""
-        out = []
-        with ConnectHandler(**self._diag_connect_kwargs(host, username, password, secret)) as conn:
-            if secret:
-                conn.enable()
-            for cmd in commands:
-                try:
-                    out.append((cmd, conn.send_command(cmd, read_timeout=tmo("show_cmd")), ""))
-                except Exception as exc:  # noqa: BLE001
-                    out.append((cmd, "", f"{type(exc).__name__}"))
-        return out
-
-    @activity("Diagnosis")
-    def _diag_commands_one(self, host, site, stamp, commands, username, password, secret):
-        self._diag_set_running(site, "commands", host, "Connecting ...")
-        label = self.label(host) if host in self.info else host
-        state, detail, rel = "failed", "", ""
-        try:
-            got = self._diag_collect(host, username, password, secret, commands)
-            sections = [(c, o if not e else f"(command failed: {e})") for c, o, e in got]
-            failed = sum(1 for _c, _o, e in got if e)
-            text = command_sections_text(f"Diagnosis commands - {label} ({host}) - {now_str()}", sections)
-            rel = self._diag_write(site, host, f"commands_{stamp}.txt", text)
-            detail = f"{len(commands) - failed} of {len(commands)} command(s) saved" + (f", {failed} failed" if failed else "")
-            state = "ok" if failed < len(commands) else "failed"
-        except NetmikoAuthenticationException:
-            detail = "Authentication failed"
-        except NetmikoTimeoutException:
-            detail = "Connection timed out"
-        except Exception as exc:  # noqa: BLE001
-            detail = f"{type(exc).__name__}: {exc}"[:160]
-        self._diag_set(site, "commands", host, state, detail, rel)
-        self.events.add(host, label, f"Diagnosis commands: {detail}", "ok" if state == "ok" else "bad")
-
-    def _diag_set_running(self, site, kind, host, detail):
-        with self.diag_lock:
-            run = self.diag_runs.get(kind)
-            if run and run.get("site") == site and host in run["hosts"]:
-                run["hosts"][host] = {"state": "running", "detail": detail, "file": ""}
-
-    def start_diag_logs(self, hosts, lookback_hours, who=None):
-        """Read the log (and a few related commands) from the selected switches and analyze it locally."""
-        try:
-            lookback = int(lookback_hours or 0)
-        except (TypeError, ValueError):
-            lookback = -1
-        if lookback not in DIAG_LOOKBACK_HOURS:
-            raise ApiError("Choose one of the look-back windows from the list.")
-        cm, todo, stamp, busy = self._diag_start("logs", hosts, {"lookback_hours": lookback})
-        for h in todo:
-            self.pool.submit(self._diag_logs_one, h, self.site_name, stamp, lookback, *cm[h])
-        self.events.add("-", "", f"Diagnosis: log analysis on {len(todo)} switch(es) started by {who or 'local'}", "info")
-        msg = f"Reading the logs of {len(todo)} switch(es) ..."
-        if busy:
-            msg += f" {len(busy)} skipped because an upgrade is running on them."
-        return {"message": msg}
-
-    @activity("Diagnosis")
-    def _diag_logs_one(self, host, site, stamp, lookback, username, password, secret):
-        self._diag_set_running(site, "logs", host, "Connecting ...")
-        label = self.label(host) if host in self.info else host
-        try:
-            got = self._diag_collect(host, username, password, secret, DIAG_LOG_COMMANDS)
-            sections = {c: (o if not e else "") for c, o, e in got}
-            if not any(sections.values()):
-                raise RuntimeError("The switch returned no output")
-            self._diag_set_running(site, "logs", host, "Analyzing ...")
-            raw = command_sections_text(f"Log collection - {label} ({host}) - {now_str()}",
-                                        [(c, o if not e else f"(command failed: {e})") for c, o, e in got])
-            raw_rel = self._diag_write(site, host, f"logs_{stamp}.txt", raw)
-            a = analyze_switch_logs(sections, lookback, label, host)
-            a["stamp"] = stamp
-            a["files"] = {"logs": raw_rel}
-            a["files"]["report"] = self._diag_write(site, host, f"log-analysis_{stamp}.txt", format_analysis_report(a, raw_rel))
-            with self.diag_lock:
-                if self.site_name == site:
-                    self.diag_results[host] = a
-            self._diag_set(site, "logs", host, "ok", a["verdict_text"], a["files"]["report"])
-            self.events.add(host, label, f"Log analysis: {a['verdict'].upper()} - {a['verdict_text']}",
-                            {"green": "ok", "amber": "info", "red": "bad"}[a["verdict"]])
-        except NetmikoAuthenticationException:
-            self._diag_set(site, "logs", host, "failed", "Authentication failed")
-            self.events.add(host, label, "Log analysis: authentication failed", "bad")
-        except NetmikoTimeoutException:
-            self._diag_set(site, "logs", host, "failed", "Connection timed out")
-            self.events.add(host, label, "Log analysis: connection timed out", "bad")
-        except Exception as exc:  # noqa: BLE001
-            self._diag_set(site, "logs", host, "failed", f"{type(exc).__name__}: {exc}"[:160])
-            self.events.add(host, label, f"Log analysis failed: {type(exc).__name__}", "bad")
-
-    def diag_report(self, fmt, hosts_csv):
-        """(bytes, content type, file name) - a CSV / Excel / PDF report of the finished log analyses of the given switches."""
-        fmt = str(fmt or "").lower()
-        if fmt not in DIAG_REPORT_FORMATS:
-            raise ApiError("Choose csv, xlsx or pdf.")
-        hosts = [h.strip() for h in str(hosts_csv or "").split(",") if h.strip()]
-        with self.diag_lock:
-            site = self.site_name
-            run = self.diag_runs.get("logs")
-            if run and run.get("site") == site and not run["finished"]:
-                raise ApiError("The log analysis is still running - download the report when it has finished.", 409)
-            analyses = [self.diag_results[h] for h in dict.fromkeys(hosts) if h in self.diag_results]
-        if not analyses:
-            raise ApiError("None of the selected switches has a finished log analysis.", 404)
-        try:
-            data = build_diag_report(fmt, analyses, site or "")
-        except ImportError:
-            raise ApiError("Excel reports need the openpyxl package.", 500)
-        name = f"log_analysis_{safe_name(site or 'site')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{DIAG_REPORT_FORMATS[fmt][1]}"
-        self.events.add("-", "", f"Log analysis report ({fmt.upper()}) downloaded for {len(analyses)} switch(es)", "info")
-        return data, DIAG_REPORT_FORMATS[fmt][0], name
-
-    # ---- optional AI second opinion (Settings > AI Analysis) ---------------------------------------------- #
-    def ai_settings_view(self):
-        """For the Settings page. The API key is never sent back - only whether one is saved."""
-        cfg = self.ai_cfg
-        return {"values": {"enabled": cfg["enabled"], "provider": cfg["provider"], "model": cfg["model"],
-                           "base_url": cfg["base_url"], "mask": cfg["mask"]},
-                "key_saved": bool(cfg.get("api_key_enc")),
-                "providers": [{"key": k, "label": v} for k, v in AI_PROVIDERS.items()],
-                "defaults": {"anthropic_model": AI_DEFAULTS["model"]}}
-
-    def update_ai_settings(self, values, who=None):
-        if not isinstance(values, dict):
-            raise ApiError("Send the AI settings as a JSON object.")
-        cfg, problems = ai_clean_values(values)
-        key = str(values.get("api_key") or "").strip()
-        if len(key) > 400 or re.search(r"[\s\x00-\x1f]", key):
-            problems.append("The API key is not valid (spaces or line breaks).")
-        cfg["api_key_enc"] = "" if values.get("clear_key") else self.ai_cfg.get("api_key_enc", "")
-        if cfg["enabled"] and not key and not cfg["api_key_enc"]:
-            problems.append("Enter the API key.")
-        if problems:
-            raise ApiError(" ".join(problems))
-        if key:
-            try:
-                cfg["api_key_enc"] = protect_secret(key)
-            except (Exception, SystemExit) as exc:  # noqa: BLE001
-                raise ApiError(f"Could not encrypt the API key ({type(exc).__name__}).", 500)
-        try:
-            save_ai_settings(cfg)
-        except OSError as exc:
-            raise ApiError(f"Could not save the AI settings ({type(exc).__name__}).", 500)
-        was = self.ai_cfg["enabled"]
-        self.ai_cfg = cfg
-        self.events.add("-", "", "AI log analysis settings saved by " + (who or "local") + ": " + (
-            f"ON ({AI_PROVIDERS[cfg['provider']]}, model {cfg['model']})" if cfg["enabled"] else ("switched OFF" if was else "OFF")), "info")
-        out = self.ai_settings_view()
-        out["message"] = "Saved - applied now." if cfg["enabled"] else "Saved - the cloud AI option is OFF (log analysis stays local)."
-        return out
-
-    def test_ai_settings(self, values, who=None):
-        cfg, problems = ai_clean_values(dict(values or {}, enabled=True))
-        key = str((values or {}).get("api_key") or "").strip()
-        if not key and self.ai_cfg.get("api_key_enc") and not (values or {}).get("clear_key"):
-            try:
-                key = unprotect_secret(self.ai_cfg["api_key_enc"])
-            except Exception:  # noqa: BLE001
-                key = ""
-        if not key:
-            problems.append("Enter the API key.")
-        if problems:
-            raise ApiError(" ".join(problems))
-        try:
-            ai_call(cfg, key, "Reply with the single word OK.", "Connection test.", max_tokens=20)
-        except (Exception, SystemExit) as exc:  # noqa: BLE001
-            raise ApiError("Test failed: " + ai_describe_error(exc))
-        return {"message": f"Connected - {AI_PROVIDERS[cfg['provider']]} answered using model {cfg['model']}."}
-
-    def diag_ai_advice(self, host, who=None):
-        """A second opinion on ONE switch's local analysis. Sends only the condensed findings (masked by default)."""
-        cfg = self.ai_cfg
-        if not cfg["enabled"] or not cfg.get("api_key_enc"):
-            raise ApiError("The cloud AI option is off. An administrator can turn it on under Settings > AI Analysis.")
-        with self.diag_lock:
-            a = self.diag_results.get(host)
-            site = self.site_name
-        if not a:
-            raise ApiError("Run the log analysis on this switch first.")
-        try:
-            key = unprotect_secret(cfg["api_key_enc"])
-        except Exception:  # noqa: BLE001
-            raise ApiError("The saved API key cannot be read on this computer - enter it again in Settings > AI Analysis.")
-        masker = AiMasker([a.get("label"), self.label(host) if host in self.info else ""]) if cfg["mask"] else None
-        prompt = ai_build_prompt(a, masker)
-        try:
-            text = ai_call(cfg, key, AI_SYSTEM_PROMPT, prompt)
-        except (Exception, SystemExit) as exc:  # noqa: BLE001
-            raise ApiError("The AI request failed: " + ai_describe_error(exc))
-        if masker:
-            text = masker.unmask(text)
-        advice = {"time": now_str(), "provider": AI_PROVIDERS[cfg["provider"]], "model": cfg["model"],
-                  "masked": bool(cfg["mask"]), "text": text}
-        try:
-            rel = self._diag_write(site, host, f"ai-advice_{a.get('stamp') or datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                                   f"AI second opinion - {a['label']} ({host}) - {advice['time']}\n"
-                                   f"Provider: {advice['provider']}, model {advice['model']}, identifiers {'masked' if advice['masked'] else 'NOT masked'}\n"
-                                   "Advisory only - generated text, verify it against the evidence.\n\n" + text + "\n")
-            advice["file"] = rel
-        except OSError:
-            advice["file"] = ""
-        with self.diag_lock:
-            if self.site_name == site and host in self.diag_results:
-                self.diag_results[host]["ai"] = advice
-        self.events.add(host, a["label"], f"AI second opinion requested by {who or 'local'} ({advice['provider']})", "info")
-        return {"message": "Done.", "ai": advice}
-
-    def topology_set_root(self, host, on):
-        """Choose which switch is the top of its tree (the distribution / core), overriding the automatic guess."""
-        self._require_site()
-        if not isinstance(host, str) or host not in self.info:
-            raise ApiError("Unknown switch.")
-        with self.topo_lock:
-            store = self._topology_load()
-            with self.lock:
-                order, info = list(self.order), {h: dict(self.info[h]) for h in self.order}
-            graph = build_topology_graph(info, order, store["devices"], set())
-            comp = {n["id"]: n["comp"] for n in graph["nodes"]}
-            if host not in comp:
-                raise ApiError("Scan this switch first - it is not on the diagram yet.")
-            store["roots"] = [r for r in store["roots"] if comp.get(r) != comp[host] and r != host]
-            if on:
-                store["roots"].append(host)
-            self._topology_save(store)
-        return {"message": f"{self.label(host)} is now the top of its tree." if on else "Top of tree cleared - back to automatic."}
-
-    # ---- web terminal (device drawer > Console) ------------------------------ #
-    def _term_reap(self):
-        """Drop finished sessions and close the ones nobody has used for a while. Called with term_lock held."""
-        now = time.time()
-        for sid, s in list(self.terms.items()):
-            if not s.closed and now - s.last_used > TERM_IDLE_SECONDS:
-                s.close()
-            if s.closed and now - s.last_used > 60:
-                del self.terms[sid]
-
-    def _term(self, host, sid):
-        s = self.terms.get(str(sid or ""))
-        if s is None or s.host != str(host or ""):
-            raise ApiError("That console session no longer exists - click Connect.", 404)
-        return s
-
-    def term_open(self, host, user):
-        host = str(host or "")
-        self._require_site()
-        with self.lock:
-            if host not in self.info:
-                raise ApiError("Unknown switch.", 404)
-            self._poll_job(host)
-            if self._upgrade_active(host):
-                raise ApiError(f"{host} is being upgraded right now - the console is closed until it finishes.", 409)
-            username, password, secret = self._creds_map([host])[host]
-            label = self.info[host]["label"]
-        with self.term_lock:
-            self._term_reap()
-            for s in self.terms.values():                       # one live console per switch: reconnect to it
-                if s.host == host and not s.closed:
-                    s.last_used = time.time()
-                    return {"sid": s.id, "offset": 0, "reused": True}
-            if sum(1 for s in self.terms.values() if not s.closed) >= TERM_MAX_SESSIONS:
-                raise ApiError(f"Too many consoles are open ({TERM_MAX_SESSIONS}) - close one first.", 429)
-            s = TerminalSession(host, label, username, password, secret, user, self._protocol_of(host), self._port_of(host))
-            self.terms[s.id] = s
-        self.events.add(host, label, f"Web console opened by {user}", "info")
-        return {"sid": s.id, "offset": 0, "reused": False}
-
-    def term_send(self, host, sid, line=None, raw=None, secret=False, user="local"):
-        s = self._term(host, sid)
-        if raw is not None:
-            keys = {"ctrl_c": "\x03", "ctrl_z": "\x1a"}
-            if raw not in keys:
-                raise ApiError("Unknown key.")
-            s.send(keys[raw])
-            return {"ok": True}
-        line = str(line if line is not None else "")
-        if len(line) > TERM_MAX_LINE or any(ord(c) < 32 and c != "\t" for c in line):
-            raise ApiError("That line is too long or contains control characters.")
-        if not secret and line.strip():
-            with activity("Web console"):
-                record_command(s.host, line.strip(), True, 0)          # the command log shows what was typed, never passwords
-        s.send(line if line.endswith("?") else line + "\n")             # '?' shows help at once, without Enter
-        return {"ok": True}
-
-    def term_read(self, host, sid, offset):
-        s = self._term(host, sid)
-        try:
-            offset = max(0, int(offset))
-        except (TypeError, ValueError):
-            offset = 0
-        s.last_used = time.time()
-        return s.read(offset)
-
-    def term_close(self, host, sid, user="local"):
-        s = self._term(host, sid)
-        s.close()
-        self.events.add(s.host, s.label, f"Web console closed ({user})", "info")
-        return {"ok": True}
-
-    def term_close_host(self, host):
-        """Close the consoles of a switch (an upgrade is starting, or it was deleted). Never blocks on self.lock."""
-        with self.term_lock:
-            for s in self.terms.values():
-                if s.host == host and not s.closed:
-                    s.close()
-
-    def term_close_all(self):
-        with self.term_lock:
-            for s in self.terms.values():
-                s.close()
-
-    # ---- device drawer ------------------------------------------------------ #
-    def _device_dirs(self, host):
-        """(backup folder, runs folder) of a device; refuses unknown devices / no active site."""
-        if host not in self.info:
-            raise ApiError("Unknown switch.", 404)
-        if not self.site_name or self.backup_dir is None or self.runs_dir is None:
-            raise ApiError("No site is selected.", 409)
-        return self.backup_dir / device_folder_name(self.info[host]["label"], host), self.runs_dir
-
-    def device_detail(self, host, image_name="", shared_target=False):
-        """Everything for the device drawer (see the comment above read_device_facts)."""
-        host = str(host or "")
-        image_name = os.path.basename(str(image_name or "").replace("\\", "/"))[:200]
-        with self.lock:
-            device_dir, runs_dir = self._device_dirs(host)
-            self._poll_job(host)
-            ops = json.loads(json.dumps(self.ops[host], default=str))     # a private copy to work on
-            if image_name:
-                self.target_image = image_name          # remembered so a Viewer (no image picker) sees it too
-            elif shared_target:
-                # A Viewer has no image picker: show the image an Operator/Administrator picked, else the
-                # one scheduled for / used by the latest upgrade of this switch.
-                sched_img = os.path.basename(str((self.schedule.get(host) or {}).get("image_path") or ""))
-                up_img = os.path.basename(str((ops.get("upgrade") or {}).get("image") or ""))
-                image_name = self.target_image or sched_img or up_img
-            info = dict(self.info[host])
-            profile = self.assign.get(host)
-            sched = self.schedule.get(host)
-            scheduled = None if sched is None else datetime.fromtimestamp(sched["run_at"]).strftime("%Y-%m-%d %H:%M")
-            job_id = (self.jobs.get(host) or {}).get("id")
-            site = self.site_name
-        with self.monitor.lock:
-            s = self.monitor.stats.get(host) or {}
-            mon = {"status": s.get("status") or "PENDING", "last_checked": s.get("last_checked"),
-                   "last_change": s.get("last_change"), "last_rtt": s.get("last_rtt"),
-                   "checks": s.get("checks"), "successes": s.get("successes")}
-        if not self.monitor.running:                  # up/down is only known while monitoring is on
-            mon["status"], mon["monitoring_off"] = "DOWN", True
-
-        facts = read_device_facts(device_dir)
-        backups = list_device_backups(device_dir)
-        run_files = list_run_files(runs_dir, host)
-        model = ops.get("model") or facts.get("members", [{}])[0].get("model") or info.get("platform") or None
-        version = ops.get("version")
-
-        target = None
-        if image_name:
-            target = {"image": image_name, "version": guess_version_from_filename(image_name),
-                      "problems": check_image_for_device(image_name, model, version)}
-
-        pre = None
-        status = latest_upgrade_status(runs_dir, host)
-        if status and isinstance(status.get("pre_snapshot"), dict):
-            try:
-                pre = {"summary": summarize_snapshot(status["pre_snapshot"]), "time": _stamp_to_time(status["_stamp"])}
-            except (KeyError, TypeError):
-                pre = None
-
-        checklist = self._device_checklist(mon, profile, ops, model, version, backups, target)
-        missing = sum(1 for c in checklist if c["state"] in ("todo", "bad"))
-        warnings = sum(1 for c in checklist if c["state"] == "warn")
-
-        events = [e for e in self.events.items(300) if e.get("host") == host][:80]
-        history = [r for r in reversed(load_history(site)) if r.get("ip_address") == host][:15]
-        return {
-            "host": host, "label": info.get("label") or "", "type": info.get("type"),
-            "model": model, "version": version, "profile": profile, "scheduled": scheduled, "job_id": job_id,
-            "monitor": mon, "facts": facts, "ops": ops, "target": target, "pre_snapshot": pre,
-            "checklist": checklist, "missing": missing, "warnings": warnings,
-            "backups": {"folder": device_dir.name, "runs": backups}, "check_files": run_files,
-            "commands": read_command_log(runs_dir, host), "events": events, "history": history,
-        }
-
-    @staticmethod
-    def _device_checklist(mon, profile, ops, model, version, backups, target):
-        """The steps that should be done before an upgrade, each ok / warn / bad / todo / run, with a reason."""
-        items = []
-
-        def add(key, title, state, detail):
-            items.append({"key": key, "title": title, "state": state, "detail": detail})
-
-        st = mon.get("status")
-        if mon.get("monitoring_off"):
-            add("reach", "Reachable", "bad", "Monitoring is stopped - the switch is shown as down until monitoring is started")
-        elif st == "UP":
-            rtt = mon.get("last_rtt")
-            add("reach", "Reachable", "ok", "Answers ping" + (f" ({rtt:.1f} ms)" if isinstance(rtt, (int, float)) else ""))
-        elif st == "DOWN":
-            add("reach", "Reachable", "bad", "Not answering ping - check the switch and the network path")
-        else:
-            add("reach", "Reachable", "todo", "Not checked yet - start monitoring")
-
-        creds = ops.get("creds") or {}
-        if not profile:
-            add("profile", "Credential profile attached", "bad", "No profile is attached - nothing can be read from or done on this switch")
-        else:
-            add("profile", "Credential profile attached", "ok", f"Profile '{profile}'")
-        cs = creds.get("state")
-        if cs == "ok":
-            add("creds", "Credentials tested", "ok", creds.get("detail") or "Login OK")
-        elif cs == "failed":
-            add("creds", "Credentials tested", "bad", creds.get("detail") or "Login failed")
-        elif cs == "testing":
-            add("creds", "Credentials tested", "run", "Testing ...")
-        else:
-            add("creds", "Credentials tested", "todo", "Not tested yet - use 'Test credentials'")
-
-        if model and version:
-            add("ident", "Platform and software version known", "ok", f"{model}, running {version}")
-        else:
-            add("ident", "Platform and software version known", "todo", "Run a backup or 'Refresh version' to read them from the switch")
-
-        bk, newest = ops.get("backup") or {}, (backups[0] if backups else None)
-        age_h = None
-        if newest:
-            try:
-                age_h = (datetime.now() - datetime.strptime(newest["stamp"], "%Y%m%d_%H%M%S")).total_seconds() / 3600
-            except ValueError:
-                pass
-        if bk.get("state") in ("queued", "running"):
-            add("backup", "Configuration backup", "run", bk.get("detail") or "Backing up ...")
-        elif bk.get("state") == "failed":
-            add("backup", "Configuration backup", "bad", bk.get("detail") or "The last backup failed")
-        elif newest:
-            when = newest["time"]
-            if age_h is not None and age_h > 24:
-                add("backup", "Configuration backup", "warn", f"Last backup {when} is {int(age_h // 24)} day(s) old - take a fresh one before upgrading")
-            else:
-                add("backup", "Configuration backup", "ok", f"Last backup {when} ({len(newest['files'])} file(s))")
-        else:
-            add("backup", "Configuration backup", "todo", "No backup yet - back up the configuration first")
-
-        rd = ops.get("readiness") or {}
-        rs, ch = rd.get("state"), rd.get("checks") or {}
-        rmap = {"ready": "ok", "warning": "warn", "not_ready": "bad", "checking": "run"}
-        if rs in rmap:
-            add("ready", "Readiness check", rmap[rs], rd.get("detail") or "")
-        else:
-            add("ready", "Readiness check", "todo", "Not run yet - use 'Readiness check'")
-
-        boot = ops.get("boot") or {}
-        if boot.get("mode"):
-            if boot.get("mode") == "INSTALL" and boot.get("boot_ok") is True:
-                add("boot", "Boot mode", "ok", boot.get("detail") or "INSTALL mode, boot variable correct")
-            else:
-                add("boot", "Boot mode", "warn", (boot.get("detail") or f"{boot['mode']} mode") + " - the upgrade converts / fixes this")
-        else:
-            add("boot", "Boot mode", "todo", "Not read yet - run a backup, readiness check or 'Refresh version'")
-
-        lvl = ch.get("space_level")
-        if lvl == "ok":
-            add("space", "Flash space", "ok", ch.get("space_detail") or "Enough free flash")
-        elif lvl == "low":
-            add("space", "Flash space", "warn", ch.get("space_detail") or "Flash is tight")
-        elif lvl == "fail" or ch.get("space_ok") is False:
-            add("space", "Flash space", "bad", ch.get("space_detail") or "Not enough free flash")
-        else:
-            add("space", "Flash space", "todo", "Not checked - run the readiness check (select the image first so it is counted)")
-
-        if not target:
-            add("image", "Firmware image selected", "todo", "Pick an image under 'Firmware upgrade' to see whether it suits this switch")
-        elif target["problems"]:
-            add("image", "Firmware image suits this switch", "bad", "; ".join(target["problems"]))
-        elif target["version"] and version and target["version"] == version:
-            last_run = ops.get("upgrade") or {}
-            if last_run.get("state") == "completed" and last_run.get("action") != "distribute":
-                # the switch is on this version because the last run just upgraded it - nothing to warn about
-                add("image", "Firmware image suits this switch", "ok", f"Already upgraded to {version} by the last run")
-            else:
-                add("image", "Firmware image suits this switch", "warn", f"The switch already runs {version} - the upgrade would be skipped")
-        else:
-            add("image", "Firmware image suits this switch", "ok", target["image"])
-
-        up = ops.get("upgrade") or {}
-        if up.get("state") in ACTIVE:
-            add("busy", "No upgrade running", "run", up.get("message") or "An upgrade is running")
-        if up.get("state") in ("completed", "failed", "attention"):
-            pc = ops.get("postcheck") or {}
-            pmap = {"passed": "ok", "warning": "warn", "failed": "bad", "checking": "run"}
-            if up.get("action") != "distribute":
-                add("post", "Post-upgrade check", pmap.get(pc.get("state"), "todo"),
-                    pc.get("detail") or "Not run")
-        return items
-
-    def device_file(self, host, kind, name, tail_wanted=False):
-        """Text of one saved file for the drawer's 'View' button. Only files that belong to this
-        device are served (a name is matched against the device's own listing / file-name pattern)."""
-        host = str(host or "")
-        with self.lock:
-            device_dir, runs_dir = self._device_dirs(host)
-        name = os.path.basename(str(name or "").replace("\\", "/"))
-        if kind == "backup":
-            directory = device_dir
-            ok = bool(STAMP_RE.search(name))
-        elif kind == "run":
-            directory = runs_dir
-            ok = bool(run_file_pattern(host).match(name))
-        else:
-            raise ApiError("Unknown file type.")
-        path = directory / name
-        try:
-            real = path.resolve()
-            real.relative_to(directory.resolve())
-            is_file = ok and real.is_file() and not path.is_symlink()
-        except (ValueError, OSError):
-            is_file = False
-        if not is_file:
-            raise ApiError("File not found.", 404)
-        size = real.stat().st_size
-        tail = bool(tail_wanted) or name.endswith((".log", ".console.txt"))   # long logs: the end is what matters
-        cut = tail and size > DEVICE_FILE_MAX_BYTES
-        with open(real, "rb") as fh:
-            if cut:
-                fh.seek(size - DEVICE_FILE_MAX_BYTES)
-            data = fh.read(DEVICE_FILE_MAX_BYTES)
-        text = data.decode("utf-8", "replace")
-        if cut and "\n" in text:
-            text = text.split("\n", 1)[1]              # start at a whole line
-        return {"name": name, "size": size, "truncated": size > DEVICE_FILE_MAX_BYTES, "tail": cut,
-                "limit": DEVICE_FILE_MAX_BYTES, "text": text}
-
-    UPGRADE_REPORT_FIELDS = ["hostname", "ip_address", "previous_image", "current_image",
-                             "upgrade_started_at", "upgrade_duration", "status", "finished_at",
-                             "postcheck_result", "postcheck_reason", "action", "image_file", "started_by"]
-
-    POSTCHECK_LABELS = {"passed": "Pass", "warning": "Differences found", "failed": "Fail",
-                        "checking": "In progress", "idle": "Not run"}
-
-    def _postcheck_report(self, upgrade_state, pc):
-        """(result, reason) for the report. The reason is only filled when the result is not
-        a Pass, so a reader can see at a glance why a switch needs attention."""
-        pc = pc or {}
-        state = pc.get("state") or "idle"
-        result = self.POSTCHECK_LABELS.get(state, state)
-        if state == "passed":
-            return result, ""
-        detail = str(pc.get("detail") or "").strip()
-        if state == "warning":
-            reason = ("Switch is on the new version but something differs from before the upgrade: "
-                      + detail) if detail else "Differences found compared with the pre-upgrade snapshot"
-        elif state == "failed":
-            reason = detail or "Post-check failed"
-        elif state == "checking":
-            reason = detail or "Post-check is still running"
-        else:  # idle - never ran
-            if upgrade_state == "idle":
-                reason = "No upgrade attempted, so no post-check was run"
-            elif upgrade_state in ("completed", "skipped"):
-                reason = ("Upgrade not needed (already on target version), so no post-check was run"
-                          if upgrade_state == "skipped" else "Post-check did not run after the upgrade")
-            else:
-                reason = f"Post-check not run - upgrade status is '{upgrade_state}'"
-        return result, reason
-
-    @staticmethod
-    def _format_duration(seconds):
-        if seconds is None or seconds < 0:
-            return ""
-        seconds = int(round(seconds))
-        h, rem = divmod(seconds, 3600)
-        m, s = divmod(rem, 60)
-        return (f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s" if m else f"{s}s")
-
-    def upgrade_report_rows(self):
-        """One row per device: hostname, IP, previous/current software version, and how long
-        its most recent upgrade attempt took. Devices never upgraded still appear, blank."""
-        with self.lock:
-            self._poll_all()
-            rows = []
-            for host in self.order:
-                o = self.ops[host]
-                up = o["upgrade"]
-                had_attempt = up["state"] != "idle"
-                pc_result, pc_reason = self._postcheck_report(up["state"], o.get("postcheck"))
-                duration = None
-                if up.get("started_ts") and up.get("finished_ts"):
-                    duration = up["finished_ts"] - up["started_ts"]
-                rows.append({
-                    "hostname": self.info[host]["label"] or host,
-                    "ip_address": host,
-                    "previous_image": up.get("old_version") or "",
-                    "current_image": up.get("new_version") or o["version"] or "",
-                    "upgrade_started_at": up.get("started") or "",
-                    "upgrade_duration": self._format_duration(duration),
-                    "status": up["state"] if had_attempt else "not attempted",
-                    "finished_at": up.get("finished") or "",
-                    "postcheck_result": pc_result,
-                    "postcheck_reason": pc_reason,
-                    "action": self.ACTION_VERB.get(up.get("action") or "full", "Upgrade") if up.get("action") else "",
-                    "image_file": up.get("image") or "",
-                    "started_by": up.get("started_by") or "",
-                })
-            return rows
-
-    REPORT_LABELS = {"hostname": "Hostname", "ip_address": "IP address", "previous_image": "Previous version",
-                     "current_image": "Current version", "upgrade_started_at": "Started",
-                     "upgrade_duration": "Duration", "status": "Status", "finished_at": "Finished",
-                     "postcheck_result": "Post-check", "postcheck_reason": "Post-check detail",
-                     "action": "Action", "image_file": "Image file", "started_by": "Started by"}
-    REPORT_STATUS_FILLS = {"completed": "C6EFCE", "failed": "FFC7CE", "attention": "FFEB9C",
-                           "running": "DDEBF7", "starting": "DDEBF7", "scheduled": "EDEDED"}
-
-    def _report_counts(self, rows):
-        counts = {}
-        for r in rows:
-            counts[r["status"]] = counts.get(r["status"], 0) + 1
-        return counts
-
-    def upgrade_report_xlsx(self, generated_by="local"):
-        """Excel report: Summary, current status of every switch, and the full run history."""
-        from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Font, PatternFill
-        from openpyxl.utils import get_column_letter
-        rows = self.upgrade_report_rows()
-        history = list(reversed(load_history(self.site_name))) if self.site_name else []
-        head_fill, head_font = PatternFill("solid", fgColor="1F4E79"), Font(bold=True, color="FFFFFF")
-
-        def fill_sheet(ws, headers, data, status_col=None):
-            ws.append(headers)
-            for cell in ws[1]:
-                cell.fill, cell.font = head_fill, head_font
-                cell.alignment = Alignment(vertical="center", wrap_text=True)
-            for r in data:
-                ws.append(r)
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = ws.dimensions
-            for i, h in enumerate(headers, 1):
-                width = max([len(str(h))] + [len(str(r[i - 1])) for r in data[:300]]) + 2
-                ws.column_dimensions[get_column_letter(i)].width = min(max(width, 10), 60)
-            if status_col is not None:
-                for row in ws.iter_rows(min_row=2, min_col=status_col + 1, max_col=status_col + 1):
-                    for cell in row:
-                        color = self.REPORT_STATUS_FILLS.get(str(cell.value).lower())
-                        if color:
-                            cell.fill = PatternFill("solid", fgColor=color)
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Summary"
-        counts = self._report_counts(rows)
-        ws.append([APP_NAME + " - upgrade report"])
-        ws["A1"].font = Font(bold=True, size=14)
-        for line in [("Site", self.site_name or ""), ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                     ("Generated by", generated_by), ("Application version", APP_VERSION), ("", ""),
-                     ("Switches", len(rows)), ("Completed", counts.get("completed", 0)),
-                     ("Failed", counts.get("failed", 0)), ("Needs attention", counts.get("attention", 0)),
-                     ("Running / starting", counts.get("running", 0) + counts.get("starting", 0)),
-                     ("Scheduled", counts.get("scheduled", 0)), ("Not attempted", counts.get("not attempted", 0)),
-                     ("Runs in history", len(history))]:
-            ws.append(list(line))
-        for r in range(3, ws.max_row + 1):
-            ws.cell(r, 1).font = Font(bold=True)
-        ws.append([])
-        ws.append(["Developed by " + APP_AUTHOR])
-        ws.append([APP_REPO_URL])
-        ws.cell(ws.max_row, 1).hyperlink = APP_REPO_URL
-        ws.column_dimensions["A"].width = 26
-        ws.column_dimensions["B"].width = 34
-
-        fields = self.UPGRADE_REPORT_FIELDS
-        status_idx = fields.index("status")
-        fill_sheet(wb.create_sheet("Current status"), [self.REPORT_LABELS[f] for f in fields],
-                   [[r.get(f, "") for f in fields] for r in rows], status_idx)
-        hist_fields = ["finished", "hostname", "ip_address", "action", "image_file", "previous_image",
-                       "current_image", "status", "upgrade_duration", "started_by", "postcheck_result",
-                       "postcheck_reason", "message"]
-        hist_labels = ["Finished", "Hostname", "IP address", "Action", "Image file", "Previous version",
-                       "Current version", "Result", "Duration", "Started by", "Post-check", "Post-check detail",
-                       "Message"]
-        fill_sheet(wb.create_sheet("History"), hist_labels,
-                   [[h.get(f, "") for f in hist_fields] for h in history], hist_fields.index("status"))
-        buf = io.BytesIO()
-        wb.save(buf)
-        data = buf.getvalue()
-        self._save_report(data, "upgrade_report", "xlsx")
-        return data
-
-    def upgrade_report_html(self, generated_by="local"):
-        """A clean, printable page - use the browser's Print > Save as PDF."""
-        e = html_escape
-        rows = self.upgrade_report_rows()
-        history = list(reversed(load_history(self.site_name)))[:100] if self.site_name else []
-        counts = self._report_counts(rows)
-
-        def cls(text):
-            return "s-" + re.sub(r"[^a-z]", "", str(text).lower())
-
-        def table(headers, data, status_col):
-            head = "".join("<th>{}</th>".format(e(h)) for h in headers)
-            body = "".join(
-                "<tr>" + "".join(
-                    "<td class=\"{}\">{}</td>".format(cls(v) if i == status_col else "", e(str(v)))
-                    for i, v in enumerate(r)) + "</tr>" for r in data)
-            return "<table><thead><tr>{}</tr></thead><tbody>{}</tbody></table>".format(head, body or
-                   "<tr><td colspan=\"{}\">Nothing to show yet.</td></tr>".format(len(headers)))
-
-        fields = self.UPGRADE_REPORT_FIELDS
-        tiles = "".join("<div class=\"tile\"><b>{}</b><span>{}</span></div>".format(n, e(t)) for t, n in [
-            ("Switches", len(rows)), ("Completed", counts.get("completed", 0)), ("Failed", counts.get("failed", 0)),
-            ("Needs attention", counts.get("attention", 0)), ("Scheduled", counts.get("scheduled", 0))])
-        hist_fields = ["finished", "hostname", "action", "previous_image", "current_image", "status",
-                       "upgrade_duration", "started_by", "postcheck_result"]
-        hist_labels = ["Finished", "Hostname", "Action", "From", "To", "Result", "Duration", "Started by",
-                       "Post-check"]
-        return (
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{app} - upgrade report</title>"
-            "<style>body{{font:13px/1.45 system-ui,Segoe UI,sans-serif;margin:24px;color:#1b2430}}"
-            "h1{{font-size:20px;margin:0}}h2{{font-size:15px;margin:22px 0 6px}}.sub{{color:#51606f;margin:2px 0 14px}}"
-            ".tiles{{display:flex;gap:10px;flex-wrap:wrap}}.tile{{border:1px solid #d5dce4;border-radius:8px;"
-            "padding:8px 14px;min-width:92px}}.tile b{{display:block;font-size:20px}}.tile span{{color:#51606f}}"
-            "table{{border-collapse:collapse;width:100%;font-size:12px}}th,td{{border:1px solid #d5dce4;"
-            "padding:4px 7px;text-align:left;vertical-align:top}}th{{background:#1f4e79;color:#fff}}"
-            ".s-completed{{background:#c6efce}}.s-failed{{background:#ffc7ce}}.s-attention{{background:#ffeb9c}}"
-            ".s-running,.s-starting{{background:#ddebf7}}.foot{{margin-top:22px;color:#51606f;font-size:12px;"
-            "border-top:1px solid #d5dce4;padding-top:8px}}button{{padding:6px 14px;margin:0 0 12px}}"
-            "@media print{{button{{display:none}}body{{margin:8mm}}}}</style></head><body>"
-            "<button onclick=\"window.print()\">Print / Save as PDF</button>"
-            "<h1>{app} - Upgrade Report</h1>"
-            "<p class=\"sub\">Site: <b>{site}</b> &nbsp;|&nbsp; Generated {now} by {who} &nbsp;|&nbsp; v{ver}</p>"
-            "<div class=\"tiles\">{tiles}</div>"
-            "<h2>Current Status</h2>{t1}<h2>History (Latest 100 Runs)</h2>{t2}"
-            "<p class=\"foot\">Developed by <b>{author}</b> | <a href=\"{repo}\">GitHub</a></p></body></html>"
-        ).format(app=e(APP_NAME), site=e(self.site_name or ""), now=datetime.now().strftime("%Y-%m-%d %H:%M"),
-                 who=e(generated_by), ver=e(APP_VERSION), tiles=tiles,
-                 t1=table([self.REPORT_LABELS[f] for f in fields], [[r.get(f, "") for f in fields] for r in rows],
-                          fields.index("status")),
-                 t2=table(hist_labels, [[h.get(f, "") for f in hist_fields] for h in history],
-                          hist_fields.index("status")),
-                 author=e(APP_AUTHOR), repo=e(APP_REPO_URL, quote=True))
-
-    def upgrade_report_csv(self):
-        buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=self.UPGRADE_REPORT_FIELDS)
-        w.writeheader()
-        w.writerows(self.upgrade_report_rows())
-        text = buf.getvalue()
-        self._save_report(text, "upgrade_report")
-        return text
-
-    def _save_report(self, data, prefix, ext="csv"):
-        """Every generated report is also saved under this site's Reports folder, not just
-        streamed to the browser - best-effort, a failure here never blocks the download."""
-        try:
-            self.reports_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = self.reports_dir / f"{prefix}_{stamp}.{ext}"
-            if isinstance(data, bytes):
-                path.write_bytes(data)
-            else:
-                path.write_text(data, encoding="utf-8")
-        except (OSError, AttributeError):
-            pass
-
-    def _record_history(self, host):
-        """Append the run that just finished to this site's permanent history (best effort:
-        a problem here must never affect the upgrade itself)."""
-        try:
-            o = self.ops[host]
-            up = o["upgrade"]
-            pc_result, pc_reason = self._postcheck_report(up["state"], o.get("postcheck"))
-            ts_start, ts_end = up.get("started_ts"), up.get("finished_ts") or time.time()
-            fmt = "%Y-%m-%d %H:%M:%S"
-            append_history(self.site_name, {
-                "finished": datetime.fromtimestamp(ts_end).strftime(fmt),
-                "started": datetime.fromtimestamp(ts_start).strftime(fmt) if ts_start else "",
-                "hostname": self.label(host), "ip_address": host,
-                "action": self.ACTION_VERB.get(up.get("action") or "full", "Upgrade"),
-                "image_file": up.get("image") or "",
-                "previous_image": up.get("old_version") or "", "current_image": up.get("new_version") or "",
-                "status": up["state"], "message": up.get("message") or "",
-                "upgrade_duration": self._format_duration(ts_end - ts_start) if ts_start else "",
-                "started_by": up.get("started_by") or "",
-                "postcheck_result": pc_result, "postcheck_reason": pc_reason})
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _enforce_image_check(self, hosts, image, skip, user):
-        """Refuse (HTTP 409) when the chosen image looks wrong for a selected switch, unless
-        the person ticked 'Ignore image check warnings'. Called with self.lock held."""
-        name = Path(image).name
-        problems = []
-        for h in hosts:
-            o = self.ops[h]
-            model = o.get("model") or self.info[h].get("platform") or ""
-            for p in check_image_for_device(name, model, o.get("version")):
-                problems.append(f"{self.label(h) or h} ({h}): {p}")
-        if not problems:
-            return
-        if skip:
-            self.events.add("-", "", f"Image check warnings ignored by {user or 'local'}: "
-                            + "; ".join(problems[:3]) + (" ..." if len(problems) > 3 else ""), "warn")
-            return
-        shown = "; ".join(problems[:4]) + (f"; and {len(problems) - 4} more" if len(problems) > 4 else "")
-        raise ApiError("Image check: " + shown + ". Fix the selection, or tick 'Ignore image check "
-                       "warnings' to continue anyway.", 409)
-
-    def active_upgrades(self):
-        with self.lock:
-            self._poll_all()
-            return [h for h in self.order if self._upgrade_active(h)]
-
-    def _save_schedule(self):
-        """Pending scheduled upgrades are saved with the site, so a restart can tell which ones
-        were missed. They contain no credentials (those come from the profiles when they run)."""
-        if not self.site_name:
-            return
-        try:
-            tmp = site_schedule_path(self.site_name).with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.schedule), encoding="utf-8")
-            tmp.replace(site_schedule_path(self.site_name))
-        except OSError as exc:
-            print(f"Could not save the scheduled upgrades: {exc}", flush=True)
-
-    def _need_awake(self):
-        """True while an upgrade is running or a scheduled upgrade is waiting."""
-        with self.lock:
-            return bool(self.schedule) or any(self.ops[h]["upgrade"]["state"] in ACTIVE for h in self.order)
-
-    def _awake_changed(self, on, ok):
-        if on:
-            self.events.add("-", "", "Windows is being kept awake (an upgrade is running or a scheduled "
-                                     "upgrade is waiting)" + ("" if ok else " - WARNING: the request failed"), "info")
-        else:
-            self.events.add("-", "", "No upgrade running or scheduled - Windows may sleep again", "info")
-
-    def close(self):
-        self.term_close_all()
-        self.keep_awake.stop()
-        self._stop.set()
-        self.pool.shutdown(wait=False, cancel_futures=True)
-        shutil.rmtree(self.job_tmp, ignore_errors=True)
-
-
-# --------------------------------------------------------------------------- #
-# Web GUI
-# --------------------------------------------------------------------------- #
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NetUpgrade</title>
-<style>
-  /* Cisco Cloud Control style. Light by default, dark follows the OS/browser or the toggle. */
-  :root {
-    --bg:#eef1f8; --bg2:#e4e9f5; --tb:linear-gradient(90deg,#fff,#eef0fb); --tbd:#d6dcec;
-    --pn:#fff; --pn2:#f5f7fc; --bd:#dbe1ee; --tx:#14213d; --mu:#5d6b88;
-    --ac:#2f6fe4; --acs:#e3ecfd; --sel:#e3ecfd;
-    --t-b:#dcecf9; --t-r:#fde3e6; --t-a:#fcefc9; --t-g:#e9edf4; --t-gn:#dff3e6;
-    --c-b:#0b6aa8; --c-r:#c62a3a; --c-a:#9a6a00;
-    --gr:#12834f; --am:#b97500; --rd:#c62a3a; --sh:0 1px 3px #1a2a5014; color-scheme:light;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg:#080d1a; --bg2:#0d1428; --tb:linear-gradient(90deg,#1b2552,#10173a 55%,#0c1230); --tbd:#232d57;
-      --pn:#0f1626; --pn2:#0b1120; --bd:#1d2742; --tx:#e8edf8; --mu:#93a1c0;
-      --ac:#4f86f7; --acs:#16254a; --sel:#1b2a52;
-      --t-b:#1e3b52; --t-r:#3a2129; --t-a:#3b3320; --t-g:#2a3140; --t-gn:#17382a;
-      --c-b:#6cc0f5; --c-r:#ff7b8a; --c-a:#f4c542;
-      --gr:#4ade80; --am:#f4c542; --rd:#ff7b8a; --sh:none; color-scheme:dark;
-    }
-  }
-  :root[data-theme="dark"] {
-    --bg:#080d1a; --bg2:#0d1428; --tb:linear-gradient(90deg,#1b2552,#10173a 55%,#0c1230); --tbd:#232d57;
-    --pn:#0f1626; --pn2:#0b1120; --bd:#1d2742; --tx:#e8edf8; --mu:#93a1c0;
-    --ac:#4f86f7; --acs:#16254a; --sel:#1b2a52;
-    --t-b:#1e3b52; --t-r:#3a2129; --t-a:#3b3320; --t-g:#2a3140; --t-gn:#17382a;
-    --c-b:#6cc0f5; --c-r:#ff7b8a; --c-a:#f4c542;
-    --gr:#4ade80; --am:#f4c542; --rd:#ff7b8a; --sh:none; color-scheme:dark;
-  }
-  * { box-sizing:border-box; }
-  html, body { height:100%; margin:0; }
-  body { background:radial-gradient(1200px 500px at 70% -10%, var(--bg2), var(--bg)); color:var(--tx);
-         font:13px/1.45 "Inter",system-ui,"Segoe UI",Arial,sans-serif;
-         display:flex; flex-direction:column; overflow:hidden; }
-  svg.i { width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round;
-          stroke-linejoin:round; flex:none; }
-  .muted { color:var(--mu); }
-  [data-i] { display:grid; place-items:center; }
-  .sp { flex:1; }
-
-  /* ---- header ---- */
-  header { background:var(--tb); border-bottom:1px solid var(--tbd); display:flex; align-items:center; gap:10px;
-           padding:0 16px; height:56px; flex:none; }
-  .appver { font-size:11px; font-weight:600; opacity:.65; align-self:flex-end; margin-bottom:3px; }
-  .brand { font-size:18px; font-weight:300; display:flex; align-items:center; gap:8px; padding-right:14px;
-           border-right:1px solid var(--tbd); height:32px; white-space:nowrap; }
-  .brand img { width:26px; height:26px; object-fit:contain; flex:none; }
-  .lost { color:var(--rd); font-weight:600; font-size:12px; }
-  .ib { background:none; border:0; color:var(--tx); border-radius:8px; width:36px; height:36px; display:grid;
-        place-items:center; cursor:pointer; }
-  .ib:hover { background:var(--acs); }
-  .mstate { font-size:12px; font-weight:600; padding:5px 13px; border-radius:999px; background:var(--t-a);
-            color:var(--c-a); border:1px solid var(--c-a); white-space:nowrap; }
-  .mdot { width:11px; height:11px; border-radius:50%; background:var(--mu); flex:none; margin-right:-4px; }
-  .mdot.running { background:var(--gr); animation:mon-blink 1.3s ease-in-out infinite; }
-  @keyframes mon-blink { 0% { box-shadow:0 0 0 0 rgba(34,170,90,.65); opacity:1; } 50% { opacity:.45; }
-                         100% { box-shadow:0 0 0 9px rgba(34,170,90,0); opacity:1; } }
-  @media (prefers-reduced-motion:reduce) { .mdot.running { animation:none; } }
-  /* status note: floats over the page (no layout space) and fades out by itself */
-  .mainmsg { position:fixed; right:18px; bottom:18px; z-index:1200; max-width:min(520px,calc(100vw - 36px));
-             margin:0; padding:9px 14px; border-radius:8px; background:var(--pn); border:1px solid var(--bd);
-             box-shadow:0 6px 20px rgba(0,0,0,.25); pointer-events:none; }
-  .mainmsg:has(#msg:empty) { display:none; } .mainmsg .msg { margin:0; }
-  .mstate.running { background:var(--t-gn); color:var(--gr); border-color:var(--gr); }
-
-  /* site badge + dropdown */
-  .badge { display:inline-block; padding:6px 14px; border-radius:999px; font-size:13px; font-weight:500;
-           background:var(--t-g); color:var(--mu); border:1px solid var(--tbd); }
-  .badge.accent { background:var(--acs); color:var(--tx); border-color:var(--ac); }
-  .badge.warn { background:var(--t-a); color:var(--c-a); border-color:var(--c-a); }
-  .site-btn { cursor:pointer; font-family:inherit; }
-  .site-btn::after { content:" \25BE"; }
-  .site-btn:disabled { opacity:.55; cursor:not-allowed; }
-  .site-btn.needed { animation:pulse 1.4s ease-in-out infinite; }
-  .sitemenu { position:relative; display:inline-block; }
-  .site-pop { position:absolute; left:0; top:calc(100% + 8px); z-index:950; min-width:230px; max-width:320px;
-              max-height:300px; overflow-y:auto; background:var(--pn); color:var(--tx); border:1px solid var(--bd);
-              border-radius:10px; padding:4px; box-shadow:0 10px 30px rgba(0,0,0,.25); font-size:13px; }
-  .site-pop[hidden] { display:none; }
-  .notemenu { position:relative; display:inline-block; }
-  .ib .nbadge { position:absolute; top:2px; right:1px; min-width:16px; height:16px; padding:0 4px; border-radius:8px;
-                background:var(--rd); color:#fff; font-size:10px; font-weight:700; line-height:16px; text-align:center; }
-  .ib .nbadge[hidden] { display:none; }
-  .note-pop { position:absolute; right:0; top:calc(100% + 8px); z-index:1300; width:360px; max-width:calc(100vw - 24px);
-              background:var(--pn); color:var(--tx); border:1px solid var(--bd); border-radius:10px;
-              box-shadow:0 10px 30px rgba(0,0,0,.25); font-size:13px; overflow:hidden; }
-  .note-pop[hidden] { display:none; }
-  .note-pop .nh { display:flex; align-items:center; justify-content:space-between; padding:9px 12px; font-weight:700;
-                  border-bottom:1px solid var(--bd); }
-  .note-pop .nh button { background:none; border:0; color:var(--ac); cursor:pointer; font:inherit; font-size:12px; font-weight:600; }
-  .note-pop .nl { max-height:380px; overflow-y:auto; }
-  .note-pop .ni { display:flex; gap:10px; padding:9px 12px; border-bottom:1px solid var(--bd); cursor:pointer; }
-  .note-pop .ni:last-child { border-bottom:0; }
-  .note-pop .ni:hover { background:var(--acs); }
-  .note-pop .ni.unread { background:var(--sel); }
-  .note-pop .ni .ic { flex:0 0 auto; font-size:15px; line-height:1.3; }
-  .note-pop .ni .nt { font-weight:600; }
-  .note-pop .ni .nm { color:var(--mu); font-size:12px; word-break:break-word; margin-top:1px; }
-  .note-pop .ni .tm { color:var(--mu); font-size:11px; margin-top:2px; }
-  .note-pop .none { padding:16px 12px; color:var(--mu); text-align:center; }
-  .site-pop button { display:block; width:100%; text-align:left; background:transparent; color:var(--tx); border:0;
-                     padding:7px 10px; border-radius:7px; font:inherit; cursor:pointer; white-space:nowrap;
-                     overflow:hidden; text-overflow:ellipsis; }
-  .site-pop button:hover { background:var(--acs); }
-  .site-pop button.cur { font-weight:700; color:var(--ac); }
-  .site-pop .none { padding:7px 10px; color:var(--mu); }
-  .site-pop hr { border:0; border-top:1px solid var(--bd); margin:4px 0; }
-  .site-pop .newsite { color:var(--ac); font-weight:600; }
-  .modal { position:fixed; inset:0; z-index:1300; background:rgba(0,0,0,.45); display:flex; align-items:center;
-           justify-content:center; padding:16px; }
-  .modal[hidden] { display:none; }
-  .modal-card { background:var(--pn); border:1px solid var(--bd); border-radius:12px; padding:16px 18px; width:100%;
-                max-width:340px; box-shadow:0 14px 50px rgba(0,0,0,.4); }
-  .modal-card h2 { font-size:15px; margin:0 0 6px; }
-
-  /* ---- buttons and inputs ---- */
-  .btn { background:var(--pn2); border:1px solid var(--bd); color:var(--tx); border-radius:7px; padding:6px 12px;
-         cursor:pointer; font:inherit; text-decoration:none; display:inline-block; text-align:center; }
-  .btn:hover:not(:disabled) { border-color:var(--ac); }
-  .btn.p { background:var(--ac); border-color:var(--ac); color:#fff; font-weight:600; }
-  .btn.sm { padding:4px 10px; font-size:12px; }
-  .btn.on { border-color:var(--ac); color:var(--ac); }
-  .btn:disabled { opacity:.45; cursor:not-allowed; }
-  label { display:block; font-size:11px; color:var(--mu); margin:10px 0 4px; }
-  input[type=text], input[type=password], input[type=datetime-local], textarea, select {
-    width:100%; background:var(--pn); border:1px solid var(--bd); color:var(--tx); border-radius:6px;
-    padding:7px 9px; font:inherit; }
-  input[type=text] + input[type=text] { margin-top:6px; }
-  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--ac); box-shadow:0 0 0 2px var(--acs); }
-  input[type=file] { width:100%; font-size:11px; color:var(--mu); }
-  input[type=checkbox] { accent-color:var(--ac); width:15px; height:15px; cursor:pointer; margin:0; }
-  textarea { height:80px; resize:vertical; font-family:ui-monospace,Consolas,monospace; font-size:11.5px; }
-  a.lnk { color:var(--ac); text-decoration:underline; cursor:pointer; font-size:11px; }
-  a.lnk:hover { opacity:.8; }
-  .hint, .note { font-size:11px; color:var(--mu); margin-top:6px; }
-  .hint.bad { color:var(--rd); }
-  .msg { font-size:12px; font-weight:600; margin:2px 0 6px; }
-  .msg:empty { display:none; }
-  .side .body > .msg { margin:12px 0 0; overflow-wrap:anywhere; }          /* status lines sit at the bottom of each section */
-  .protobox { display:flex; align-items:center; gap:12px; flex-wrap:nowrap; margin-top:2px; }
-  .protobox .ropt { display:flex; align-items:center; gap:6px; margin:0; font-size:12px; color:var(--tx); cursor:pointer; }
-  input[type=radio] { accent-color:var(--ac); width:15px; height:15px; cursor:pointer; margin:0; }
-  .protobox .portwrap { display:flex; align-items:center; gap:6px; margin-left:auto; flex:none; white-space:nowrap; }
-  .protobox .portwrap label { margin:0; }
-  .protobox .portwrap input[type=text] { width:56px; text-align:center; padding:5px 6px; }
-  .msg.ok { color:var(--gr); } .msg.err { color:var(--rd); }
-  .row { display:flex; gap:6px; margin-top:10px; }
-  .row .btn { flex:1; padding:6px 8px; white-space:nowrap; }
-  .chk { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--tx); margin:12px 0 0; cursor:pointer; }
-  hr.sep { border:0; border-top:1px solid var(--bd); margin:14px 0 2px; }
-  /* help tips: a small ? (how it works) or ! (important) icon; the text shows on hover, focus or click */
-  .tip { display:inline-grid; place-items:center; vertical-align:middle; width:16px; height:16px; margin-left:6px; flex:none; padding:0;
-         border-radius:50%; border:1.5px solid var(--ac); color:var(--ac); background:transparent; cursor:help; user-select:none;
-         font:700 11px/1 system-ui,Segoe UI,sans-serif; text-transform:none; letter-spacing:0; }
-  .tip.w { border-color:var(--am); color:var(--am); }
-  .tip.bad { border-color:var(--rd); color:var(--rd); }
-  .tip:hover, .tip:focus-visible, .tip.on { background:var(--ac); color:var(--pn); }
-  .tip.w:hover, .tip.w:focus-visible, .tip.w.on { background:var(--am); }
-  .tip.bad:hover, .tip.bad:focus-visible, .tip.bad.on { background:var(--rd); }
-  .row .tip { align-self:center; margin-left:2px; }
-  .dr-term .th .tip { border-color:#8fb0ff; color:#8fb0ff; margin-left:0; }
-  .dr-term .th .tip:hover, .dr-term .th .tip.on { background:#8fb0ff; color:#151c33; }
-  #tip-pop { position:fixed; z-index:2000; max-width:280px; padding:9px 12px; border-radius:8px; background:var(--pn); color:var(--tx);
-             border:1px solid var(--bd); border-left:3px solid var(--ac); box-shadow:0 8px 28px #00000040; font-size:12px; line-height:1.45;
-             font-weight:400; pointer-events:none; white-space:pre-line; }
-  #tip-pop.w { border-left-color:var(--am); } #tip-pop.bad { border-left-color:var(--rd); }
-  #tip-pop[hidden] { display:none; }
-  .dr-term .tn:empty { display:none; }
-  :focus-visible { outline:2px solid var(--ac); outline-offset:1px; }
-
-  /* ---- layout: sidebar + main ---- */
-  .app { flex:1; display:flex; min-height:0; }
-  .side { flex:none; display:flex; flex-direction:column; overflow:auto; border-right:1px solid var(--bd);
-          background:var(--pn2); transition:width .15s; }
-  .side.wide { width:266px; }
-  .side.narrow { width:62px; align-items:center; padding:8px 0; gap:4px; }
-  .sh { display:flex; align-items:center; gap:12px; padding:14px 14px 10px; font-size:17px; font-weight:600; }
-  .cb { background:none; border:0; color:var(--tx); cursor:pointer; width:34px; height:34px; border-radius:8px;
-        display:grid; place-items:center; flex:none; }
-  .cb:hover { background:var(--acs); }
-  .sec { margin:2px 8px; }
-  .sec > h3 { margin:0; padding:11px 12px; font-size:14px; font-weight:500; cursor:pointer; display:flex;
-              align-items:center; gap:12px; border-radius:8px; color:var(--mu); user-select:none; }
-  .sec > h3:hover { background:var(--acs); color:var(--tx); }
-  .sec.o > h3 { background:var(--sel); color:var(--tx); box-shadow:3px 0 0 var(--ac) inset; }
-  .sec > h3 .ch { margin-left:auto; transition:transform .15s; display:grid; }
-  .sec.o > h3 .ch { transform:rotate(180deg); }
-  .sec .body { display:none; padding:4px 12px 14px; }
-  .sec.o .body { display:block; }
-  .side.narrow .sh { padding:0; }
-  .side.narrow .shl, .side.narrow .sec > h3 .lbl, .side.narrow .sec > h3 .ch, .side.narrow .sec .body { display:none !important; }
-  .side.narrow .sec { margin:0; }
-  .side.narrow .sec > h3 { width:42px; height:42px; padding:0; justify-content:center; border-radius:10px; }
-  .side.narrow .sec.o > h3 { box-shadow:none; }
-  #dashboard.nosite .side .sec { opacity:.45; pointer-events:none; }
-
-  main { flex:1; min-width:0; display:flex; flex-direction:column; gap:12px; padding:12px 16px; overflow:auto; }
-  .card { background:var(--pn); border:1px solid var(--bd); border-radius:10px; display:flex; flex-direction:column;
-          min-height:0; box-shadow:var(--sh); overflow:hidden; }
-  .card > h4 { margin:0; padding:9px 14px; font-size:14px; font-weight:600; border-bottom:1px solid var(--bd);
-               display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-  .card > h4 .a { margin-left:auto; display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-weight:400;
-                  font-size:12px; color:var(--mu); }
-  .fl { display:flex; gap:6px; margin-left:6px; }
-  .col-pop { position:fixed; z-index:1250; background:var(--pn); border:1px solid var(--bd); border-radius:10px;
-             box-shadow:var(--sh); padding:8px 6px; min-width:190px; font-size:12.5px; }
-  .col-pop[hidden] { display:none; }
-  .col-pop .cp-h { padding:2px 8px 6px; color:var(--mu); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
-  .col-pop label.ci { display:flex; align-items:center; gap:8px; margin:0; padding:5px 8px; border-radius:6px;
-                      font-size:12.5px; color:var(--tx); cursor:pointer; }
-  .col-pop label.ci:hover { background:var(--acs); }
-  .col-pop .cp-f { padding:6px 8px 2px; border-top:1px solid var(--bd); margin-top:4px; }
-  table.hc-platform .c-platform, table.hc-status .c-status, table.hc-creds .c-creds, table.hc-ready .c-ready,
-  table.hc-version .c-version, table.hc-boot .c-boot, table.hc-backup .c-backup, table.hc-stage .c-stage, table.hc-upgrade .c-upgrade,
-  table.hc-post .c-post, table.hc-recent .c-recent { display:none; }
-
-  /* status bar (replaces the old progress card + toolbar link) */
-  .fbar { position:relative; display:flex; align-items:center; gap:14px; background:var(--pn); border:1px solid var(--bd);
-          border-radius:10px; padding:10px 14px; box-shadow:var(--sh); overflow:hidden; flex:none; }
-  .fbar .ftext { font-weight:600; white-space:nowrap; }
-  .fbar #p-cycles { color:var(--mu); font-weight:400; margin-left:10px; }
-  .fbar #meta { color:var(--mu); font-size:12px; white-space:nowrap; }
-  .fbar .msg { margin:0; max-width:40%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .pbar { position:absolute; left:0; right:0; bottom:0; height:3px; background:transparent; }
-  .pbar > div { height:100%; width:0; background:var(--ac); transition:width .5s; }
-
-  /* summary cards */
-  .wg { display:grid; grid-template-columns:repeat(2, 1fr); gap:12px; flex:none; }
-  .tl { display:grid; grid-template-columns:repeat(auto-fit, minmax(70px, 1fr)); gap:10px; padding:12px 14px; }
-  .t { border-radius:6px; padding:8px 6px; text-align:center; background:var(--t-g); }
-  .t b { display:block; font-size:22px; font-weight:600; line-height:1.2; }
-  .t span { font-size:12px; color:var(--mu); }
-  .t.b { background:var(--t-b); } .t.r { background:var(--t-r); } .t.a { background:var(--t-a); }
-  .t.gn { background:var(--t-gn); } .t.g { background:var(--t-g); }
-
-  /* devices table: rows scroll inside the card */
-  .work { flex:1; min-height:280px; display:flex; flex-direction:column; gap:12px; }
-  .card.tb { flex:1; }
-  .card.max { position:fixed; inset:10px; z-index:1000; height:auto; box-shadow:0 14px 60px rgba(0,0,0,.45); }
-  .card.max .sc { max-height:none; }
-  body.card-max { overflow:hidden; }
-  .card > h4 .ib.mx { width:26px; height:26px; margin:-3px -6px -3px 0; flex:0 0 auto; }
-  .card.e > h4 .ib.mx { margin-left:auto; }
-  .card > h4 .ib.mx .i { width:16px; height:16px; }
-  .card.e { height:128px; flex:none; }
-  .card.e.max { height:auto; }
-  .sc { overflow:auto; flex:1; min-height:0; }
-  table { width:100%; border-collapse:collapse; min-width:900px; }
-  th { font-size:11px; color:var(--mu); text-align:left; padding:9px 6px; position:sticky; top:0; z-index:1;
-       background:var(--pn2); font-weight:600; white-space:normal; line-height:1.25; }
-  td { padding:9px 6px; border-top:1px solid var(--bd); white-space:nowrap; vertical-align:middle; }
-  td.ck, th.ck { width:34px; padding-right:0; padding-left:14px; }
-  tr:hover td { background:var(--pn2); }
-  tr.sel td { background:var(--sel); }
-  .host { font-weight:600; }
-  th.rc, td.rc { width:196px; min-width:196px; max-width:196px; }
-  .hist { display:flex; gap:2px; align-items:center; width:178px; }
-  .hist i { display:block; width:3px; height:16px; border-radius:1px; background:var(--gr); flex:none; }
-  .hist i.f { background:var(--rd); }
-  .hist i.e { background:var(--t-g); }
-  .label { color:var(--mu); font-size:12px; }
-  .clip { display:block; max-width:112px; overflow:hidden; text-overflow:ellipsis; }
-  .clink { font-size:11px; color:var(--ac); text-decoration:none; margin-left:6px; font-weight:600; }
-  .clink:hover { text-decoration:underline; }
-
-  .pill { display:inline-block; min-width:56px; text-align:center; padding:2px 8px; border-radius:999px;
-          font-size:11px; font-weight:700; }
-  .pill.UP { background:var(--t-b); color:var(--c-b); }
-  .pill.OK { background:var(--t-gn); color:var(--gr); }
-  .pill.DOWN { background:var(--t-r); color:var(--c-r); }
-  .pill.PENDING { background:var(--t-g); color:var(--mu); }
-  .pill.RUN { background:var(--t-a); color:var(--c-a); animation:pulse 1.4s ease-in-out infinite; }
-  .pill.WARN, .pill.CHECK { background:var(--t-a); color:var(--c-a); box-shadow:inset 0 0 0 1px var(--c-a); }
-  @keyframes pulse { 50% { opacity:.55; } }
-  @media (prefers-reduced-motion: reduce) { .pill.RUN, .site-btn.needed { animation:none; } }
-
-  /* events */
-  .ev { padding:6px 14px; overflow:auto; flex:1; font-size:12px; }
-  .ev > div { padding:3px 0; color:var(--mu); }
-  .ev b { color:var(--tx); }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--mu); }
-  .dot.ok { background:var(--gr); } .dot.bad { background:var(--rd); } .dot.warn { background:var(--am); }
-
-  /* ---- device drawer: opens on the right when a switch name is clicked ---- */
-  :root { --dw: 470px; }
-  .devlink { display:block; color:inherit; text-decoration:none; cursor:pointer; }
-  .devlink:hover .host { color:var(--ac); text-decoration:underline; }
-  .devlink:focus-visible { outline:2px solid var(--ac); outline-offset:2px; border-radius:4px; }
-  tr.dopen td { background:var(--acs); }
-  tr.dopen td:first-child + td { box-shadow:inset 3px 0 0 var(--ac); }
-  body.drawer-open #dashboard { margin-right:var(--dw); }
-  body.drawer-open #toasts { right:calc(var(--dw) + 14px); }
-  .drawer { position:fixed; top:56px; right:0; bottom:0; width:var(--dw); z-index:1000; background:var(--pn);
-            border-left:1px solid var(--bd); box-shadow:-8px 0 28px rgba(0,0,0,.14); display:flex; flex-direction:column; }
-  .drawer[hidden] { display:none; }
-  @media (max-width:1399px) { body.drawer-open #dashboard { margin-right:0; } }   /* narrower screens: the drawer overlays instead of squeezing the table */
-  @media (max-width:1000px) {
-    body.drawer-open #toasts { right:14px; }
-    .drawer { width:100vw; max-width:100vw; }
-  }
-  .dr-head { display:flex; align-items:center; gap:11px; padding:14px 12px 10px 14px; flex:none; }
-  .dr-ic { width:42px; height:42px; border-radius:50%; background:var(--acs); color:var(--ac); display:grid; place-items:center; flex:none; }
-  .dr-title { min-width:0; flex:1; }
-  .dr-name { font-size:16px; font-weight:700; display:flex; align-items:center; gap:8px; flex-wrap:wrap; overflow-wrap:anywhere; }
-  .dr-sub { color:var(--mu); font-size:12px; margin-top:2px; overflow-wrap:anywhere; }
-  .dr-tabs { display:flex; flex-wrap:wrap; justify-content:space-between; gap:0; padding:0 8px; border-bottom:1px solid var(--bd); flex:none; }
-  .dr-tabs button { background:none; border:0; border-bottom:2px solid transparent; color:var(--mu); padding:9px 5px; margin-bottom:-1px;
-                    font:inherit; font-size:12.5px; cursor:pointer; white-space:nowrap; }
-  .dr-tabs button:hover { color:var(--tx); }
-  .dr-tabs button.on { color:var(--ac); border-bottom-color:var(--ac); font-weight:600; }
-  .dr-tabs .n { display:inline-block; min-width:17px; padding:0 4px; margin-left:3px; border-radius:9px; background:var(--t-g); color:var(--mu);
-                font-size:10.5px; line-height:17px; text-align:center; font-weight:600; }
-  .dr-body { flex:1; overflow-y:auto; padding:12px 14px 22px; }
-  .dr-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:14px; }
-  .dr-card { border:1px solid var(--bd); border-radius:8px; padding:9px 11px; background:var(--pn2); min-width:0; }
-  .dr-card .k { font-size:11px; color:var(--mu); }
-  .dr-card .v { font-size:15px; font-weight:700; margin-top:3px; overflow-wrap:anywhere; }
-  .dr-card .s { font-size:11px; color:var(--mu); margin-top:3px; overflow-wrap:anywhere; }
-  .dr-card .s.bad { color:var(--rd); }
-  .dr-sec { margin:0 0 16px; }
-  .dr-fold { border:1px solid var(--bd); border-radius:8px; padding:0 11px; }
-  .dr-fold > h5 { margin:0; padding:9px 0; }
-  .dr-fold.open > h5 { border-bottom:1px solid var(--bd); margin-bottom:8px; }
-  .fold-btn { flex:1; min-width:0; display:flex; align-items:center; gap:6px; background:none; border:0; padding:0; color:inherit;
-              font:inherit; font-weight:700; text-align:left; cursor:pointer; }
-  .fold-btn:focus-visible { outline:2px solid var(--ac); outline-offset:3px; border-radius:4px; }
-  .fold-btn .chev { display:inline-grid; transition:transform .15s; color:var(--mu); order:2; margin-left:auto; }
-  .dr-fold.open .chev { transform:rotate(180deg); }
-  .dr-fold > h5 .sp { display:none; }
-  .dr-fold > h5 .pill { order:1; }
-  .dr-fold > h5 { display:flex; }
-  .fold-body { padding-bottom:8px; }
-  .dr-sec > h5 { margin:0 0 6px; font-size:13px; font-weight:700; display:flex; align-items:center; gap:8px; }
-  .dr-sec > h5 .sp { flex:1; }
-  .dr-sec > h5 .btn { font-weight:500; }
-  .dr-kv, .cm { min-width:0; }      /* the page's global table { min-width:900px } must not apply here */
-  .dr-kv { width:100%; border-collapse:collapse; font-size:12.5px; }
-  .dr-kv td { padding:5px 0; border-top:0; border-bottom:1px solid var(--bd); vertical-align:top; white-space:normal; }
-  .dr-kv td:first-child { color:var(--mu); width:40%; padding-right:10px; }
-  .dr-kv td:last-child { text-align:right; overflow-wrap:anywhere; }
-  .dr-note { font-size:11.5px; color:var(--mu); margin-top:6px; }
-  .dr-empty { color:var(--mu); font-size:12.5px; padding:6px 0; }
-  .dr-banner { border-radius:8px; padding:8px 11px; font-weight:600; font-size:12.5px; margin-bottom:4px; }
-  .dr-banner.ok { background:var(--t-gn); color:var(--gr); }
-  .dr-banner.warn { background:var(--t-a); color:var(--c-a); }
-  .dr-banner.bad { background:var(--t-r); color:var(--c-r); }
-  .steps { display:flex; align-items:flex-start; margin:4px 0 12px; }
-  .step { flex:1; display:flex; flex-direction:column; align-items:center; position:relative; font-size:10.5px; color:var(--mu); text-align:center; }
-  .step .c { width:24px; height:24px; border-radius:50%; display:grid; place-items:center; font-size:11.5px; font-weight:700;
-             background:var(--t-g); color:var(--mu); z-index:1; margin-bottom:4px; }
-  .step::before { content:""; position:absolute; top:11px; left:-50%; right:50%; height:2px; background:var(--bd); }
-  .step:first-child::before { display:none; }
-  .step.done .c { background:var(--gr); color:#fff; }
-  .step.done::before { background:var(--gr); }
-  .step.warn .c { background:var(--am); color:#fff; }
-  .step.warn::before { background:var(--am); }
-  .step.failed .c { background:var(--rd); color:#fff; }
-  .step.active .c { background:var(--ac); color:#fff; animation:pulse 1.4s ease-in-out infinite; }
-  .step.done, .step.warn, .step.failed, .step.active { color:var(--tx); }
-  .step.skip { opacity:.55; }
-  .dr-bar { height:6px; border-radius:3px; background:var(--t-g); overflow:hidden; flex:1; }
-  .dr-bar > i { display:block; height:100%; background:var(--ac); transition:width .4s; }
-  .dr-barrow { display:flex; align-items:center; gap:10px; font-size:12px; }
-  .dr-ev { display:flex; align-items:flex-start; gap:6px; padding:5px 0; border-bottom:1px solid var(--bd); font-size:12.5px; }
-  .dr-ev .t { margin-left:auto; color:var(--mu); font-size:11px; white-space:nowrap; padding-left:8px; }
-  .dr-ev .x { min-width:0; overflow-wrap:anywhere; }
-  .dr-ev .dot { margin-top:5px; flex:none; }
-  .cm { width:100%; border-collapse:collapse; font-size:12px; }
-  .cm td { padding:6px 4px; border-top:0; border-bottom:1px solid var(--bd); vertical-align:top; white-space:normal; }
-  .cm code { font:11.5px ui-monospace,Consolas,"Courier New",monospace; overflow-wrap:anywhere; }
-  .cm .w { color:var(--mu); font-size:11px; white-space:nowrap; }
-  .cm td:first-child { width:88px; } .cm td:last-child { width:22px; text-align:right; }
-  .cm .ok { color:var(--gr); font-weight:700; } .cm .no { color:var(--rd); font-weight:700; }
-  .src { display:inline-block; padding:1px 7px; border-radius:999px; background:var(--acs); color:var(--ac); font-size:10.5px; font-weight:600; white-space:nowrap; }
-  .chips { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:8px; }
-  .chips button { background:var(--pn2); border:1px solid var(--bd); color:var(--tx); border-radius:999px; padding:3px 10px; font:inherit; font-size:11.5px; cursor:pointer; }
-  .chips button.on { border-color:var(--ac); color:var(--ac); font-weight:600; background:var(--acs); }
-  .fl-row { display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid var(--bd); font-size:12px; }
-  .fl-row .nm { flex:1; min-width:0; overflow-wrap:anywhere; }
-  .fl-row .nm small { display:block; color:var(--mu); font-size:11px; }
-  .fl-row .sz { color:var(--mu); font-size:11px; white-space:nowrap; }
-  .dr-run { border:1px solid var(--bd); border-radius:8px; margin-bottom:8px; overflow:hidden; }
-  .dr-run > .rh { display:flex; gap:8px; align-items:center; padding:7px 10px; background:var(--pn2); font-weight:600; font-size:12.5px; }
-  .dr-run > .rh span.m { margin-left:auto; color:var(--mu); font-weight:400; font-size:11px; }
-  .dr-run .fl-row { padding:6px 10px; }
-  .dr-run .fl-row:last-child { border-bottom:0; }
-  .hrow { padding:7px 0; border-bottom:1px solid var(--bd); font-size:12px; }
-  .hrow .a { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
-  .hrow .b { color:var(--mu); font-size:11.5px; margin-top:2px; overflow-wrap:anywhere; }
-  .dr-view { position:absolute; inset:0; background:var(--pn); display:flex; flex-direction:column; z-index:3; }
-  .dr-view[hidden] { display:none; }
-  .dr-view .vh { display:flex; align-items:center; gap:8px; padding:10px 12px; border-bottom:1px solid var(--bd); font-weight:600; font-size:12.5px; }
-  .dr-view .vh .nm { flex:1; min-width:0; overflow-wrap:anywhere; }
-  .dr-view pre { margin:0; padding:10px 12px 56px; flex:1; min-height:0; overflow:auto; font:11.5px/1.45 ui-monospace,Consolas,"Courier New",monospace; background:var(--pn2); white-space:pre; }
-  .dr-view .vn { padding:6px 12px; font-size:11.5px; color:var(--c-a); background:var(--t-a); }
-
-  /* ---- device drawer > Console (interactive SSH) ---- */
-  .dr-term { flex:1; min-height:0; display:flex; flex-direction:column; margin:10px 14px 14px; background:#0b1020; color:#d6e2ff;
-             border:1px solid #2a3558; border-radius:10px; overflow:hidden; }
-  .dr-term[hidden] { display:none; }
-  .dr-term .th { display:flex; align-items:center; gap:6px; padding:6px 8px 6px 11px; background:#151c33; flex:none; flex-wrap:wrap; }
-  .dr-term .tt { font-weight:600; font-size:12px; white-space:nowrap; display:none; }
-  .dr-term.max .tt { display:inline; }
-  .dr-term .tst { font-size:11px; padding:1px 8px; border-radius:999px; background:#2a3558; color:#d6e2ff; white-space:nowrap; }
-  .dr-term .tst.on { background:#17382a; color:#4ade80; }
-  .dr-term .tst.busy { background:#3b3320; color:#f4c542; }
-  .dr-term .sp { flex:1; }
-  .dr-term .tb { background:transparent; border:1px solid #3b4a7a; color:#d6e2ff; border-radius:6px; padding:3px 9px; font:inherit; font-size:11.5px; cursor:pointer; }
-  .dr-term .tb:hover:not(:disabled) { background:rgba(255,255,255,.12); }
-  .dr-term .tb:disabled { opacity:.4; cursor:not-allowed; }
-  .dr-term .tb.go { background:#2f6fe4; border-color:#2f6fe4; color:#fff; font-weight:600; }
-  .dr-term .tout { flex:1; min-height:0; margin:0; padding:8px 11px; overflow:auto; white-space:pre-wrap; word-break:break-word;
-                   font:12px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
-  .dr-term .tin { display:flex; align-items:center; gap:7px; padding:6px 11px; border-top:1px solid #2a3558; background:#0e1429; flex:none; }
-  .dr-term .tin span { color:#4ade80; font:12px ui-monospace,Consolas,monospace; }
-  .dr-term .tin input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:#f3f6ff; caret-color:#4ade80;
-                        font:12.5px ui-monospace,Consolas,"Courier New",monospace; padding:3px 0; }
-  .dr-term .tin input:disabled { opacity:.45; }
-  .dr-term .tn { padding:5px 11px; font-size:10.5px; color:#93a1c0; border-top:1px solid #2a3558; flex:none; }
-  .dr-term.max { position:fixed; inset:28px; margin:0; z-index:1150; box-shadow:0 14px 60px rgba(0,0,0,.55); }
-  .dr-term.max .tout { font-size:13.5px; }
-  #dr-term-bd { position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:1140; }
-  #dr-term-bd[hidden] { display:none; }
-
-
-  .dr-term .tin[hidden], .dr-term .tb[hidden] { display:none; }
-  .dr-term .tn { white-space:pre-wrap; word-break:break-word; }
-
-  /* ---- device list: search + filters ---- */
-  .dev-tools { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid var(--bd); }
-  .dev-tools .st-search { flex:1 1 220px; min-width:180px; }
-  .dev-tools select { width:auto; max-width:170px; padding:5px 8px; font-size:12px; }
-  .dev-tools .dev-shown { font-size:11.5px; color:var(--mu); white-space:nowrap; }
-
-  /* ---- completion pop-ups ---- */
-  #toasts { position:fixed; top:66px; right:14px; z-index:1200; display:flex; flex-direction:column; gap:8px;
-            width:min(370px, calc(100vw - 28px)); pointer-events:none; }
-  .toast { pointer-events:auto; cursor:pointer; background:var(--pn); color:var(--tx); border:1px solid var(--bd);
-           border-left:5px solid var(--gr); border-radius:10px; padding:10px 34px 10px 12px; position:relative;
-           box-shadow:0 10px 30px rgba(0,0,0,.28); animation:toast-in .25s ease-out; }
-  .toast.warn { border-left-color:var(--am); } .toast.bad { border-left-color:var(--rd); }
-  .toast .tt { font-weight:700; } .toast .tmsg { color:var(--mu); font-size:12px; margin-top:2px; word-break:break-word; }
-  .toast .tx { position:absolute; top:6px; right:6px; border:0; background:transparent; color:var(--mu);
-               cursor:pointer; font-size:14px; width:22px; height:22px; border-radius:6px; }
-  .toast .tx:hover { background:var(--t-g); }
-  @keyframes toast-in { from { transform:translateX(40px); opacity:0; } }
-  @media (prefers-reduced-motion: reduce) { .toast { animation:none; } }
-
-  /* ---- Home / Storage tabs (header) ---- */
-  .app[hidden], .btn[hidden], .chk[hidden] { display:none; }
-  .tabs { display:flex; align-self:stretch; gap:2px; margin-left:8px; }
-  .tab { background:none; border:0; border-bottom:3px solid transparent; border-top:3px solid transparent;
-         color:var(--mu); font:inherit; font-size:14px; font-weight:500; padding:0 16px; cursor:pointer;
-         display:flex; align-items:center; gap:8px; white-space:nowrap; }
-  .tab:hover { color:var(--tx); background:var(--acs); }
-  .tab.on { color:var(--tx); font-weight:600; border-bottom-color:var(--ac); }
-
-  /* ---- Diagram page ---- */
-  /* ---- Diagnosis tab ---- */
-  #diagnosis main { overflow:auto; }
-  .dx-card { flex:1; min-height:0; display:flex; flex-direction:column; }
-  .dx-grid { display:grid; grid-template-columns:290px minmax(0,1fr); flex:1; min-height:0; }
-  .dx-pick { border-right:1px solid var(--bd); padding:0 14px 14px; overflow:auto; }
-  .dx-work { padding:14px 18px 22px; overflow:auto; min-width:0; }
-  .dx-intro { font-size:13px; color:var(--mu); margin:0 0 10px; line-height:1.5; }
-  .dx-work textarea { width:100%; height:170px; box-sizing:border-box; }
-  .dx-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:10px 0 4px; }
-  .dx-row label { margin:0; font-size:13px; }
-  .dx-res { margin-top:14px; display:flex; flex-direction:column; gap:10px; }
-  .dx-sw { border:1px solid var(--bd); border-radius:10px; background:var(--pn); overflow:hidden; }
-  .dx-sw > .hd { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:9px 12px; border-bottom:1px solid var(--bd); }
-  .dx-sw > .hd b { font-size:14px; }
-  .dx-sw .bd { padding:10px 12px; font-size:13px; }
-  .dx-sw .sp { margin-left:auto; display:flex; gap:6px; flex-wrap:wrap; }
-  .dx-v { display:inline-block; padding:2px 10px; border-radius:999px; font-size:11.5px; font-weight:700; border:1px solid currentColor; }
-  .dx-v.green { color:var(--gr); background:var(--t-gn); } .dx-v.amber { color:var(--c-a); background:var(--t-a); } .dx-v.red { color:var(--c-r); background:var(--t-r); }
-  .dx-v.run { color:var(--mu); } .dx-v.bad { color:var(--c-r); background:var(--t-r); }
-  .dx-note { font-size:12px; color:var(--mu); margin:4px 0; }
-  .dx-f { border:1px solid var(--bd); border-radius:8px; margin:6px 0; background:var(--pn2); }
-  .dx-f > summary { cursor:pointer; padding:6px 10px; font-weight:600; display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
-  .dx-f > summary .m { font-weight:400; color:var(--mu); font-size:12px; }
-  .dx-f .fb { padding:2px 12px 10px; }
-  .dx-lv { font-size:10.5px; font-weight:700; padding:1px 7px; border-radius:6px; border:1px solid currentColor; }
-  .dx-lv.crit { color:var(--c-r); } .dx-lv.warn { color:var(--c-a); } .dx-lv.info { color:var(--c-b); }
-  .dx-ev { margin:6px 0 0; padding:6px 8px; background:var(--pn); border:1px solid var(--bd); border-radius:6px; font:11.5px ui-monospace,Consolas,monospace; white-space:pre-wrap; word-break:break-word; }
-  .dx-top { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
-  .dx-top td { padding:3px 6px; border-top:1px solid var(--bd); vertical-align:top; }
-  .dx-top td:first-child { width:48px; text-align:right; color:var(--mu); }
-  .dx-ai { margin-top:10px; padding:10px 12px; border:1px dashed var(--ac); border-radius:8px; background:var(--acs); }
-  .dx-ai pre { margin:6px 0 0; white-space:pre-wrap; word-break:break-word; font:12.5px/1.5 inherit; font-family:inherit; }
-  .dx-line { display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--pn); font-size:13px; }
-  .dx-line .sp { margin-left:auto; display:flex; gap:6px; }
-  .dx-rep { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px; padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--pn); font-size:13px; }
-  .dx-rep[hidden] { display:none; }
-  .dx-rep .sp { margin-left:auto; display:flex; gap:6px; }
-  @media (max-width: 900px) { .dx-grid { grid-template-columns:1fr; } .dx-pick { border-right:0; border-bottom:1px solid var(--bd); max-height:260px; } }
-  .dg-side { width:300px; }
-  .dg-sec { padding:0 14px 14px; }
-  .dg-actions { position:sticky; top:0; z-index:3; display:flex; gap:8px; margin:8px -14px 0; padding:8px 14px; background:var(--pn2); border-bottom:1px solid var(--bd); }
-  .dg-actions .btn { flex:1; min-width:0; justify-content:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  #diagram main { overflow:hidden; }
-  .dg-list { display:flex; flex-direction:column; gap:2px; margin:10px 0 4px; }
-  .dg-dev { display:flex; align-items:flex-start; gap:9px; padding:7px 8px; border-radius:8px; cursor:pointer; margin:0; font-size:13px; color:var(--tx); }
-  .dg-dev:hover { background:var(--acs); }
-  .dg-dev.off { opacity:.62; cursor:not-allowed; }
-  .dg-dev input { flex:none; margin-top:3px; }
-  .dg-dev .meta { min-width:0; flex:1; }
-  .dg-dev .t1 { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .dg-dev .t2 { font-size:11.5px; color:var(--mu); word-break:break-word; }
-  .dg-dev .t2.bad { color:var(--rd); } .dg-dev .t2.ok { color:var(--gr); } .dg-dev .t2.warn { color:var(--c-a); }
-  .dg-card { flex:1; min-height:0; }
-  .dg-banner { margin:10px 14px 0; padding:9px 12px; border-radius:8px; background:var(--t-a); color:var(--c-a); border:1px solid var(--c-a); font-size:13px; font-weight:600; }
-  .dg-banner[hidden] { display:none; }
-  .dg-wrap { position:relative; flex:1; min-height:380px; overflow:hidden; background:var(--pn); cursor:grab; touch-action:none; user-select:none; -webkit-user-select:none; }
-  .dg-wrap.panning { cursor:grabbing; }
-  #dg-svg { position:absolute; inset:0; width:100%; height:100%; display:block; }
-  .dg-ico { display:inline-grid; place-items:center; padding:5px 8px; }
-  .dg-ico .i { width:15px; height:15px; }
-  .dg-hint { position:absolute; left:12px; bottom:10px; font-size:11px; color:var(--mu); background:var(--pn); border:1px solid var(--bd);
-             border-radius:999px; padding:2px 10px; pointer-events:none; opacity:.9; z-index:1; }
-  .dg-hint:empty { display:none; }
-  /* Full screen: the whole Topology card (toolbar, canvas, legend, details panel) fills the screen */
-  .dg-card:fullscreen { width:100vw; height:100vh; border-radius:0; border:0; background:var(--pn); }
-  .dg-card:fullscreen .dg-wrap { min-height:0; }
-  .dg-card.dg-full { position:fixed; inset:0; z-index:500; border-radius:0; border:0; background:var(--pn); }
-  .dg-card.dg-full .dg-wrap { min-height:0; }
-  .dg-empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; padding:24px; color:var(--mu); font-size:14px; pointer-events:none; }
-  .dg-empty:empty { display:none; }
-  .dg-legend { display:flex; flex-wrap:wrap; gap:6px 16px; padding:8px 14px; border-top:1px solid var(--bd); font-size:11.5px; color:var(--mu); align-items:center; }
-  .dg-legend .dot { margin-right:5px; }
-  .dg-legend .lg-run, .dg-legend .lg-done, .dg-legend .lg-fail, .dg-legend .lg-q, .dg-legend .lg-hold { padding:1px 8px; border-radius:999px; font-weight:600; }
-  .dg-legend .lg-run { background:var(--t-a); color:var(--c-a); } .dg-legend .lg-done { background:var(--t-gn); color:var(--gr); }
-  .dg-legend .lg-fail { background:var(--t-r); color:var(--c-r); } .dg-legend .lg-q { background:var(--t-b); color:var(--c-b); }
-  .dg-legend .lg-hold { border:1px dashed var(--am); color:var(--c-a); }
-  .dg-n { cursor:grab; outline:none; }
-  .dg-n:active { cursor:grabbing; }
-  .dg-n .bx { fill:var(--pn2); stroke:var(--bd); stroke-width:2; }
-  .dg-n.s-UP .bx { stroke:var(--gr); } .dg-n.s-DOWN .bx { stroke:var(--rd); } .dg-n.s-PENDING .bx { stroke:var(--mu); }
-  .dg-n.ext .bx { stroke:var(--mu); stroke-dasharray:5 4; }
-  .dg-n .sd { fill:var(--mu); } .dg-n.s-UP .sd { fill:var(--gr); } .dg-n.s-DOWN .sd { fill:var(--rd); }
-  .dg-n text { fill:var(--tx); font-size:12px; pointer-events:none; }
-  .dg-n .nm { font-weight:700; }
-  .dg-n .ipt { fill:var(--mu); font-size:10.5px; }
-  .dg-n .stt { font-size:10.5px; font-weight:700; fill:var(--mu); }
-  .dg-n.s-UP .stt { fill:var(--gr); } .dg-n.s-DOWN .stt { fill:var(--rd); }
-  .dg-n .strip rect { fill:var(--t-g); }
-  .dg-n .strip text { font-size:10.5px; font-weight:600; fill:var(--mu); }
-  .dg-n.u-none .strip { display:none; }
-  .dg-n.u-running .strip rect, .dg-n.u-attention .strip rect { fill:var(--t-a); }
-  .dg-n.u-running .strip text, .dg-n.u-attention .strip text { fill:var(--c-a); }
-  .dg-n.u-completed .strip rect { fill:var(--t-gn); } .dg-n.u-completed .strip text { fill:var(--gr); }
-  .dg-n.u-failed .strip rect { fill:var(--t-r); } .dg-n.u-failed .strip text { fill:var(--c-r); }
-  .dg-n.u-queued .strip rect { fill:var(--t-b); } .dg-n.u-queued .strip text { fill:var(--c-b); }
-  .dg-n.u-running .bx { stroke-width:3; animation:pulse 1.4s ease-in-out infinite; }
-  .dg-n.hold .bx { stroke:var(--am); stroke-dasharray:6 4; stroke-width:3; }
-  .dg-n.u-hold .strip rect { fill:var(--t-a); stroke:var(--am); stroke-dasharray:4 3; } .dg-n.u-hold .strip text { fill:var(--c-a); }
-  .dg-n.sel .bx { filter:drop-shadow(0 0 5px var(--ac)); }
-  .dg-n:focus-visible .bx { stroke:var(--ac); }
-  .dg-e { fill:none; stroke:var(--mu); opacity:.85; }
-  .dg-e.down { stroke:var(--rd); stroke-dasharray:6 5; }
-  .dg-e.upg { stroke:var(--am); }
-  .dg-e.hold { stroke:var(--am); stroke-dasharray:6 4; }
-  .dg-lbl { fill:var(--mu); font-size:9.5px; paint-order:stroke; stroke:var(--pn); stroke-width:4px; stroke-linejoin:round; pointer-events:none; }
-  .dg-cap { fill:var(--mu); font-size:12px; font-weight:600; }
-  .dg-detail { position:absolute; top:10px; right:10px; width:290px; max-height:calc(100% - 20px); overflow:auto; background:var(--pn);
-               border:1px solid var(--bd); border-radius:10px; box-shadow:0 8px 28px rgba(0,0,0,.28); padding:12px 14px; font-size:13px; z-index:2; }
-  .dg-detail[hidden] { display:none; }
-  .dg-detail h5 { margin:0 0 8px; font-size:14px; display:flex; align-items:center; gap:8px; }
-  .dg-detail h5 span { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .dg-detail h5 button { background:none; border:0; color:var(--mu); font-size:18px; cursor:pointer; line-height:1; }
-  .dg-detail dl { display:grid; grid-template-columns:auto 1fr; gap:4px 10px; margin:0 0 10px; }
-  .dg-detail dt { color:var(--mu); } .dg-detail dd { margin:0; word-break:break-word; }
-  .dg-detail .nbs { margin:0 0 10px; padding:0; list-style:none; font-size:12px; }
-  .dg-detail .nbs li { padding:4px 0; border-top:1px solid var(--bd); }
-  .dg-detail .nbs .pt { color:var(--mu); }
-  @media (prefers-reduced-motion: reduce) { .dg-n.u-running .bx { animation:none; } }
-
-  /* ---- Storage page ---- */
-  .st-side { width:266px; }
-  .st-side .sh { font-size:15px; padding:14px 14px 8px; }
-  .st-sites { padding:0 8px 12px; display:flex; flex-direction:column; gap:2px; }
-  .st-site { display:flex; align-items:center; gap:10px; width:100%; text-align:left; background:none; border:0;
-             color:var(--mu); font:inherit; font-size:14px; padding:10px 12px; border-radius:8px; cursor:pointer; }
-  .st-site:hover { background:var(--acs); color:var(--tx); }
-  .st-site.on { background:var(--sel); color:var(--tx); font-weight:600; box-shadow:3px 0 0 var(--ac) inset; }
-  .st-site .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .st-site .tag { font-size:10px; font-weight:700; padding:1px 7px; border-radius:999px; background:var(--t-gn);
-                  color:var(--gr); }
-  .st-empty { padding:10px 14px; color:var(--mu); font-size:12px; }
-  #storage main { overflow:hidden; }
-  .st-card { flex:1; }
-  .st-bar { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--bd);
-            flex-wrap:wrap; }
-  .crumbs { display:flex; align-items:center; flex-wrap:wrap; gap:2px; font-size:13px; min-width:0; }
-  .crumbs button { background:none; border:0; color:var(--ac); font:inherit; cursor:pointer; padding:3px 6px;
-                   border-radius:6px; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .crumbs button:hover { background:var(--acs); }
-  .crumbs button.cur { color:var(--tx); font-weight:600; cursor:default; }
-  .crumbs button.cur:hover { background:none; }
-  .crumbs .sepc { color:var(--mu); }
-  .st-search { position:relative; width:min(340px, 100%); display:flex; align-items:center; }
-  .st-search [data-i], .st-search .si { position:absolute; left:9px; color:var(--mu); pointer-events:none; }
-  .st-search input { padding-left:32px; padding-right:28px; }
-  .st-clear { position:absolute; right:4px; background:none; border:0; color:var(--mu); cursor:pointer; font-size:16px;
-              width:24px; height:24px; border-radius:6px; line-height:1; }
-  .st-clear:hover { background:var(--t-g); }
-  .st-clear[hidden] { display:none; }
-  .st-table { min-width:640px; }
-  .st-table th.sortable { cursor:pointer; user-select:none; }
-  .st-table th.sortable:hover { color:var(--tx); }
-  #dev-table th[data-sort] { cursor:pointer; user-select:none; }
-  #dev-table th[data-sort]:hover { color:var(--tx); }
-  #dev-table th[data-sort].sorted { color:var(--tx); }
-  .st-table td { white-space:nowrap; }
-  .st-table td.nm { width:100%; max-width:0; overflow:hidden; text-overflow:ellipsis; }
-  .st-table td.act { text-align:right; }
-  .st-table td.act .btn { margin-left:4px; }
-  .st-table .ico { display:inline-flex; vertical-align:middle; margin-right:8px; color:var(--mu); }
-  .st-table .ico.dir { color:var(--ac); }
-  .st-name { background:none; border:0; font:inherit; color:var(--tx); cursor:pointer; padding:0; text-align:left;
-             max-width:100%; overflow:hidden; text-overflow:ellipsis; vertical-align:middle; }
-  .st-name:hover { color:var(--ac); text-decoration:underline; }
-  .st-loc { color:var(--mu); font-size:12px; }
-  .st-foot { padding:7px 14px; border-top:1px solid var(--bd); color:var(--mu); font-size:12px; flex:none; }
-  .st-none { padding:34px 14px; text-align:center; color:var(--mu); }
-  .modal-card.wide { max-width:min(1200px, 100%); height:calc(100vh - 32px); max-height:calc(100vh - 32px); display:flex; flex-direction:column; min-height:0; }
-  #st-pre { margin:8px 0 0; padding:10px 12px 48px; overflow:auto; flex:1; min-height:0; background:var(--pn2);
-            border:1px solid var(--bd); border-radius:8px; white-space:pre; font:12px/1.5 ui-monospace,Consolas,monospace; }
-
-  @media (max-width:1000px) {
-    .wg { grid-template-columns:1fr; }
-    .side.wide, .st-side { width:250px; }
-    .fbar #meta { display:none; }
-  }
-  .repbtns { display:inline-flex; gap:6px; }
-  /* ---- signed-in user menu ---- */
-  .usermenu { position:relative; display:inline-block; margin-left:4px; }
-  .userbtn { display:flex; align-items:center; gap:7px; height:36px; padding:0 10px; border:0; border-radius:18px;
-             background:none; color:var(--tx); font:inherit; cursor:pointer; }
-  .userbtn:hover, .userbtn[aria-expanded="true"] { background:rgba(128,128,128,.18); }
-  .userbtn:focus-visible { outline:2px solid var(--ac); outline-offset:1px; }
-  .userbtn svg { width:20px; height:20px; }
-  .userbtn .uname { font-size:13px; font-weight:600; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .user-pop { position:absolute; right:0; top:calc(100% + 8px); z-index:1300; min-width:230px; background:var(--pn);
-              color:var(--tx); border:1px solid var(--bd); border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.25);
-              font-size:13px; overflow:hidden; }
-  .user-pop[hidden] { display:none; }
-  .user-pop .uh { padding:10px 12px; border-bottom:1px solid var(--bd); }
-  .user-pop .uh b { display:block; font-size:14px; }
-  .user-pop .uh span { display:block; color:var(--mu); font-size:12px; margin-top:2px; }
-  .user-pop a { display:block; padding:10px 12px; color:var(--tx); text-decoration:none; font-weight:600; }
-  .user-pop a:hover, .user-pop a:focus-visible { background:rgba(128,128,128,.18); }
-  .user-pop a[hidden] { display:none; }
-  @media (max-width:900px) { .userbtn .uname { display:none; } }
-  /* ---- roles: the server enforces them; this only hides what a role cannot use ---- */
-  body.role-viewer #side, body.role-viewer #storage, body.role-viewer #tab-storage, body.role-viewer #diagram, body.role-viewer #tab-diagram, body.role-viewer #diagnosis, body.role-viewer #tab-diagnosis, body.role-viewer #btn-mon,
-  body.role-viewer #sel-count, body.role-viewer #btn-version, body.role-viewer #btn-delete-devices,
-  body.role-viewer .ck, body.role-viewer #note-clear { display:none !important; }
-  body.role-viewer #site-badge { pointer-events:none; cursor:default; }
-  body.role-operator #btn-mon[data-action="stop"] { display:none !important; }
-  /* ---- credit footer ---- */
-  footer.credit { flex:none; display:flex; align-items:center; justify-content:center; gap:10px; padding:7px 16px;
-                  background:var(--tb); border-top:1px solid var(--tbd); font-size:12px; color:var(--mu); }
-  footer.credit strong { color:var(--tx); font-weight:600; }
-  footer.credit .sep { opacity:.45; }
-  footer.credit a { display:inline-flex; align-items:center; gap:6px; color:var(--ac); font-weight:600;
-                    text-decoration:none; }
-  footer.credit a:hover, footer.credit a:focus-visible { text-decoration:underline; }
-  footer.credit svg { width:14px; height:14px; fill:currentColor; }
-
-  /* ---- v-next: settings page, events collapse, image list, hover tips ---- */
-  .ib[hidden], .card[hidden] { display:none; }
-  .ib.on { background:var(--acs); color:var(--ac); }
-  input[type=number] { background:var(--pn); border:1px solid var(--bd); color:var(--tx); border-radius:6px; padding:6px 8px; font:inherit; }
-  .set-nav { display:flex; flex-direction:column; gap:2px; padding:4px 8px 12px; }
-  .set-nav button { text-align:left; background:none; border:0; border-radius:8px; padding:10px 12px; font:inherit;
-                    font-size:14px; color:var(--mu); cursor:pointer; }
-  .set-nav button:hover { background:var(--acs); color:var(--tx); }
-  .set-nav button.on { background:var(--sel); color:var(--tx); font-weight:600; box-shadow:3px 0 0 var(--ac) inset; }
-  .set-card { flex:none; }
-  .set-body { padding:2px 18px 16px; }
-  .set-intro { color:var(--mu); font-size:12.5px; margin:12px 0 2px; max-width:780px; line-height:1.5; }
-  .ab-card { border:1px solid var(--bd); border-radius:10px; padding:12px 14px; margin-top:12px; max-width:780px; }
-  .ab-kv { display:grid; grid-template-columns:150px minmax(0,1fr); gap:6px 12px; font-size:13px; }
-  .ab-kv span:nth-child(odd) { color:var(--mu); }
-  .ab-ver { margin-top:16px; max-width:780px; border-top:1px solid var(--bd); padding-top:10px; }
-  .ab-ver h4 { margin:0 0 4px; font-size:14px; display:flex; gap:8px; align-items:center; }
-  .ab-ver small { color:var(--mu); font-weight:400; }
-  .ab-cur { font-size:10.5px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; padding:1px 8px; border-radius:999px; background:var(--sel); color:var(--ac); }
-  .ab-ver ul { margin:4px 0 0; padding-left:20px; font-size:12.5px; line-height:1.55; }
-  .set-sec { margin:20px 0 2px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--mu); font-weight:700; }
-  .set-row { display:flex; gap:24px; align-items:center; justify-content:space-between; padding:11px 0; border-top:1px solid var(--bd); }
-  .set-sec + .set-row { margin-top:4px; }
-  .set-info { flex:1; min-width:0; }
-  .set-label { font-weight:600; font-size:13px; }
-  .set-row.chg .set-label::after { content:"  \2022 changed"; color:var(--am); font-size:11px; font-weight:600; }
-  .set-help { color:var(--mu); font-size:12px; margin-top:2px; max-width:600px; line-height:1.45; }
-  .set-ctl { flex:none; display:flex; align-items:center; gap:8px; width:360px; justify-content:flex-end; }
-  .set-ctl input[type=number] { width:92px; text-align:right; }
-  .set-unit { color:var(--mu); font-size:12px; min-width:18px; }
-  .set-hint { color:var(--mu); font-size:11px; width:64px; white-space:nowrap; }
-  .set-def { background:none; border:1px dashed var(--bd); color:var(--mu); border-radius:6px; font:inherit; font-size:11px;
-             padding:3px 8px; cursor:pointer; white-space:nowrap; }
-  .set-def:hover:not(:disabled) { border-color:var(--ac); color:var(--ac); }
-  .set-def:disabled { cursor:default; }
-  .set-chk { margin:0; }
-  .set-note { padding:8px 18px 0; color:var(--mu); font-size:12px; }
-  .nt-form { display:grid; grid-template-columns:180px minmax(220px,420px); gap:10px 14px; align-items:center; max-width:720px; margin-top:16px; }
-  .nt-form label { margin:0; font-size:13px; color:var(--tx); font-weight:600; }
-  .nt-form .nt-inline { display:flex; gap:8px; align-items:center; }
-  .nt-form .nt-inline input[type=text] { width:90px; }
-  .nt-form .nt-inline select { flex:1; width:auto; }
-  .nt-form .nt-hint { grid-column:2; color:var(--mu); font-size:11.5px; margin-top:-6px; }
-  .nt-kinds { display:flex; flex-wrap:wrap; gap:6px 18px; margin:6px 0 8px; max-width:720px; }
-  .nt-kinds label { display:flex; align-items:center; gap:6px; margin:0; font-size:13px; color:var(--tx); }
-  .nt-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:14px; }
-  .nt-last { color:var(--mu); font-size:12px; margin-top:10px; }
-  .nt-last.ok { color:var(--gr); } .nt-last.bad { color:var(--rd); }
-  .card.e { cursor:default; }
-  .card.e > h4 { cursor:pointer; user-select:none; flex-wrap:nowrap; }
-  .card.e.collapsed { height:auto; }
-  .card.e.collapsed > h4 { border-bottom:0; }
-  .card.e.collapsed .ev { display:none; }
-  .evn { font-size:11px; font-weight:600; color:var(--mu); background:var(--pn2); border:1px solid var(--bd); border-radius:999px; padding:0 8px; }
-  .evn:empty { display:none; }
-  .evlast { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; font-weight:400; color:var(--mu); }
-  .card.e:not(.collapsed) .evlast { display:none; }
-  .img-card { flex:none; }
-  .img-body { padding:10px 14px 12px; max-height:300px; overflow:auto; }
-  .img-form { display:grid; grid-template-columns:minmax(200px,1fr) minmax(260px,1.2fr) auto; gap:12px; align-items:end; }
-  .img-form label { margin-top:0; }
-  .img-table { min-width:0; margin-top:10px; }
-  .img-table td, .img-table th { padding:7px 8px; }
-
-  /* ---- command duration profiles + command time test (Settings > Command Outputs) ---- */
-  .tp-bar, .ct-card { border:1px solid var(--bd); border-radius:10px; background:var(--pn2); margin:14px 0 4px; padding:12px 14px; max-width:1280px; }
-  .tp-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-  .tp-row + .tp-row { margin-top:10px; }
-  .tp-row > label, .ct-row > label { font-weight:600; font-size:13px; }
-  .tp-bar select, .ct-card select, .tp-bar input[type=text], .ct-card input[type=text], .ct-card input[type=number] {
-    background:var(--pn); border:1px solid var(--bd); color:var(--tx); border-radius:6px; padding:6px 8px; font:inherit; font-size:13px; max-width:100%; }
-  .tp-bar select { width:auto; min-width:260px; flex:0 1 380px; }
-  .tp-row input[type=text] { width:auto; flex:1 1 200px; max-width:380px; }
-  .tp-row input[type=text] + input[type=text] { margin-top:0; }
-  .ct-actions input[type=text] { width:auto; flex:1 1 220px; max-width:360px; }
-  .tp-state { font-size:12px; color:var(--mu); }
-  .tp-state b { color:var(--tx); }
-  .tp-info { font-size:12px; color:var(--mu); margin-top:8px; line-height:1.5; }
-  .tp-vals { margin-top:6px; font-size:12px; color:var(--mu); }
-  .tp-vals summary { cursor:pointer; }
-  .tp-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(290px, 1fr)); gap:2px 18px; margin-top:6px; }
-  .tp-grid span:nth-child(odd) { color:var(--tx); }
-  /* ---- command time test: step list | step detail + console | results ---- */
-  .ct-toggle { display:flex; align-items:center; gap:8px; width:100%; background:none; border:0; color:var(--tx); font:inherit; font-weight:600; font-size:14px; cursor:pointer; padding:0; text-align:left; }
-  .ct-toggle .sub { font-weight:400; font-size:12px; color:var(--mu); }
-  .ct-toggle .car { margin-left:auto; transition:transform .15s; display:inline-grid; }
-  .ct-card.open .ct-toggle .car { transform:rotate(180deg); }
-  .ct-bar { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:flex-end; margin-top:14px; }
-  .ct-f { flex:1 1 260px; min-width:0; }
-  .ct-f > label { display:block; font-weight:600; font-size:12px; color:var(--mu); margin-bottom:4px; }
-  .ct-f select { width:100%; }
-  .ct-bar-r { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-left:auto; }
-  .ct-wb { display:grid; grid-template-columns:292px minmax(0,1fr); gap:16px; margin-top:14px; align-items:start; }
-  .ct-rail { border:1px solid var(--bd); border-radius:10px; background:var(--pn); padding:6px; }
-  .ct-rs + .ct-rs { margin-top:4px; border-top:1px solid var(--bd); padding-top:4px; }
-  .ct-rs-h { display:flex; align-items:center; gap:7px; width:100%; background:none; border:0; color:var(--mu); font:inherit; font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; padding:8px 8px 5px; cursor:pointer; text-align:left; }
-  .ct-rs-h:hover { color:var(--tx); }
-  .ct-rs-c { margin-left:auto; font-weight:600; letter-spacing:0; }
-  .ct-car { display:inline-grid; transition:transform .15s; transform:rotate(-90deg); }
-  .ct-rs.open .ct-car { transform:none; }
-  .ct-r { display:flex; align-items:center; gap:9px; width:100%; background:none; border:0; border-radius:7px; padding:7px 8px; font:inherit; font-size:13px; color:var(--tx); cursor:pointer; text-align:left; }
-  .ct-r:hover { background:var(--pn2); }
-  .ct-rs.off .ct-r, .ct-rs.off .ct-rs-h { opacity:.5; }
-  .ct-r.sel { background:var(--acs); box-shadow:inset 3px 0 0 var(--ac); font-weight:600; }
-  .ct-r-t { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .ct-r-v { font-size:11.5px; font-weight:400; color:var(--mu); font-variant-numeric:tabular-nums; white-space:nowrap; }
-  .ct-n { flex:none; width:22px; height:22px; border-radius:50%; background:var(--pn2); border:1px solid var(--bd); display:grid; place-items:center; font-size:11px; font-weight:700; color:var(--mu); }
-  .ct-r.done .ct-n { background:var(--gr); border-color:var(--gr); color:#fff; }
-  .ct-r.bad .ct-n { background:var(--rd); border-color:var(--rd); color:#fff; }
-  .ct-r.run .ct-n { background:var(--ac); border-color:var(--ac); color:#fff; }
-  .ct-main { min-width:0; display:flex; flex-direction:column; gap:14px; }
-  .ct-d { border:1px solid var(--bd); border-radius:10px; background:var(--pn); padding:14px 16px; }
-  .ct-d-h { display:flex; flex-wrap:wrap; gap:12px 16px; align-items:flex-start; }
-  .ct-d-id { flex:1 1 280px; min-width:0; }
-  .ct-d-k { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--mu); }
-  .ct-d-t { font-size:17px; font-weight:700; display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:2px; }
-  .ct-cmd { display:block; margin-top:5px; font-size:12.5px; color:var(--mu); overflow-wrap:anywhere; }
-  .ct-d-a { display:flex; flex-wrap:wrap; gap:8px; margin-left:auto; }
-  .ct-d-a .btn { padding:8px 18px; font-size:13px; }
-  .ct-d-desc { margin:10px 0 0; font-size:13px; line-height:1.55; }
-  .ct-chips { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-top:10px; font-size:12px; color:var(--mu); }
-  .ct-chip { padding:2px 9px; border-radius:999px; background:var(--pn2); border:1px solid var(--bd); color:var(--tx); font-size:11.5px; }
-  .ct-tiles { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:12px; }
-  .ct-tile { border:1px solid var(--bd); border-radius:8px; padding:8px 11px; background:var(--pn2); }
-  .ct-tile span { display:block; font-size:10.5px; letter-spacing:.05em; text-transform:uppercase; color:var(--mu); }
-  .ct-tile b { font-size:18px; font-variant-numeric:tabular-nums; }
-  .ct-status { margin-top:10px; font-size:12.5px; color:var(--mu); }
-  .ct-status .dot { margin-right:5px; }
-  .ct-badge { font-size:10.5px; font-weight:600; padding:1px 8px; border-radius:999px; background:var(--t-a); color:var(--c-a); }
-  .ct-badge.d { background:var(--t-r); color:var(--c-r); }
-  .ct-badge.n { background:var(--t-g); color:var(--mu); }
-  .ct-panel { margin-top:12px; border:1px solid var(--bd); border-radius:8px; background:var(--pn2); }
-  .ct-panel-h { padding:7px 10px; font-size:12px; border-bottom:1px solid var(--bd); }
-  .ct-panel pre { margin:0; padding:8px 10px; max-height:240px; overflow:auto; font-size:11.5px; line-height:1.4; white-space:pre; }
-  .ct-panel table { width:100%; border-collapse:collapse; font-size:12.5px; min-width:0; }
-  .ct-panel th { text-align:left; font-size:11px; letter-spacing:.04em; text-transform:uppercase; color:var(--mu); padding:5px 10px; }
-  .ct-panel td { padding:5px 10px; border-top:1px solid var(--bd); }
-  .ct-panel td.n, .ct-panel th.n, .ct-table td.n, .ct-table th.n { text-align:right; font-variant-numeric:tabular-nums; }
-  .ct-empty { margin-top:12px; padding:14px; border:1px dashed var(--bd); border-radius:8px; font-size:12.5px; color:var(--mu); text-align:center; }
-  .ct-result { margin-top:16px; border-top:1px solid var(--bd); padding-top:14px; }
-  .ct-result-t { font-weight:700; font-size:14px; }
-  .ct-result-g { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr); gap:18px; align-items:start; margin-top:8px; }
-  .ct-result-g > * { min-width:0; }
-  #ct-sugg-t { overflow-x:auto; }
-  .ct-sg-h label { font-size:13px; font-weight:600; color:var(--tx); display:inline-flex; align-items:center; gap:6px; }
-  .ct-side { border:1px solid var(--bd); border-radius:10px; background:var(--pn); padding:12px 14px; }
-  .ct-sg-h { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
-  .ct-sg-h input[type=number] { width:72px; }
-  .ct-table { width:100%; border-collapse:collapse; font-size:12.5px; min-width:0; }
-  .ct-table td, .ct-table th, .ct-panel td, .ct-panel th { white-space:normal; }
-  .ct-table th { text-align:left; font-size:11px; letter-spacing:.04em; text-transform:uppercase; color:var(--mu); padding:5px 8px; border-bottom:1px solid var(--bd); }
-  .ct-table td { padding:6px 8px; border-bottom:1px solid var(--bd); }
-  .ct-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; }
-  .ct-note { font-size:12px; color:var(--mu); margin-top:8px; line-height:1.5; }
-  .btn.dg { border-color:var(--rd); color:var(--rd); }
-  /* Colour-coded function buttons: green = run / save / add, blue = check / read / refresh, amber = schedule / reset,
-     red = delete / cancel / stop. They reuse the theme colours, so light and dark mode both match. */
-  .btn.ok, .btn.in, .btn.wn, .btn.dg, #btn-backup, #btn-upgrade, #btn-add-device, #btn-upload-devices, #btn-prof-save,
-  #btn-upload-image, #btn-site-create, #set-save, #nt-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
-  [data-ct="saveform"], #ck-save, #btn-prof-assign, #btn-prof-test, #btn-readiness, #btn-version, #dg-run, #st-refresh,
-  #img-refresh, #dg-refresh, [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test, #btn-schedule, #set-reset,
-  [data-tp="update"], #btn-delete-devices, #btn-prof-delete, #btn-unschedule, [data-tp="delete"], [data-ct="stop"],
-  #ck-add-pre, #ck-add-post { font-weight:600; }
-  .btn.ok, #btn-backup, #btn-upgrade, #btn-add-device, #btn-upload-devices, #btn-prof-save, #btn-upload-image,
-  #btn-site-create, #set-save, #nt-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
-  [data-ct="saveform"], #ck-save, #ck-add-pre, #ck-add-post { background:var(--t-gn); border-color:var(--gr); color:var(--gr); }
-  .btn.in, #btn-prof-assign, #btn-prof-test, #btn-readiness, #btn-version, #dg-run, #st-refresh, #img-refresh, #dg-refresh,
-  [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test { background:var(--acs); border-color:var(--ac); color:var(--ac); }
-  .btn.wn, #btn-schedule, #set-reset, [data-tp="update"] { background:var(--t-a); border-color:var(--am); color:var(--c-a); }
-  .btn.dg, #btn-delete-devices, #btn-prof-delete, #btn-unschedule, [data-tp="delete"], [data-ct="stop"] { background:var(--t-r); border-color:var(--rd); color:var(--rd); }
-  .btn.ok:hover:not(:disabled), #btn-backup:hover:not(:disabled), #btn-upgrade:hover:not(:disabled), #btn-add-device:hover:not(:disabled),
-  #btn-upload-devices:hover:not(:disabled), #btn-prof-save:hover:not(:disabled), #btn-upload-image:hover:not(:disabled),
-  #btn-site-create:hover:not(:disabled), #set-save:hover:not(:disabled), #nt-save:hover:not(:disabled), #rep-go:hover:not(:disabled),
-  [data-tp="create"]:hover:not(:disabled), [data-ct="run"]:hover:not(:disabled), [data-ct="save"]:hover:not(:disabled),
-  [data-ct="saveform"]:hover:not(:disabled), #ck-save:hover:not(:disabled), #ck-add-pre:hover:not(:disabled), #ck-add-post:hover:not(:disabled)
-    { border-color:var(--gr); box-shadow:0 0 0 3px color-mix(in srgb, var(--gr) 22%, transparent); }
-  .btn.in:hover:not(:disabled), #btn-prof-assign:hover:not(:disabled), #btn-prof-test:hover:not(:disabled), #btn-readiness:hover:not(:disabled),
-  #btn-version:hover:not(:disabled), #dg-run:hover:not(:disabled), #st-refresh:hover:not(:disabled), #img-refresh:hover:not(:disabled),
-  #dg-refresh:hover:not(:disabled), [data-verify]:hover:not(:disabled), [data-tp="apply"]:hover:not(:disabled),
-  #cmp-go, #st-compare:hover:not(:disabled), #nt-test:hover:not(:disabled) { box-shadow:0 0 0 3px color-mix(in srgb, var(--ac) 22%, transparent); }
-  .btn.wn:hover:not(:disabled), #btn-schedule:hover:not(:disabled), #set-reset:hover:not(:disabled), [data-tp="update"]:hover:not(:disabled)
-    { border-color:var(--am); box-shadow:0 0 0 3px color-mix(in srgb, var(--am) 22%, transparent); }
-  .btn.dg:hover:not(:disabled), #btn-delete-devices:hover:not(:disabled), #btn-prof-delete:hover:not(:disabled), #btn-unschedule:hover:not(:disabled),
-  [data-tp="delete"]:hover:not(:disabled), [data-ct="stop"]:hover:not(:disabled)
-    { border-color:var(--rd); box-shadow:0 0 0 3px color-mix(in srgb, var(--rd) 22%, transparent); }
-  /* backup comparison */
-  .cmp-box { border:1px solid var(--bd); background:var(--pn2); border-radius:8px; padding:8px 10px; margin-bottom:8px; }
-  .cmp-box .cmp-row { display:flex; align-items:center; gap:6px; margin:4px 0; }
-  .cmp-box .cmp-row > span { width:42px; flex:none; font-size:11.5px; color:var(--mu); }
-  .cmp-box select { flex:1; min-width:0; }
-  .cmp-box .cmp-opt { display:flex; align-items:center; gap:6px; margin:6px 0; font-size:12px; color:var(--tx); }
-  .cmp-bar { display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px; margin:10px 0 6px; }
-  .cmp-bar label { margin:0; }
-  .cmp-bar select { width:auto; min-width:170px; }
-  .cmp-opt { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--tx); }
-  .cmp-diff { flex:1; overflow:auto; min-height:160px; padding:8px 10px; background:var(--pn2); border:1px solid var(--bd); border-radius:8px; }
-  .df-sum { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:8px; font-size:12px; }
-  .df-sum .pill { margin:0; }
-  .df-cmd { border:1px solid var(--bd); border-radius:8px; margin:6px 0; background:var(--pn); }
-  .df-cmd > summary { cursor:pointer; padding:6px 10px; font:600 12px ui-monospace,Consolas,monospace; display:flex; gap:8px; align-items:center; }
-  .df-cmd > summary .st { margin-left:auto; font:600 11px system-ui,sans-serif; }
-  .df-cmd pre { margin:0; padding:0; background:transparent; overflow:auto; font:11.5px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
-  .df-cmd pre div { padding:0 10px; white-space:pre; }
-  .df-a { background:var(--t-gn); color:var(--gr); }
-  .df-r { background:var(--t-r); color:var(--rd); }
-  .df-h { background:var(--t-b); color:var(--c-b); }
-  .df-same { color:var(--mu); font-size:12px; padding:2px 4px; }
-
-  /* backup comparison: full screen, left (older) / right (newer) */
-  .modal.cmp-full { padding:0; align-items:stretch; background:var(--pn); }
-  .cmp-card { max-width:none; width:100%; height:100%; border-radius:0; border:0; box-shadow:none; display:flex; flex-direction:column; min-height:0; padding:10px 14px 12px; }
-  .cmp-top { display:flex; align-items:center; gap:10px; flex:none; }
-  .cmp-top h2 { flex:1; min-width:0; margin:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .cmp-seg { display:inline-flex; border:1px solid var(--bd); border-radius:7px; overflow:hidden; flex:none; }
-  .cmp-seg button { background:var(--pn2); border:0; color:var(--tx); padding:5px 12px; font:inherit; cursor:pointer; }
-  .cmp-seg button.on { background:var(--acs); color:var(--ac); font-weight:600; }
-  .cmp-bar { flex:none; }
-  .cmp-main { flex:1; min-height:0; display:flex; gap:10px; }
-  .cmp-list { width:280px; flex:none; display:flex; flex-direction:column; min-height:0; border:1px solid var(--bd); border-radius:8px; background:var(--pn2); }
-  .cmp-list .lh { padding:7px 10px; border-bottom:1px solid var(--bd); font-size:12px; flex:none; }
-  .cmp-list .lb { flex:1; min-height:0; overflow:auto; }
-  .cmp-item { display:block; width:100%; text-align:left; background:none; border:0; border-bottom:1px solid var(--bd); color:var(--tx); padding:7px 10px; cursor:pointer; font:inherit; }
-  .cmp-item:hover { background:var(--sel); }
-  .cmp-item.on { background:var(--acs); box-shadow:inset 3px 0 0 var(--ac); }
-  .cmp-item .c { font:600 12px ui-monospace,Consolas,"Courier New",monospace; overflow-wrap:anywhere; }
-  .cmp-item .s { font-size:11px; margin-top:2px; }
-  .cmp-pane { flex:1; min-width:0; display:flex; flex-direction:column; min-height:0; }
-  .cmp-pane .df-sum { flex:none; }
-  .cmp-diff { min-height:0; padding:0; }
-  .cmp-diff > .cmp-msg { padding:12px 14px; color:var(--mu); }
-  table.sbs { width:100%; border-collapse:collapse; table-layout:fixed; font:12px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
-  table.sbs th { position:sticky; top:0; z-index:2; background:var(--pn); padding:7px 10px; font:600 12px system-ui,sans-serif; color:var(--tx);
-                 text-transform:none; letter-spacing:0; border-bottom:1px solid var(--bd); text-align:left; }
-  table.sbs th + th { border-left:2px solid var(--bd); }
-  table.sbs td { padding:0 8px; vertical-align:top; border:0; }
-  table.sbs td.ln { text-align:right; color:var(--mu); user-select:none; -webkit-user-select:none; font-size:11px; padding-right:6px; background:var(--pn2); }
-  table.sbs td.ln + td.tx + td.ln { border-left:2px solid var(--bd); }
-  table.sbs td.tx { white-space:pre-wrap; overflow-wrap:anywhere; }
-  table.sbs td.l-r { background:var(--t-r); } table.sbs td.l-a { background:var(--t-gn); } table.sbs td.emp { background:var(--pn2); }
-  table.sbs td.ln.l-r { background:var(--t-r); color:var(--rd); } table.sbs td.ln.l-a { background:var(--t-gn); color:var(--gr); }
-  table.sbs mark { background:color-mix(in srgb, currentColor 28%, transparent); color:inherit; border-radius:2px; }
-  table.sbs td.vol { color:var(--mu); }
-  table.sbs tr.gap td { text-align:center; padding:3px 8px; background:var(--t-b); color:var(--c-b); cursor:pointer; font:11.5px system-ui,sans-serif; }
-  table.sbs tr.gap:hover td { filter:brightness(1.15); }
-  pre.uni { margin:0; padding:8px 0 40px; font:12px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
-  pre.uni div { padding:0 12px; white-space:pre-wrap; overflow-wrap:anywhere; }
-  @media (max-width:860px) { .cmp-main { flex-direction:column; } .cmp-list { width:auto; max-height:32%; } }
-  /* console under the step detail */
-  .cc { height:340px; min-height:220px; max-height:85vh; resize:vertical; display:flex; flex-direction:column; background:#0b1020; color:#d6e2ff; border:1px solid #2a3558; border-radius:10px; overflow:hidden; }
-  .cc-h { display:flex; align-items:center; gap:6px; padding:6px 8px 6px 11px; background:#151c33; flex:none; flex-wrap:wrap; }
-  .cc-t { font-weight:600; font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
-  .cc-st { font-size:11px; padding:1px 8px; border-radius:999px; background:#2a3558; color:#d6e2ff; white-space:nowrap; }
-  .cc-st.on { background:#17382a; color:#4ade80; }
-  .cc-st.busy { background:#3b3320; color:#f4c542; }
-  .cc-sp { flex:1; }
-  .cc-b { background:transparent; border:1px solid #3b4a7a; color:#d6e2ff; border-radius:6px; padding:3px 9px; font:inherit; font-size:11.5px; cursor:pointer; }
-  .cc-b:hover:not(:disabled) { background:rgba(255,255,255,.12); }
-  .cc-b:disabled { opacity:.4; cursor:not-allowed; }
-  .cc-b.go { background:#2f6fe4; border-color:#2f6fe4; color:#fff; font-weight:600; }
-  .cc-out { flex:1; min-height:0; margin:0; padding:8px 11px; overflow:auto; white-space:pre-wrap; word-break:break-word; font:12px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
-  .cc-in { display:flex; align-items:center; gap:7px; padding:6px 11px; border-top:1px solid #2a3558; background:#0e1429; flex:none; }
-  .cc-in span { color:#4ade80; font:12px ui-monospace,Consolas,monospace; }
-  .cc-in input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:#f3f6ff; caret-color:#4ade80; font:12.5px ui-monospace,Consolas,"Courier New",monospace; padding:3px 0; }
-  .cc-in input:disabled { opacity:.45; }
-  .cc-n { padding:5px 11px; font-size:10.5px; color:#93a1c0; border-top:1px solid #2a3558; flex:none; }
-  .cc.max { position:fixed; inset:28px; margin:0; z-index:1150; height:auto; max-height:none; resize:none; box-shadow:0 14px 60px rgba(0,0,0,.55); }
-  .cc.max .cc-out { font-size:13.5px; }
-  @media (max-width:1000px) { .ct-wb, .ct-result-g { grid-template-columns:minmax(0,1fr); } .ct-tiles { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-  .pill[data-rtip] { cursor:help; }
-  [data-rtip] { cursor:help; }
-
-  /* ================= NetUpgrade "Glass Dashboard" theme (redesign) =================
-     Floating pill header, glass cards with a blue corner glow, pill buttons, donut charts. */
-  :root {
-    --card:linear-gradient(160deg,#f1f6ff 0%,#fff 45%); --hd:#fff; --thb:#eef3fc; --glass:#f4f7fd;
-    --glow:0 6px 22px #1f6bff55; --rad:22px; --tile:#f4f7fd;
-    --bg:#e9eff9; --bg2:#dfe8f8; --bd:#d9e2f3; --ac:#1f6bff; --acs:#e2ecff; --sel:#e2ecff; --tbd:#d9e2f3;
-    --sh:0 8px 30px #1b2f6a12; --pn2:#f3f6fd;
-  }
-  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
-    --card:linear-gradient(155deg,#12306b 0%,#0c1a3a 34%,#0a1329 100%); --hd:linear-gradient(90deg,#0f1c40,#0a1431 60%,#0a1330);
-    --thb:#080f21; --glass:#111c3a; --tile:#0b1429; --bg:#050a18; --bg2:#0a1630; --pn:#0c1429; --pn2:#09111f; --bd:#1a2748;
-    --tbd:#1a2748; --ac:#2f86ff; --acs:#13295c; --sel:#14316e; --tx:#eef3ff; --mu:#8d9cc2; --sh:none;
-    --t-b:#0f2f66; --t-r:#3a1a2c; --t-a:#3a3016; --t-g:#17213d; --t-gn:#0f3326; --glow:0 6px 26px #2f86ff66; } }
-  :root[data-theme="dark"] {
-    --card:linear-gradient(155deg,#12306b 0%,#0c1a3a 34%,#0a1329 100%); --hd:linear-gradient(90deg,#0f1c40,#0a1431 60%,#0a1330);
-    --thb:#080f21; --glass:#111c3a; --tile:#0b1429; --bg:#050a18; --bg2:#0a1630; --pn:#0c1429; --pn2:#09111f; --bd:#1a2748;
-    --tbd:#1a2748; --ac:#2f86ff; --acs:#13295c; --sel:#14316e; --tx:#eef3ff; --mu:#8d9cc2; --sh:none;
-    --t-b:#0f2f66; --t-r:#3a1a2c; --t-a:#3a3016; --t-g:#17213d; --t-gn:#0f3326; --glow:0 6px 26px #2f86ff66;
-  }
-  body { background:radial-gradient(900px 480px at 12% -8%, var(--bg2), transparent 70%),
-                    radial-gradient(800px 460px at 100% 0, var(--bg2), transparent 65%), var(--bg); }
-  ::-webkit-scrollbar { width:9px; height:9px; } ::-webkit-scrollbar-thumb { background:var(--bd); border-radius:9px; }
-  ::-webkit-scrollbar-track { background:transparent; }
-
-  /* header: floating pill */
-  header { margin:14px 16px 0; height:64px; border-radius:999px; background:var(--hd); border:1px solid var(--bd);
-           box-shadow:var(--sh); padding:0 14px 0 10px; gap:8px; }
-  .brand { border-right:0; font-weight:600; font-size:17px; padding-right:6px; }
-  .brand img { width:36px; height:36px; border-radius:50%; background:var(--glass); padding:5px; border:1px solid var(--bd); }
-  .tabs { align-self:center; gap:6px; margin-left:6px; }
-  .tab { border:0; border-radius:999px; height:42px; padding:0 20px; font-size:13.5px; }
-  .tab:hover { background:var(--glass); }
-  .tab.on { background:linear-gradient(180deg,#4a97ff,#1d6bff); color:#fff; box-shadow:var(--glow), inset 0 1px 0 #ffffff55; }
-  .ib { border-radius:50%; width:40px; height:40px; background:var(--glass); border:1px solid var(--bd); }
-  .ib:hover { background:var(--acs); border-color:var(--ac); }
-  .card > h4 .ib.mx { border:0; background:none; border-radius:8px; }
-  .userbtn { height:44px; padding:0 14px 0 5px; border-radius:999px; background:var(--glass); border:1px solid var(--bd); }
-  .userbtn svg { width:32px; height:32px; padding:6px; border-radius:50%; background:linear-gradient(135deg,#3b8cff,#7c5cff); color:#fff; }
-  .mstate, .badge { border-radius:999px; }
-  .badge { background:var(--glass); }
-  .site-pop, .note-pop, .user-pop, .col-pop { border-radius:16px; }
-
-  /* layout: floating glass side panel + cards */
-  .app { padding:14px 16px 16px; gap:14px; }
-  .side { border:1px solid var(--bd); border-radius:var(--rad); background:var(--card); box-shadow:var(--sh); }
-  .sec > h3 { border-radius:999px; }
-  .sec.o > h3 { background:var(--sel); box-shadow:none; color:var(--tx); border:1px solid var(--ac); }
-  main { padding:0; gap:14px; }
-  .card, .fbar { border-radius:var(--rad); background:var(--card); border:1px solid var(--bd); box-shadow:var(--sh); }
-  .card > h4 { padding:16px 20px 8px; font-size:15px; font-weight:600; border-bottom:0; }
-  .dev-tools { padding-left:20px; padding-right:20px; }
-
-  /* buttons and inputs: pills */
-  .btn { border-radius:999px; background:var(--glass); padding:7px 15px; }
-  .btn.sm { padding:5px 13px; }
-  .btn.p { background:linear-gradient(180deg,#4a97ff,#1d6bff); border-color:transparent; box-shadow:var(--glow); }
-  .btn.p:hover:not(:disabled) { filter:brightness(1.08); }
-  .btn.on { background:var(--acs); }
-  input[type=text], input[type=password], input[type=datetime-local], textarea, select { border-radius:12px; background:var(--glass); }
-
-  /* summary tiles + donut cards */
-  .wg { grid-template-columns:repeat(2, minmax(0,1fr)); }
-  .tl { padding:6px 20px 20px; gap:10px; }
-  .t { border-radius:16px; padding:12px 6px; background:var(--tile); border:1px solid var(--bd); }
-  .t b { font-size:28px; font-weight:600; } .t.b b { color:var(--ac); } .t.r b { color:var(--rd); } .t.gn b { color:var(--gr); } .t.a b { color:var(--am); }
-
-  /* device table */
-  .sc { padding:0 14px 14px; }
-  th { background:var(--thb); padding:12px 8px; }
-  th:first-child { border-radius:14px 0 0 14px; } th:last-child { border-radius:0 14px 14px 0; }
-  td { padding:12px 8px; }
-  tr:hover td { background:var(--glass); } tr.sel td { background:var(--sel); }
-  .pill { padding:3px 11px; }
-  .hist i { border-radius:3px; }
-
-  /* device drawer: floating glass panel */
-  .drawer { top:92px; bottom:14px; right:14px; border:1px solid var(--bd); border-radius:var(--rad); background:var(--card); overflow:hidden; }
-  @media (min-width:1400px) { body.drawer-open #dashboard { margin-right:calc(var(--dw) + 14px); } }
-  .dr-card, .dr-fold, .dr-run { border-radius:14px; }
-  .dr-tabs button.on { border-bottom-width:3px; }
-  .modal-card { border-radius:20px; }
-
-  /* fit fixes */
-  .badge, #btn-mon, .mstate { white-space:nowrap; }
-  .row .btn { padding:6px 8px; }
-  .row .btn { padding:6px 4px; min-width:0; font-size:12px; }
-  #btn-mon.ok { background:var(--t-gn); border-color:var(--gr); color:var(--gr); box-shadow:none; }
-  #btn-mon.ok:hover:not(:disabled) { filter:none; box-shadow:0 0 0 3px color-mix(in srgb, var(--gr) 22%, transparent); }
-
-  /* ================= Modern controls (v-ui): sliding tabs, gear spin, file picker, checkboxes, switches, dropdowns ================= */
-  /* sliding tab indicator (only when the script that moves it is running: .tabs.js) */
-  .tabs { position:relative; }
-  .tab { position:relative; z-index:1; transition:color .25s ease, background .2s ease; }
-  .tab svg { transition:transform .35s cubic-bezier(.34,1.56,.64,1); }
+              €ç6◊∆ÚµÎ(ö+my‘ion:transform .35s cubic-bezier(.34,1.56,.64,1); }
   .tabs.js .tab.on, .tabs.js .tab.on:hover { background:none; box-shadow:none; color:#fff; }
   .tabs.js .tab.on svg { transform:scale(1.12); }
   .tab-ind { position:absolute; left:0; top:0; width:0; height:0; border-radius:999px; z-index:0; pointer-events:none; opacity:0;
              background:linear-gradient(180deg,#4a97ff,#1d6bff); box-shadow:var(--glow), inset 0 1px 0 #ffffff55; }
   .tab-ind.show { opacity:1; }
   .tab-ind.ready { transition:transform .5s cubic-bezier(.5,1.35,.4,1), width .5s cubic-bezier(.5,1.35,.4,1), opacity .2s ease; }
-
-  /* settings gear: spins once on every click, turns a little on hover, rests rotated while Settings is open */
-  #btn-settings svg { transition:transform .5s cubic-bezier(.34,1.4,.5,1); transform-origin:50% 50%; }
-  #btn-settings:hover svg { transform:rotate(45deg); }
-  #btn-settings.on svg { transform:rotate(90deg); }
-  #btn-settings.spin svg { animation:gear-spin .8s cubic-bezier(.45,.05,.25,1); }
-  @keyframes gear-spin { from { transform:rotate(0deg); } to { transform:rotate(360deg); } }
 
   /* file picker: dashed drop area with a pill button */
   input[type=file] { width:100%; padding:8px 10px; border:1.5px dashed color-mix(in srgb, var(--mu) 45%, transparent); border-radius:14px;
@@ -10347,8 +7693,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .nsel-opt.sel .nsel-k { opacity:1; }
   .nsel-grp { padding:8px 10px 4px; font-size:11px; font-weight:600; color:var(--mu); text-transform:uppercase; letter-spacing:.04em; }
   @media (prefers-reduced-motion: reduce) {
-    .tab-ind.ready, .nsel-pop, .nsel-c, #btn-settings svg, input[type=checkbox]::after, input[type=radio]::after { transition:none; }
-    #btn-settings.spin svg { animation:none; }
+    .tab-ind.ready, .nsel-pop, .nsel-c, input[type=checkbox]::after, input[type=radio]::after { transition:none; }
   }
 
   /* ================= Date & time picker (schedule) ================= */
@@ -10419,12 +7764,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <button type="button" class="tab on" id="tab-home" role="tab" aria-selected="true" data-view="home"><span data-i="home"></span>Home</button>
     <button type="button" class="tab" id="tab-diagram" role="tab" aria-selected="false" data-view="diagram"><span data-i="diagram"></span>Diagram</button>
     <button type="button" class="tab" id="tab-diagnosis" role="tab" aria-selected="false" data-view="diagnosis"><span data-i="diagnosis"></span>Diagnosis</button>
+    <button type="button" class="tab" id="tab-troubleshoot" role="tab" aria-selected="false" data-view="troubleshoot"><span data-i="troubleshoot"></span>Troubleshoot</button>
     <button type="button" class="tab" id="tab-storage" role="tab" aria-selected="false" data-view="storage"><span data-i="storage"></span>Storage</button>
   </nav>
   <span class="sp"></span>
   <span class="lost" id="lost"></span>
-  <span class="mdot" id="mon-dot" role="img" aria-label="Monitoring status" title="Monitoring status"></span>
-  <span id="state" class="mstate">Monitor starting</span>
   <button class="btn p ok" id="btn-mon" style="padding:7px 14px">Start Monitoring</button>
   <span class="notemenu"><button class="ib" id="btn-bell" title="Notifications - upgrades started and completed" aria-haspopup="true" aria-expanded="false" style="position:relative"><span data-i="bell"></span><span class="nbadge" id="bell-count" hidden>0</span></button><div class="note-pop" id="note-pop" role="dialog" aria-label="Notifications" hidden><div class="nh"><span>Notifications</span><span><button type="button" id="note-sound" title="Play a sound for new alerts (not for logins)">Sound: On</button> <button type="button" id="note-clear">Clear All</button></span></div><div class="nl" id="note-list"></div></div></span>
   <button class="ib" id="btn-settings" title="Settings" aria-label="Settings"><span data-i="gear"></span></button>
@@ -10744,6 +8088,55 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </main>
 </div>
 
+<div class="app" id="troubleshoot" hidden>
+  <aside class="side st-side tr-side" id="tr-side" aria-label="Troubleshoot steps">
+    <div class="sh"><span data-i="troubleshoot"></span><span class="shl">Steps</span></div>
+    <nav class="ct-rail" id="tr-rail" aria-label="Steps"></nav>
+  </aside>
+  <main id="tr-body">
+    <div class="tr-grid">
+      <div class="tr-right">
+        <div class="card tr-top is-setup" id="tr-top">
+          <h4>
+            <div class="tr-tabs" role="tablist" aria-label="Troubleshoot panels">
+              <button type="button" class="tr-tab" id="tr-tab-setup" role="tab" aria-selected="true" data-ct="tab" data-t="setup">Test Setup</button>
+              <button type="button" class="tr-tab" id="tr-tab-detail" role="tab" aria-selected="false" data-ct="tab" data-t="detail">Run &amp; Output</button>
+            </div>
+            <span class="tip" data-tip="Run the steps from top to bottom on a TEST switch: it is a real upgrade done by hand. Pick a step on the left, press Execute, read the output here and in the console, then go on with Next step. The image is needed for the copy, the MD5 check and the add step. Steps marked as changing the switch ask first; Activate RELOADS the switch. Run a step again to get a second sample - the slowest time of each step is the one that counts."></span>
+            <span class="a">
+              <button type="button" class="btn sm" id="tr-expand" data-ct="stages" data-v="1" disabled>Expand All</button>
+              <button type="button" class="btn sm" id="tr-collapse" data-ct="stages" data-v="0" disabled>Collapse All</button>
+              <button type="button" class="btn sm" id="tr-clear" data-ct="clear" disabled>Clear Results</button>
+            </span>
+          </h4>
+          <div class="msg" id="tr-msg" role="status" aria-live="polite"></div>
+          <div class="tr-pane" id="tr-pane-setup" role="tabpanel" aria-labelledby="tr-tab-setup">
+            <div class="tr-setup">
+              <div class="tr-fields" id="tr-fields"></div>
+              <div class="ct-f tr-profile">
+          <label>Command duration profile<span class="tip" data-tip="A profile is a named set of the command timeouts. Pick one here, or create a new one from the timeouts now in use; the results of the test can then be saved into it. To use a profile, choose it in Settings > Command Outputs and press Apply (that is also where a profile is deleted)."></span></label>
+          <div class="tr-prof-row">
+            <span class="sitemenu"><button type="button" id="prof-badge" class="badge accent site-btn" aria-haspopup="true" aria-expanded="false" title="Select or create a command duration profile">Profile: Default</button><div id="prof-pop" class="site-pop" role="menu" hidden></div></span>
+            <span class="tp-state" id="tr-state"></span>
+          </div>
+        </div>
+            </div>
+          </div>
+          <div class="tr-pane tr-pane-detail" id="tr-pane-detail" role="tabpanel" aria-labelledby="tr-tab-detail" hidden><div id="tr-detail"></div></div>
+        </div>
+        <div class="card tr-console"><div id="cc-slot"></div></div>
+      </div>
+    </div>
+
+    <div class="card tr-res collapsed" id="tr-res-card">
+      <h4>Results And Profile
+        <button type="button" class="tr-res-btn" id="tr-res-btn" data-ct="restoggle" aria-expanded="false" aria-controls="tr-result" title="Show or hide Results And Profile" aria-label="Show or hide Results And Profile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+      </h4>
+      <div id="tr-result"></div>
+    </div>
+  </main>
+</div>
+
 <div class="app" id="settings" hidden>
   <aside class="side st-side" aria-label="Settings menu">
     <div class="sh"><span data-i="gear"></span><span class="shl">Settings</span></div>
@@ -10826,6 +8219,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+<div id="prof-modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-labelledby="prof-modal-title">
+    <h2 id="prof-modal-title">Create New Profile</h2>
+    <label for="prof-new">Profile name</label>
+    <input type="text" id="prof-new" placeholder="e.g. Colombo site, Production ..." maxlength="40" autocomplete="off">
+    <label for="prof-note" style="margin-top:8px">Note (optional)</label>
+    <input type="text" id="prof-note" maxlength="300" autocomplete="off">
+    <div class="msg" id="prof-msg" role="status" aria-live="polite" style="margin-top:8px"></div>
+    <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:8px;">
+      <button class="btn" id="btn-prof-cancel" type="button">Cancel</button>
+      <button class="btn p" id="btn-prof-create" type="button">Create Profile</button>
+    </div>
+  </div>
+</div>
 <div id="toasts" role="status" aria-live="polite"></div>
 
 <aside id="drawer" class="drawer" role="dialog" aria-label="Switch details" hidden>
@@ -10881,6 +8288,7 @@ const IC = {
   home: I('<path d="M3 11 12 3l9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>'),
   diagram: I('<rect x="9" y="3" width="6" height="5" rx="1"/><rect x="3" y="16" width="6" height="5" rx="1"/><rect x="15" y="16" width="6" height="5" rx="1"/><path d="M12 8v4M6 16v-4h12v4"/>'),
   diagnosis: I('<path d="M3 12h4l2-6 4 12 2-6h6"/>'),
+  troubleshoot: I('<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/>'),
   storage: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   folder: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   file: I('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>'),
@@ -11343,24 +8751,24 @@ function ntRender() {
   if (!NT.data) { root.innerHTML = '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" style="margin-top:14px">' + esc(NT.msg ? NT.msg.text : "Loading ...") + "</div>"; return; }
   const d = NT.draft, dis = SET_CAN_EDIT ? "" : " disabled";
   const secOpts = NT.data.security_options.map(o => '<option value="' + esc(o.key) + '"' + (o.key === d.security ? " selected" : "") + ">" + esc(o.label) + "</option>").join("");
-  const kinds = NT.data.kinds.map(k => '<label><input type="checkbox" data-nt-kind="' + esc(k.key) + '" data-nt-dep' + (d.kinds.includes(k.key) ? " checked" : "") + ">" + esc(k.label) + "</label>").join("");
   const last = NT.data.last && NT.data.last.time ? '<div class="nt-last ' + (NT.data.last.ok ? "ok" : "bad") + '">Last e-mail ' + esc(NT.data.last.time) + ": " + esc(NT.data.last.detail || "") + "</div>" : "";
+  const row = (label, help, ctl, id) => '<div class="set-row"><div class="set-info"><div class="set-label">' + (id ? '<label for="' + id + '" style="margin:0;font:inherit">' + label + "</label>" : label) + "</div>" +
+    (help ? '<div class="set-help">' + help + "</div>" : "") + '</div><div class="set-ctl">' + ctl + "</div></div>";
+  const sw = (id, on, txt, extra) => '<label class="chk set-chk"><input type="checkbox"' + (id ? ' id="' + id + '"' : "") + (extra || "") + (on ? " checked" : "") + "><span>" + txt + "</span></label>";
+  const kinds = NT.data.kinds.map(k => row(esc(k.label), "", sw("", d.kinds.includes(k.key), d.kinds.includes(k.key) ? "On" : "Off", ' data-nt-kind="' + esc(k.key) + '" data-nt-dep'))).join("");
   root.innerHTML =
-    '<div class="nt-form">' +
-    '<label for="nt-enabled">Send e-mail notifications</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="nt-enabled"' + (d.enabled ? " checked" : "") + dis + "><span>" + (d.enabled ? "On" : "Off") + "</span></label>" +
-    '<label for="nt-host">SMTP server</label><input type="text" id="nt-host" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.host) + '">' +
-    '<label for="nt-port">Port / security</label><div class="nt-inline"><input type="text" id="nt-port" data-nt-dep inputmode="numeric" maxlength="5" value="' + esc(String(d.port)) + '"><select id="nt-sec" data-nt-dep>' + secOpts + "</select></div>" +
-    '<label for="nt-user">Gmail address</label><input type="text" id="nt-user" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.username) + '">' +
-    '<label for="nt-pw">App password</label><input type="password" id="nt-pw" data-nt-dep autocomplete="new-password" maxlength="200" value="' + esc(NT.pw) + '">' +
-    '<div class="nt-hint">' + (NT.data.password_saved ? "Password saved - leave empty to keep it. " : "") + "</div>" +
-    '<label for="nt-to">Send to</label><input type="text" id="nt-to" data-nt-dep autocomplete="off" spellcheck="false" maxlength="2000" value="' + esc(d.to) + '">' +
-    '<div class="nt-hint">Several recipients: separate them with commas.</div></div>' +
-    '<div class="set-sec">E-mail me about</div><div class="nt-kinds">' + kinds + "</div>" +
-    '<div class="nt-actions"><button type="button" class="btn sm" data-nt-q="all" data-nt-dep>Select All</button>' +
-    '<button type="button" class="btn sm" data-nt-q="problems" data-nt-dep>Problems Only</button>' +
-    '<button type="button" class="btn sm" data-nt-q="none" data-nt-dep>Clear</button></div>' +
-    '<div class="nt-actions"><button type="button" class="btn sm" id="nt-test" data-nt-dep>Send Test E-Mail</button>' +
-    '<button type="button" class="btn p sm" id="nt-save"' + dis + ">Save Notification Settings</button></div>" +
+    '<div class="set-sec">E-mail delivery</div>' +
+    row("Send e-mail notifications", "Copies of the notifications shown under the bell icon.", sw("nt-enabled", d.enabled, d.enabled ? "On" : "Off", dis)) +
+    row("SMTP server", "Mail server that sends the e-mails.", '<input type="text" id="nt-host" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.host) + '">', "nt-host") +
+    row("Port / security", "Gmail: 587 with STARTTLS, or 465 with SSL.", '<input type="text" id="nt-port" data-nt-dep inputmode="numeric" maxlength="5" value="' + esc(String(d.port)) + '"><select id="nt-sec" data-nt-dep>' + secOpts + "</select>", "nt-port") +
+    row("Gmail address", "The account the e-mails are sent from.", '<input type="text" id="nt-user" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.username) + '">', "nt-user") +
+    row("App password", NT.data.password_saved ? "Password saved - leave empty to keep it." : "Use a Gmail app password, not your normal password.", '<input type="password" id="nt-pw" data-nt-dep autocomplete="new-password" maxlength="200" value="' + esc(NT.pw) + '">', "nt-pw") +
+    row("Send to", "Several recipients: separate them with commas.", '<input type="text" id="nt-to" data-nt-dep autocomplete="off" spellcheck="false" maxlength="2000" value="' + esc(d.to) + '">', "nt-to") +
+    '<div class="set-sec">E-mail me about</div>' +
+    row("Quick select", "Choose the notification types in one click.", '<button type="button" class="set-def" data-nt-q="all" data-nt-dep>Select All</button><button type="button" class="set-def" data-nt-q="problems" data-nt-dep>Problems Only</button><button type="button" class="set-def" data-nt-q="none" data-nt-dep>Clear</button>') +
+    kinds +
+    '<div class="set-sec">Test and save</div>' +
+    row("E-mail settings", "Send a test e-mail first, then save.", '<button type="button" class="btn sm" id="nt-test" data-nt-dep>Send Test E-Mail</button><button type="button" class="btn p sm" id="nt-save"' + dis + ">Save Notification Settings</button>") +
     '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" id="nt-msg" role="status" aria-live="polite" style="margin:10px 0 0">' + esc(NT.msg ? NT.msg.text : "") + "</div>" + last;
   ntEnabledState();
 }
@@ -11397,7 +8805,7 @@ document.addEventListener("click", async e => {
 document.addEventListener("change", e => {
   const root = $("nt-root"); if (!root || !root.contains(e.target) || !SET_CAN_EDIT || !NT.data) return;
   if (e.target.id === "nt-enabled") { ntCollect(); NT.draft.enabled = e.target.checked; e.target.parentNode.querySelector("span").textContent = e.target.checked ? "On" : "Off"; ntEnabledState(); }
-  else if (e.target.dataset.ntKind) { const k = e.target.dataset.ntKind, set = new Set(NT.draft.kinds); e.target.checked ? set.add(k) : set.delete(k); NT.draft.kinds = NT.data.kinds.map(x => x.key).filter(x => set.has(x)); }
+  else if (e.target.dataset.ntKind) { const lb = e.target.parentNode.querySelector("span"); if (lb) lb.textContent = e.target.checked ? "On" : "Off"; const k = e.target.dataset.ntKind, set = new Set(NT.draft.kinds); e.target.checked ? set.add(k) : set.delete(k); NT.draft.kinds = NT.data.kinds.map(x => x.key).filter(x => set.has(x)); }
   else if (e.target.id === "nt-sec") {
     ntCollect();
     if (["", "587", "465"].includes(String(NT.draft.port))) NT.draft.port = e.target.value === "ssl" ? "465" : "587";
@@ -11415,8 +8823,6 @@ function render(d) {
   for (const h of [...selected]) if (!d.hosts.some(x => x.host === h)) selected.delete(h);
 
   const m = d.monitor;
-  const st = $("state"); st.textContent = "Monitor " + m.state; st.className = "mstate " + m.state;
-  const md = $("mon-dot"); md.className = "mdot " + m.state;
   $("meta").textContent = "Check: " + m.mode + " every " + m.interval + "s" + (m.started_at ? "  |  started " + m.started_at : "");
   $("btn-mon").textContent = m.state === "running" ? "Stop Monitoring" : "Start Monitoring";
   $("btn-mon").className = "btn " + (m.state === "running" ? "dg" : "p ok");
@@ -11449,10 +8855,6 @@ function render(d) {
       : "Monitoring is " + m.state;
   }
   $("p-cycles").textContent = m.cycles + " check cycles";
-  { // static text only (no timers or counters): a title that changes every poll makes the browser tooltip flicker
-    const tip = "Monitoring is " + m.state + " - Check: " + m.mode + " every " + m.interval + "s";
-    const md2 = $("mon-dot");
-    if (md2.title !== tip) { md2.title = tip; md2.setAttribute("aria-label", tip); $("state").title = tip; } }
 
   fillProfileLists(d);
   syncNotes(d);
@@ -12271,6 +9673,7 @@ async function refresh() {
   try {
     const r = await fetch("/api/status", {cache: "no-store"});
     render(await r.json());
+    try { ctDeviceSync(); } catch (e) {}
     $("lost").textContent = "";
   } catch (e) { $("lost").textContent = "Lost connection to the script"; }
   refreshImages();
@@ -12453,16 +9856,17 @@ function stSay(kind, text) { const m = $("st-msg"); m.className = "msg " + kind;
 
 function showView(view, push) {
   if (view === "settings" && ME.role === "viewer") view = "home";
-  if ((view === "diagram" || view === "diagnosis") && ME.role === "viewer") view = "home";
-  if (view !== "storage" && view !== "settings" && view !== "diagram" && view !== "diagnosis") view = "home";
-  const storage = view === "storage", settings = view === "settings", diagram = view === "diagram", diagnosis = view === "diagnosis";
-  if (storage || settings || diagram || diagnosis) { try { closeDrawer(); } catch (e) {} }
-  $("dashboard").hidden = storage || settings || diagram || diagnosis;
+  if ((view === "diagram" || view === "diagnosis" || view === "troubleshoot") && ME.role === "viewer") view = "home";
+  if (view !== "storage" && view !== "settings" && view !== "diagram" && view !== "diagnosis" && view !== "troubleshoot") view = "home";
+  const storage = view === "storage", settings = view === "settings", diagram = view === "diagram", diagnosis = view === "diagnosis", trouble = view === "troubleshoot";
+  if (storage || settings || diagram || diagnosis || trouble) { try { closeDrawer(); } catch (e) {} }
+  $("dashboard").hidden = storage || settings || diagram || diagnosis || trouble;
   $("storage").hidden = !storage;
   $("diagram").hidden = !diagram;
   $("diagnosis").hidden = !diagnosis;
+  $("troubleshoot").hidden = !trouble;
   $("settings").hidden = !settings;
-  for (const [id, on] of [["tab-home", view === "home"], ["tab-diagram", diagram], ["tab-diagnosis", diagnosis], ["tab-storage", storage]]) {
+  for (const [id, on] of [["tab-home", view === "home"], ["tab-diagram", diagram], ["tab-diagnosis", diagnosis], ["tab-troubleshoot", trouble], ["tab-storage", storage]]) {
     $(id).classList.toggle("on", on);
     $(id).setAttribute("aria-selected", String(on));
   }
@@ -12472,6 +9876,7 @@ function showView(view, push) {
   if (settings) openSettings();
   if (diagram) openDiagram(); else dgStop();
   if (diagnosis) openDiagnosis(); else dxStop();
+  if (trouble) openTroubleshoot();
 }
 document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => showView(b.dataset.view)));
 
@@ -12877,7 +10282,7 @@ const SET = {data: null, draft: {}, tab: "rollout"};
 const SET_CAN_EDIT = ME.role !== "operator" && ME.role !== "viewer";
 if (ME.role === "viewer") $("btn-settings").hidden = true;
 $("btn-settings").addEventListener("click", () => showView($("settings").hidden ? "settings" : "home"));
-function setSay(kind, text) { const m = $("set-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
+function setSay(kind, text) { const m = $("troubleshoot").hidden ? $("set-msg") : $("tr-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
 const setUnit = (item, v) => item.type === "bool" ? (v ? "On" : "Off") : v + " " + item.unit;
 function setMinutes(item, v) {
   if (item.unit !== "s" || !(v >= 120)) return "";
@@ -12922,7 +10327,7 @@ function renderSettings() {
   $("set-title").textContent = g.title;
   $("set-note").hidden = SET_CAN_EDIT;
   let html = '<div class="set-intro">' + esc(g.intro) + "</div>" +
-    (g.id === "timeouts" ? '<div id="tp-root"></div><div id="ct-root"></div>' : "") +
+    (g.id === "timeouts" ? '<div id="tp-root"></div>' : "") +
     (g.id === "notifications" ? '<div id="nt-root"></div>' : "") +
     (g.id === "ai" ? '<div id="ai-root"></div>' : "") +
     (g.id === "about" ? '<div id="ab-root"></div>' : ""), sec = null;
@@ -12932,7 +10337,7 @@ function renderSettings() {
     html += setRow(item);
   }
   $("set-body").innerHTML = html;
-  if (g.id === "timeouts") { tpRender(); ctRender(); }
+  if (g.id === "timeouts") tpRender();
   if (g.id === "notifications") { ntRender(); if (!NT.data && !NT.loading) { NT.loading = true; ntLoad().finally(() => { NT.loading = false; }); } }
   if (g.id === "ai") { aiRender(); if (!AIS.data && !AIS.loading) aiLoad(); }
   if (g.id === "about") aboutRender();
@@ -13002,14 +10407,26 @@ $("set-save").addEventListener("click", async () => {
   } catch (e) { setSay("err", e.message); }
 });
 
+async function openTroubleshoot() {
+  setSay("", "");
+  try {
+    const r = await fetch("/api/settings", {cache: "no-store"});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "Could not load the settings.");
+    SET.data = d; SET.draft = {...d.values};
+    tpRender(); ctRender();
+    tpLoad();
+  } catch (e) { setSay("err", e.message); }
+}
+
 // ============================================================================================
-// Command duration profiles + Command time test (Settings > Command Outputs).
+// Command duration profiles (Settings > Command Outputs picks and applies them) + Command time test (Troubleshoot tab).
 //  - Profiles: named sets of the command timeouts. "Default" is built in. Apply copies a profile into the settings.
 //  - Command time test: run the preset commands on one switch with the Execute buttons, see each result and note
 //    the time it took. The numbers can become a report (CSV / printable page) or a new profile.
 // ============================================================================================
 const TP = {data: null, sel: "Default", form: false};
-const CT = {open: false, host: null, image: "", results: {}, outs: {}, running: null, margin: 3, keepDefault: true, form: false, sel: null, railClosed: {}, path: "three"};
+const CT = {tab: "setup", open: true, host: null, image: "", results: {}, outs: {}, running: null, margin: 3, keepDefault: true, form: false, sel: null, railClosed: {}, path: "", picks: {}, credBusy: false, sig: ""};
 try {
   const saved = JSON.parse(localStorage.getItem("ct") || "null");
   if (saved && typeof saved === "object") {
@@ -13017,9 +10434,19 @@ try {
     CT.host = saved.host || null;
     CT.image = saved.image || "";
     if (saved.margin >= 1 && saved.margin <= 20) CT.margin = saved.margin;
+    if (saved.path === "one" || saved.path === "three") CT.path = saved.path;
+    if (typeof saved.sel === "string") CT.sel = saved.sel;
+    if (saved.tab === "detail") CT.tab = "detail";
+    if (saved.outs && typeof saved.outs === "object") CT.outs = saved.outs;
+    if (saved.picks && typeof saved.picks === "object") CT.picks = saved.picks;
   }
 } catch (e) {}
-function ctPersist() { try { localStorage.setItem("ct", JSON.stringify({results: CT.results, host: CT.host, image: CT.image, margin: CT.margin})); } catch (e) {} }
+function ctOn(type, fn) { for (const el of [$("set-body"), $("tr-body"), $("tr-side")]) el.addEventListener(type, fn); }
+function ctPersist() {      // everything the test has measured survives a page refresh (results, outputs, choices)
+  const base = {results: CT.results, host: CT.host, image: CT.image, margin: CT.margin, path: CT.path, sel: CT.sel, tab: CT.tab, picks: CT.picks};
+  try { localStorage.setItem("ct", JSON.stringify({...base, outs: CT.outs})); return; } catch (e) {}
+  try { localStorage.setItem("ct", JSON.stringify(base)); } catch (e) {}      // outputs too big for the browser storage: keep the times at least
+}
 const tmoItems = () => SET.data ? SET.data.items.filter(i => i.group === "timeouts") : [];
 const fmtS = n => typeof n === "number" ? n.toFixed(2) : "";
 function tipsIn(id) { const r = $(id); if (r) r.querySelectorAll(".tip").forEach(tipInit); }
@@ -13036,14 +10463,15 @@ async function tpLoad() {
 }
 function tpDraftValues() {
   const out = {};
-  for (const i of tmoItems()) {
-    const v = SET.draft[i.key];
+  for (const i of tmoItems()) {                  // the timeouts in use (saved in Settings)
+    const v = SET.data.values[i.key];
     if (!Number.isInteger(v) || v < i.min || v > i.max) throw new Error(i.label + " must be a whole number from " + i.min + " to " + i.max + ".");
     out[i.key] = v;
   }
   return out;
 }
-function tpRender() {
+function tpRender() { tpRenderSettings(); trProfRender(); }
+function tpRenderSettings() {
   const root = $("tp-root"); if (!root || !SET.data) return;
   if (!TP.data) { root.innerHTML = '<div class="tp-bar tp-state">Loading the profiles ...</div>'; return; }
   const list = TP.data.profiles, active = TP.data.active;
@@ -13059,26 +10487,71 @@ function tpRender() {
        cur.source === "command test" ? "built from a command time test" + (cur.switch ? " on " + cur.switch : "") : "typed in by hand"]
       .filter(Boolean).join(" | ");
   const grid = tmoItems().map(i => "<span>" + esc(i.label) + "</span><span>" + cur.values[i.key] + " s</span>").join("");
+  const tip = "A profile is a named set of the command timeouts below. Apply puts its values into the settings and saves them. Delete removes a saved profile (the timeouts now in use do not change). Profiles are created in the Troubleshoot tab, for example from a Command time test measured on a real switch.";
   root.innerHTML = '<div class="tp-bar">' +
-    '<div class="tp-row"><label for="tp-sel">Command duration profile<span class="tip" data-tip="A profile is a named set of the command timeouts below. Apply puts its values into the settings and saves them. Create profiles from the values on this page, or from a Command time test measured on a real switch (for example one profile per site)."></span></label>' +
+    '<div class="tp-row"><label for="tp-sel">Command duration profile<span class="tip" data-tip="' + esc(tip) + '"></span></label>' +
     '<select id="tp-sel">' + opts + "</select>" +
     '<button type="button" class="btn p sm" data-tp="apply"' + (SET_CAN_EDIT && cur.name !== active ? "" : " disabled") + ' title="Use the values of this profile now">Apply</button>' +
-    '<button type="button" class="btn sm" data-tp="new"' + dis + ' title="Save the values shown below as a new profile">New From Page Values...</button>' +
-    '<button type="button" class="btn sm" data-tp="update"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ' title="Replace the values of this profile with the values shown below">Update From Page Values</button>' +
-    '<button type="button" class="btn sm" data-tp="delete"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ">Delete</button>" +
+    '<button type="button" class="btn sm" data-tp="delete"' + (SET_CAN_EDIT && !cur.builtin ? "" : " disabled") + ' title="Delete this profile">Delete</button>' +
     '<span class="tp-state">' + state + "</span></div>" +
-    (TP.form ? '<div class="tp-row"><input type="text" id="tp-name" maxlength="40" placeholder="Profile name, e.g. Colombo site" aria-label="New profile name">' +
-      '<input type="text" id="tp-note" maxlength="300" placeholder="Note (optional)" aria-label="Note" style="min-width:260px">' +
-      '<button type="button" class="btn p sm" data-tp="create">Save Profile</button><button type="button" class="btn sm" data-tp="cancel">Cancel</button></div>' : "") +
     '<div class="tp-info">' + esc(meta) + "</div>" +
     '<details class="tp-vals"><summary>Values in this profile</summary><div class="tp-grid">' + grid + "</div></details></div>";
   tipsIn("tp-root");
 }
+// Troubleshoot tab: profile selection and creation, the same way as the site menu in the header
+function trProfRender() {
+  const pop = $("prof-pop"), badge = $("prof-badge"); if (!pop) return;
+  tipsIn("troubleshoot");
+  if (!TP.data) { badge.textContent = "Profile: loading ..."; pop.innerHTML = ""; return; }
+  const list = TP.data.profiles, active = TP.data.active;
+  if (!list.some(p => p.name === TP.sel)) TP.sel = active || "Default";
+  badge.textContent = "Profile: " + TP.sel;
+  $("tr-state").innerHTML = active ? "In use: <b>" + esc(active) + "</b>" : "In use: <b>Custom values</b>";
+  pop.innerHTML = "";
+  for (const p of list) {
+    const b = document.createElement("button");
+    b.type = "button"; b.setAttribute("role", "menuitem");
+    b.className = p.name === TP.sel ? "cur" : "";
+    b.textContent = (p.name === TP.sel ? "\u2713 " : "") + p.name + (p.builtin ? " (built-in)" : "");
+    b.title = p.name;
+    b.addEventListener("click", () => { trCloseProf(); TP.sel = p.name; tpRender(); ctRender(); });
+    pop.appendChild(b);
+  }
+  pop.appendChild(document.createElement("hr"));
+  const add = document.createElement("button");
+  add.type = "button"; add.className = "newsite"; add.setAttribute("role", "menuitem"); add.disabled = !SET_CAN_EDIT;
+  add.textContent = "+ Create New Profile\u2026";
+  add.addEventListener("click", () => { trCloseProf(); trOpenProfModal(); });
+  pop.appendChild(add);
+}
+function trCloseProf() { $("prof-pop").hidden = true; $("prof-badge").setAttribute("aria-expanded", "false"); }
+function profSay(kind, text) { const m = $("prof-msg"); m.className = "msg " + kind; m.textContent = text || ""; }
+function trOpenProfModal() { $("prof-new").value = ""; $("prof-note").value = ""; profSay("", ""); $("prof-modal").hidden = false; $("prof-new").focus(); }
+function trCloseProfModal() { $("prof-modal").hidden = true; }
+$("prof-badge").addEventListener("click", e => {
+  e.stopPropagation();
+  const open = $("prof-pop").hidden;
+  $("prof-pop").hidden = !open; $("prof-badge").setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("click", e => { if (!e.target.closest("#troubleshoot .sitemenu")) trCloseProf(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { trCloseProf(); trCloseProfModal(); } });
+$("btn-prof-cancel").addEventListener("click", trCloseProfModal);
+$("prof-modal").addEventListener("click", e => { if (e.target === $("prof-modal")) trCloseProfModal(); });
+$("prof-new").addEventListener("keydown", e => { if (e.key === "Enter") $("btn-prof-create").click(); });
+$("btn-prof-create").addEventListener("click", async () => {
+  const name = $("prof-new").value.trim(), note = $("prof-note").value.trim();
+  if (!name) { profSay("err", "Enter a name for the new profile."); return; }
+  if (!TP.data || TP.data.profiles.some(p => p.name.toLowerCase() === name.toLowerCase())) { profSay("err", "A profile with this name already exists."); return; }
+  $("btn-prof-create").disabled = true;
+  try {
+    const r = await post("/api/timeout-profiles/save", {name, values: tpDraftValues(), note, source: "manual", site: siteName || "", overwrite: false});
+    TP.data = r; TP.sel = r.saved; tpRender(); ctRender(); trCloseProfModal(); setSay("ok", r.message);
+  } catch (e) { profSay("err", e.message); }
+  finally { $("btn-prof-create").disabled = false; }
+});
 async function tpAction(act) {
   try {
     if (!TP.data) return;
-    if (act === "new") { TP.form = true; tpRender(); const n = $("tp-name"); if (n) n.focus(); return; }
-    if (act === "cancel") { TP.form = false; tpRender(); return; }
     if (act === "apply") {
       if (setDirtyKeys().length && !confirm("There are unsaved changes on this page. Applying the profile replaces the timeout values and saves them. Continue?")) return;
       const r = await post("/api/timeout-profiles/apply", {name: TP.sel});
@@ -13089,21 +10562,6 @@ async function tpAction(act) {
       if (!confirm("Delete the profile '" + TP.sel + "'? The timeouts now in use do not change.")) return;
       const r = await post("/api/timeout-profiles/delete", {name: TP.sel});
       TP.data = r; TP.sel = "Default"; tpRender(); setSay("ok", r.message); return;
-    }
-    if (act === "update" || act === "create") {
-      const values = tpDraftValues();
-      let name = TP.sel, note = "", overwrite = true;
-      if (act === "create") {
-        name = ($("tp-name").value || "").trim(); note = ($("tp-note").value || "").trim();
-        const ex = TP.data.profiles.find(p => p.name.toLowerCase() === name.toLowerCase());
-        overwrite = !!ex;
-        if (ex && !ex.builtin && !confirm("A profile named '" + ex.name + "' already exists. Replace its values?")) return;
-      } else {
-        if (!confirm("Replace the values of '" + name + "' with the values shown on this page?")) return;
-        note = (TP.data.profiles.find(p => p.name === name) || {}).note || "";
-      }
-      const r = await post("/api/timeout-profiles/save", {name, values, note, source: "manual", site: siteName || "", overwrite});
-      TP.data = r; TP.sel = r.saved; TP.form = false; tpRender(); setSay("ok", r.message);
     }
   } catch (e) { setSay("err", e.message); }
 }
@@ -13198,9 +10656,68 @@ function ctSelected(presets) {            // the step shown on the right: your c
 }
 const CT_PATH_GROUP = {"3. Install - Activate/Distribute": "three", "3. Install - Full Upgrade": "one"};
 function ctPathOff(g) { return !!CT_PATH_GROUP[g] && CT_PATH_GROUP[g] !== CT.path; }   // the install path you did not choose
+const CT_PATHS = [["three", "Install - Activate/Distribute"], ["one", "Install - Full Upgrade"]];
+function ctPresets() { return (TP.data && CT.path) ? TP.data.presets.filter(p => !ctPathOff(p.group)) : []; }   // only the steps of the chosen test type
+function ctGateOk() { const h = ctHostInfo(); return !!(h && h.profile && h.creds && h.creds.state === "ok"); }   // a credential profile is attached and its login works
+function ctDevHtml(h) {
+  if (!h) return '<span class="mu">No switch selected.</span>';
+  const c = h.creds || {state: "idle"}, mode = h.boot && h.boot.mode;
+  const login = !h.profile ? '<span class="bad">No credential profile attached</span>'
+    : c.state === "ok" ? '<span class="ok">Login OK</span>' : c.state === "testing" ? '<span class="mu">Testing ...</span>'
+    : c.state === "failed" ? '<span class="bad" title="' + esc(c.detail || "") + '">Login failed</span>' : '<span class="mu">Not tested yet</span>';
+  return "<span>Login: <b>" + login + "</b></span><span>Version: <b>" + esc(h.version || "-") + "</b>" + (h.model ? ' <span class="mu">(' + esc(h.model) + ")</span>" : "") +
+    "</span><span>Boot mode: <b>" + esc(mode || "-") + "</b></span>";
+}
+function ctFieldsHtml(hosts, images, busy) {
+  const h = ctHostInfo(), profs = (last && last.profiles) || [], dis = busy ? " disabled" : "";
+  const cur = (CT.picks[CT.host] && profs.some(x => x.name === CT.picks[CT.host])) ? CT.picks[CT.host] : ((h && h.profile) || "");
+  return '<div class="ct-f tr-f-switch"><label for="ct-host">Switch</label><select id="ct-host"' + dis + ">" + hosts.map(x => '<option value="' + esc(x.host) + '"' + (x.host === CT.host ? " selected" : "") + ">" +
+      esc(x.host + (x.label ? " - " + x.label : "") + (x.platform ? " (" + x.platform + ")" : "")) + "</option>").join("") + "</select></div>" +
+    '<div class="ct-f tr-f-image"><label for="ct-image">Image</label><select id="ct-image"' + dis + '><option value="">- choose the image to test with -</option>' +
+      images.map(n => '<option value="' + esc(n) + '"' + (n === CT.image ? " selected" : "") + ">" + esc(n) + "</option>").join("") + "</select></div>" +
+    '<div class="ct-f tr-f-type"><label for="ct-path">Test type<span class="tr-req"> *</span></label><select id="ct-path"' + dis + '><option value="">- choose what to test -</option>' +
+      CT_PATHS.map(x => '<option value="' + x[0] + '"' + (x[0] === CT.path ? " selected" : "") + ">" + esc(x[1]) + "</option>").join("") + "</select></div>" +
+    '<div class="ct-f tr-cred-f"><label for="ct-cred">Credential profile<span class="tr-req"> *</span></label><select id="ct-cred"' + dis + ">" +
+      '<option value="">- choose a profile -</option>' + profs.map(x => '<option value="' + esc(x.name) + '"' + (x.name === cur ? " selected" : "") + ">" + esc(x.name + " (" + x.username + ", " + (x.protocol === "telnet" ? "Telnet" : "SSH") + ")") + "</option>").join("") + "</select></div>" +
+    '<div class="ct-f tr-f-btn"><label>&nbsp;</label><button type="button" class="btn p" id="ct-cred-test" data-ct="credtest"' + ((busy || CT.credBusy || !profs.length) ? " disabled" : "") + ">" + (CT.credBusy ? "Testing ..." : "Test Credentials") + "</button></div>" +
+    '<div class="ct-f tr-dev-f"><label>Switch details (read automatically)</label><div class="tr-dev" id="ct-dev">' + ctDevHtml(h) + "</div></div>";
+}
+async function ctCredTest() {
+  const h = ctHostInfo(), sel = $("ct-cred"), name = sel ? sel.value : "";
+  if (!h || CT.credBusy || CT.running) return;
+  if (!name) { setSay("err", "Choose a credential profile first."); return; }
+  CT.credBusy = true; ctRender(); setSay("", "");
+  try {
+    if (h.profile !== name) await post("/api/profile/assign", {hosts: [CT.host], profile: name});
+    await post("/api/test-credentials", {hosts: [CT.host]});
+    let row = null;
+    for (let i = 0; i < 60; i++) {
+      await sleep(1500); await refresh();
+      const r = ctHostInfo(); if (r && r.creds && r.creds.state !== "testing") { row = r; break; }
+    }
+    if (!row || row.creds.state !== "ok") { setSay("err", "Login failed: " + ((row && row.creds && row.creds.detail) || "no answer from the switch") + "."); return; }
+    setSay("ok", "Login OK. Reading the version and boot mode ...");
+    const before = row.version_note || "";
+    await post("/api/version", {hosts: [CT.host]});
+    for (let i = 0; i < 25; i++) {
+      await sleep(2000); await refresh();
+      const r = ctHostInfo(); if (r && (r.version_note || "") !== before) { row = r; break; }
+    }
+    row = ctHostInfo() || row;
+    setSay("ok", "Ready: " + (row.version ? "version " + row.version : "version not read") + ((row.boot && row.boot.mode) ? ", " + row.boot.mode + " boot mode" : "") + ".");
+  } catch (e) { setSay("err", e.message); }
+  CT.credBusy = false; ctRender();
+}
+function ctDeviceSync() {           // keep the switch details and the Execute gate in step with the status poll (no re-render while a list is open)
+  if ($("troubleshoot").hidden) return;
+  const h = ctHostInfo(), box = $("ct-dev"); if (box) box.innerHTML = ctDevHtml(h);
+  const sig = [CT.host, h && h.profile, h && h.creds && h.creds.state, ctGateOk(), (last && last.profiles || []).map(x => x.name).join(",")].join("|");
+  if (sig !== CT.sig) { CT.sig = sig; const a = document.activeElement; if (!(a && a.tagName === "SELECT" && $("troubleshoot").contains(a))) ctRender(); }
+}
 function ctRailHtml(presets) {
   const busy = !!CT.running && CT.running.host === CT.host;
-  let html = "", num = 0;
+  let html = "", num = 0, top = 0;
+  for (const q of presets) { const m = ctStats(ctRuns(CT.host, q.id)).max; if (typeof m === "number" && m > top) top = m; }   // slowest measured step: the 100% mark for the colours
   for (const g of [...new Set(presets.map(p => p.group))]) {
     const steps = presets.filter(p => p.group === g), open = !CT.railClosed[g], done = steps.filter(ctStepDone).length;
     const off = ctPathOff(g);
@@ -13210,21 +10727,22 @@ function ctRailHtml(presets) {
       num++;
       if (!open) continue;
       const st = ctStats(ctRuns(CT.host, p.id)), running = busy && CT.running.id === p.id;
-      const cls = (off ? " off" : "") + (p.id === CT.sel ? " sel" : "") + (running ? " run" : st.last ? (ctStepDone(p) ? " done" : " bad") : "");
-      html += '<button type="button" class="ct-r' + cls + '" data-ct="sel" data-id="' + esc(p.id) + '" title="' + esc(p.title) + '"><span class="ct-n">' + (ctStepDone(p) && !running ? "&#10003;" : num) + '</span>' +
+      const cls = (off ? " off" : "") + (p.id === CT.sel ? " sel" : "") + (running ? " run" : st.last ? (ctStepDone(p) ? " done" + ((st.max != null && top > 0) ? (st.max / top < 0.25 ? " h1" : st.max / top < 0.6 ? " h2" : " h3") : "") : " bad") : "");
+      html += '<button type="button" class="ct-r' + cls + '" data-ct="sel" data-id="' + esc(p.id) + '" title="' + esc(p.title) + '"><span class="ct-n">' + num + '</span>' +
         '<span class="ct-r-t">' + esc(p.title) + '</span><span class="ct-r-v">' + (running ? Math.round(CT.running.elapsed) + " s" : st.max != null ? fmtS(st.max) + " s" : "") + "</span></button>";
     }
     html += "</div>";
   }
-  return html;
+  return html + '<div class="ct-legend"><span><i style="background:var(--gr)"></i>Fast</span><span><i style="background:var(--am)"></i>Medium</span><span><i style="background:#e8731a"></i>Slow</span><span><i style="background:var(--rd)"></i>Failed</span></div>';
 }
 function ctDetailHtml(p, num, total) {
   const host = CT.host, runs = ctRuns(host, p.id), st = ctStats(runs), key = host + "|" + p.id, busy = !!CT.running;
   const running = busy && CT.running.host === host && CT.running.id === p.id;
   const badges = (p.warn ? (p.kind === "activate" ? '<span class="ct-badge d">reloads the switch</span>' : '<span class="ct-badge">changes the switch</span>') : "") +
-    (p.needs_image && !CT.image ? '<span class="ct-badge n">choose an image above</span>' : "");
+    (p.needs_image && !CT.image ? '<span class="ct-badge n">choose an image in Test Setup</span>' : "") +
+    (ctGateOk() ? "" : '<span class="ct-badge n">test the credentials in Test Setup first</span>');
   const act = running ? '<button type="button" class="btn dg" data-ct="stop"' + (CT.running.stopping ? " disabled" : "") + ">" + (CT.running.stopping ? "Stopping ..." : "Stop") + "</button>"
-    : '<button type="button" class="btn p" data-ct="run" data-id="' + esc(p.id) + '"' + (busy ? " disabled" : "") + ">Execute</button>";
+    : '<button type="button" class="btn p" data-ct="run" data-id="' + esc(p.id) + '"' + ((busy || !ctGateOk()) ? " disabled" : "") + (ctGateOk() ? "" : ' title="Attach a credential profile and test it in Test Setup first"') + ">Execute</button>";
   const idx = TP.data.presets.findIndex(x => x.id === p.id), nxt = TP.data.presets.slice(idx + 1).find(x => !ctPathOff(x.group));
   const chips = p.keys.length ? p.keys.map(k => '<span class="ct-chip">' + esc(ctFeeds([k])) + "</span>").join("") : '<span class="ct-chip">no timeout setting - for your information</span>';
   const body = running ? '<div class="ct-panel" id="ct-live">' + ctLiveHtml() + "</div>"
@@ -13239,38 +10757,55 @@ function ctDetailHtml(p, num, total) {
     '</b></div><div class="ct-tile"><span>Average</span><b>' + (st.avg != null ? fmtS(st.avg) + " s" : "-") + '</b></div><div class="ct-tile"><span>Runs</span><b>' + st.n + "</b></div></div>" +
     (running || st.last ? '<div class="ct-status">' + (running ? '<span class="dot warn"></span>Running on ' + esc(host) : ctStatusHtml(st.last)) + "</div>" : "") + body + "</div>";
 }
+function ctTabs() {
+  const empty = !ctHosts().length || !(TP.data && TP.data.presets.length);
+  const tab = empty ? "detail" : (CT.tab === "detail" ? "detail" : "setup");
+  const top = $("tr-top"); if (top) { top.classList.toggle("is-setup", tab === "setup"); }
+  for (const t of ["setup", "detail"]) {
+    const pane = $("tr-pane-" + t), btn = $("tr-tab-" + t);
+    if (pane) pane.hidden = t !== tab;
+    if (btn) btn.setAttribute("aria-selected", t === tab ? "true" : "false");
+  }
+}
 function ctRender() {
-  const root = $("ct-root"); if (!root || !SET.data) return;
-  const presets = TP.data ? TP.data.presets : [], hosts = ctHosts(), images = TP.data ? TP.data.images : [];
+  if (!SET.data || !$("tr-rail")) return;
+  const all = TP.data ? TP.data.presets : [], presets = ctPresets(), hosts = ctHosts(), images = TP.data ? TP.data.images : [];
   if (!hosts.some(h => h.host === CT.host)) CT.host = hosts.length ? hosts[0].host : null;
   if (CT.image && !images.includes(CT.image)) CT.image = "";
-  let html = '<div class="ct-card' + (CT.open ? " open" : "") + '"><button type="button" class="ct-toggle" data-ct="toggle" aria-expanded="' + CT.open + '">' +
-    '<span>Command time test</span><span class="sub">upgrade ONE switch by hand, step by step, and time every step</span><span class="car">' + IC.dn + "</span></button>";
-  if (CT.open) {
-    if (!hosts.length || !presets.length) {
-      html += '<div class="ct-note">There are no switches in the device list yet. Add the test switch in the Device list and give it a credentials profile, then come back.</div>';
-    } else {
-      const busy = !!CT.running, p = ctSelected(presets), num = presets.indexOf(p) + 1;
-      const connect = (CT.results[CT.host] || {})._connect || [];
-      html += '<div class="ct-bar"><div class="ct-f"><label for="ct-host">Switch</label><select id="ct-host"' + (busy ? " disabled" : "") + ">" + hosts.map(h => '<option value="' + esc(h.host) + '"' + (h.host === CT.host ? " selected" : "") + ">" +
-          esc(h.host + (h.label ? " - " + h.label : "") + (h.platform ? " (" + h.platform + ")" : "")) + "</option>").join("") + "</select></div>" +
-        '<div class="ct-f"><label for="ct-image">Image</label><select id="ct-image"' + (busy ? " disabled" : "") + '><option value="">- choose the image to test with -</option>' +
-        images.map(n => '<option value="' + esc(n) + '"' + (n === CT.image ? " selected" : "") + ">" + esc(n) + "</option>").join("") + "</select></div>" +
-        '<div class="ct-bar-r"><span class="tip" data-tip="Run the steps from top to bottom on a TEST switch: it is a real upgrade done by hand. Pick a step on the left, press Execute, read the output here and in the console, then go on with Next step. The image is needed for the copy, the MD5 check and the add step. Steps marked as changing the switch ask first; Activate RELOADS the switch. Run a step again to get a second sample - the slowest time of each step is the one that counts."></span>' +
-        '<button type="button" class="btn sm" data-ct="stages" data-v="1">Expand All</button><button type="button" class="btn sm" data-ct="stages" data-v="0">Collapse All</button>' +
-        '<button type="button" class="btn sm" data-ct="clear"' + (busy ? " disabled" : "") + ">Clear Results</button></div></div>";
-      html += '<div class="ct-wb"><nav class="ct-rail" aria-label="Steps">' + ctRailHtml(presets) + '</nav><div class="ct-main">' + ctDetailHtml(p, num, presets.length) + '<div id="cc-slot"></div></div></div>';
-      html += '<div class="ct-result"><div class="ct-result-t">Results And Profile</div><div class="ct-result-g"><div id="ct-sugg-t"></div><div class="ct-side">' +
-        '<div class="ct-sg-h"><label for="ct-margin">Safety margin &times;<span class="tip" data-tip="The suggested timeout is the slowest measured time multiplied by this number, rounded up to 5 seconds. A switch is slower during a busy upgrade than during your test, so keep some room (3 is a good start)."></span></label>' +
-        '<input type="number" id="ct-margin" min="1" max="20" step="0.5" value="' + CT.margin + '">' +
-        '<label class="chk"><input type="checkbox" id="ct-keep"' + (CT.keepDefault ? " checked" : "") + '><span>Never go below the default</span></label></div>' +
-        '<div class="ct-note">Every Execute also times the SSH login' + (connect.length ? " (" + connect.length + " sample" + (connect.length > 1 ? "s" : "") + ", slowest " + fmtS(Math.max(...connect)) + " s)" : "") + ".</div>" +
-        '<div id="ct-sugg-a"></div></div></div></div>';
-    }
+  const busy = !!CT.running;
+  CT.sig = [CT.host, (ctHostInfo() || {}).profile, ((ctHostInfo() || {}).creds || {}).state, ctGateOk(), (last && last.profiles || []).map(x => x.name).join(",")].join("|");
+  ["tr-expand", "tr-collapse", "tr-clear"].forEach(id => { const b = $(id); if (b) b.disabled = !hosts.length || !presets.length || (id === "tr-clear" && busy); });
+  if (!hosts.length || !all.length) {
+    $("tr-fields").innerHTML = ""; $("tr-rail").innerHTML = ""; $("tr-result").innerHTML = "";
+    $("tr-detail").innerHTML = '<div class="ct-note" style="padding:14px 18px">' + (TP.data ? "There are no switches in the device list yet. Add the test switch in the Device list on the Home page and give it a credentials profile, then come back." : "Loading ...") + "</div>";
+    ctTabs(); tipsIn("troubleshoot"); ccSync();
+    return;
   }
-  root.innerHTML = html + "</div>";
+  $("tr-fields").innerHTML = ctFieldsHtml(hosts, images, busy);
+  if (!presets.length) {
+    $("tr-rail").innerHTML = '<div class="ct-note" style="padding:6px 14px 14px">Choose the <b>Test type</b> in Test Setup. The steps for it appear here.</div>';
+    $("tr-detail").innerHTML = '<div class="ct-note" style="padding:14px 18px">Choose the <b>Test type</b> in Test Setup first (Install - Activate/Distribute or Install - Full Upgrade). The steps to run appear on the left.</div>';
+    $("tr-result").innerHTML = "";
+    ctTabs(); tipsIn("troubleshoot");
+    const slot0 = $("cc-slot"); if (slot0) slot0.appendChild(CC_EL);
+    ccSync();
+    return;
+  }
+  const p = ctSelected(presets), num = presets.indexOf(p) + 1;
+  const connect = (CT.results[CT.host] || {})._connect || [];
+  $("tr-rail").innerHTML = ctRailHtml(presets);
+  $("tr-detail").innerHTML = ctDetailHtml(p, num, presets.length);
+  let resHtml = "";
+    resHtml = '<div class="ct-result-g"><div id="ct-sugg-t"></div><div class="ct-side">' +
+      '<div class="ct-sg-h"><label for="ct-margin">Safety margin &times;<span class="tip" data-tip="The suggested timeout is the slowest measured time multiplied by this number, rounded up to 5 seconds. A switch is slower during a busy upgrade than during your test, so keep some room (3 is a good start)."></span></label>' +
+      '<input type="number" id="ct-margin" min="1" max="20" step="0.5" value="' + CT.margin + '">' +
+      '<label class="chk"><input type="checkbox" id="ct-keep"' + (CT.keepDefault ? " checked" : "") + '><span>Never go below the default</span></label></div>' +
+      '<div class="ct-note">Every Execute also times the SSH login' + (connect.length ? " (" + connect.length + " sample" + (connect.length > 1 ? "s" : "") + ", slowest " + fmtS(Math.max(...connect)) + " s)" : "") + ".</div>" +
+      '<div id="ct-sugg-a"></div></div></div>';
+  $("tr-result").innerHTML = resHtml;
   ctRenderSuggest();
-  tipsIn("ct-root");
+  ctTabs();
+  tipsIn("troubleshoot");
   const slot = $("cc-slot"); if (slot) slot.appendChild(CC_EL);
   ccSync();
 }
@@ -13284,12 +10819,13 @@ function ctRenderSuggest() {
     '<div class="ct-note">' + (tmoItems().length - sg.rows.length) + " timeout(s) have no measurement and keep their default value in the profile (for example the backup commands, which this test does not run).</div>";
   act.innerHTML = '<div class="ct-actions"><button type="button" class="btn p" data-ct="saveform"' + dis + (SET_CAN_EDIT ? "" : ' title="Only an Administrator can save profiles"') + ">Save As Profile...</button>" +
     '<button type="button" class="btn sm" data-ct="csv">Report (CSV)</button><button type="button" class="btn sm" data-ct="print">Printable Report</button></div>' +
-    (CT.form ? '<div class="ct-actions"><input type="text" id="ct-pname" maxlength="40" placeholder="Profile name, e.g. Production" aria-label="Profile name">' +
+    (CT.form ? '<div class="ct-actions"><input type="text" id="ct-pname" maxlength="40" placeholder="Profile name, e.g. Production" aria-label="Profile name" value="' + esc(((TP.data && TP.data.profiles.find(p => p.name === TP.sel)) || {builtin: true}).builtin ? "" : TP.sel) + '">' +
       '<button type="button" class="btn p sm" data-ct="save"' + dis + '>Save</button><button type="button" class="btn sm" data-ct="cancelform">Cancel</button></div>' : "");
 }
 async function ctRun(id) {
   if (CT.running || !CT.host || !TP.data) return;
   const p = TP.data.presets.find(x => x.id === id); if (!p) return;
+  if (!ctGateOk()) { setSay("err", "Attach a credential profile to the switch and test it in Test Setup first."); return; }
   const host = CT.host;
   if (p.needs_image && !CT.image) { setSay("err", "Choose the image to test with first."); return; }
   if (p.warn && !confirm("'" + p.title + "' " + p.warn.replace("{host}", host) + "\n\nContinue?")) return;
@@ -13504,19 +11040,22 @@ async function ctSaveProfile() {
     if (ex && !ex.builtin && !confirm("A profile named '" + ex.name + "' already exists. Replace its values?")) return;
     const note = "Measured on " + CT.host + (h && h.label ? " (" + h.label + ")" : "") + ", margin x" + CT.margin + (CT.keepDefault ? ", never below the default" : "");
     const r = await post("/api/timeout-profiles/save", {name, values: sg.values, note, source: "command test", site: siteName || "", switch: CT.host, overwrite: !!ex});
-    TP.data = r; TP.sel = r.saved; CT.form = false; renderSettings(); setSay("ok", r.message);
+    TP.data = r; TP.sel = r.saved; CT.form = false; tpRender(); ctRender(); setSay("ok", r.message);
   } catch (e) { setSay("err", e.message); }
 }
-$("set-body").addEventListener("click", e => {
+ctOn("click", e => {
   const t = e.target.closest("[data-tp]"); if (t) { tpAction(t.dataset.tp); return; }
   const c = e.target.closest("[data-ct]"); if (!c) return;
   switch (c.dataset.ct) {
     case "toggle": CT.open = !CT.open; ctRender(); break;
-    case "run": ctRun(c.dataset.id); break;
+    case "tab": CT.tab = c.dataset.t === "detail" ? "detail" : "setup"; ctTabs(); ctPersist(); break;
+    case "restoggle": { const card = $("tr-res-card"), shut = card.classList.toggle("collapsed"); c.setAttribute("aria-expanded", shut ? "false" : "true"); break; }
+    case "run": CT.tab = "detail"; ctTabs(); ctRun(c.dataset.id); break;
     case "stop": ctStop(); break;
-    case "sel": { CT.sel = c.dataset.id; const sp = TP.data.presets.find(x => x.id === CT.sel); if (sp && CT_PATH_GROUP[sp.group]) CT.path = CT_PATH_GROUP[sp.group]; ctRender(); break; }
+    case "sel": { CT.tab = "detail"; CT.sel = c.dataset.id; ctPersist(); ctRender(); break; }
+    case "credtest": ctCredTest(); break;
     case "next": { const ps = TP.data.presets, i = ps.findIndex(x => x.id === CT.sel); let j = i + 1; while (ps[j] && ctPathOff(ps[j].group)) j++;
-      if (ps[j]) { CT.sel = ps[j].id; CT.railClosed[ps[j].group] = false; ctRender(); } break; }
+      if (ps[j]) { CT.tab = "detail"; CT.sel = ps[j].id; CT.railClosed[ps[j].group] = false; ctRender(); } break; }
     case "stage": CT.railClosed[c.dataset.g] = !CT.railClosed[c.dataset.g]; ctRender(); break;
     case "stages": { for (const g of new Set(TP.data.presets.map(p => p.group))) CT.railClosed[g] = c.dataset.v !== "1"; ctRender(); break; }
     case "clear": if (confirm("Clear the measured times of " + CT.host + "?")) {
@@ -13529,13 +11068,15 @@ $("set-body").addEventListener("click", e => {
     case "save": ctSaveProfile(); break;
   }
 });
-$("set-body").addEventListener("change", e => {
-  if (e.target.id === "tp-sel") { TP.sel = e.target.value; tpRender(); }
+ctOn("change", e => {
+  if (e.target.id === "tp-sel" || e.target.id === "tr-sel") { TP.sel = e.target.value; tpRender(); }
   else if (e.target.id === "ct-host") { CT.host = e.target.value; CT.form = false; ctPersist(); ctRender(); }
   else if (e.target.id === "ct-image") { CT.image = e.target.value; ctPersist(); ctRender(); }
+  else if (e.target.id === "ct-path") { CT.path = e.target.value; CT.sel = null; ctPersist(); ctRender(); }
+  else if (e.target.id === "ct-cred") { CT.picks[CT.host] = e.target.value; ctPersist(); }
   else if (e.target.id === "ct-keep") { CT.keepDefault = e.target.checked; ctRenderSuggest(); }
 });
-$("set-body").addEventListener("input", e => {
+ctOn("input", e => {
   if (e.target.id !== "ct-margin") return;
   const v = Number(e.target.value);
   if (v >= 1 && v <= 20) { CT.margin = v; ctPersist(); ctRenderSuggest(); }
@@ -14331,7 +11872,7 @@ function aiCollect() {
 function aiBody(key) { const d = AIS.draft, c = $("ai-clear"); return {enabled: d.enabled, provider: d.provider, model: d.model, base_url: d.base_url, mask: d.mask, api_key: key, clear_key: !!(c && c.checked)}; }
 document.addEventListener("change", e => {
   const root = $("ai-root"); if (!root || !root.contains(e.target) || !AIS.data) return;
-  if (e.target.id === "ai-prov") { aiCollect(); if (AIS.draft.provider === "anthropic" && !AIS.draft.model) AIS.draft.model = AIS.data.defaults.anthropic_model; aiRender(); }
+  if (e.target.id === "ai-prov") { aiCollect(); { const dm = AIS.data.defaults, prev = [dm.anthropic_model, dm.gemini_model]; if (AIS.draft.provider === "anthropic" && (!AIS.draft.model || prev.includes(AIS.draft.model))) AIS.draft.model = dm.anthropic_model; if (AIS.draft.provider === "gemini" && (!AIS.draft.model || prev.includes(AIS.draft.model))) AIS.draft.model = dm.gemini_model; } aiRender(); }
   else if (e.target.id === "ai-enabled" || e.target.id === "ai-mask") { aiCollect(); aiRender(); }
 });
 document.addEventListener("click", async e => {
@@ -14350,6 +11891,7 @@ document.addEventListener("click", async e => {
 
 if (location.hash === "#storage") showView("storage", false);
 else if (location.hash === "#diagnosis") showView("diagnosis", false);
+else if (location.hash === "#troubleshoot") showView("troubleshoot", false);
 else if (location.hash === "#diagram") showView("diagram", false);
 else if (location.hash === "#settings") showView("settings", false);
 
@@ -14908,7 +12450,7 @@ refresh();
 setInterval(refresh, 2000);
 </script>
 <script>
-// Modern UI helpers: sliding header tabs, gear spin, drag-over file pickers and custom dropdowns.
+// Modern UI helpers: sliding header tabs, drag-over file pickers and custom dropdowns.
 (function () {
   "use strict";
   // ---- sliding tab indicator ----
@@ -14932,15 +12474,6 @@ setInterval(refresh, 2000);
     window.addEventListener("resize", place);
     if (window.ResizeObserver) new ResizeObserver(place).observe(tabs);
     if (document.fonts && document.fonts.ready) document.fonts.ready.then(place);
-  }
-
-  // ---- gear icon: one full turn on every click ----
-  const gear = document.getElementById("btn-settings");
-  if (gear) {
-    gear.addEventListener("click", () => {
-      gear.classList.remove("spin"); void gear.offsetWidth; gear.classList.add("spin");
-    });
-    gear.addEventListener("animationend", () => gear.classList.remove("spin"));
   }
 
   // ---- file pickers: highlight while a file is dragged over ----
