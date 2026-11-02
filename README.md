@@ -2,7 +2,7 @@
 
 NetUpgrade is a Windows desktop application for upgrading Cisco switches in parallel. The desktop launcher runs in the Windows notification area and opens a local web dashboard.
 
-The current application version is **1.0.1**. Upgrade workflows are designed for Cisco Catalyst 9200/9300 switches and IOS-XE INSTALL mode.
+The current application version is **1.0.2**. Upgrade workflows are designed for Cisco Catalyst 9200/9300 switches and IOS-XE INSTALL mode.
 
 ## Features
 
@@ -15,7 +15,7 @@ The current application version is **1.0.1**. Upgrade workflows are designed for
 - Check each IOS-XE image against Cisco's MD5 checksum during upload; images with missing or mismatched checksums are rejected.
 - Set the dashboard-wide upgrade limit (1–10 switches at a time). Extra switches wait in a queue, and an Administrator can choose whether a failure stops queued upgrades.
 - Start upgrades now or schedule them for later; view each switch's live progress and console output in the dashboard.
-- Use Diagnosis to run read-only commands on several switches and review saved logs. Run Commands and Log Analysis keep separate results and status. Log reports can be downloaded as CSV, Excel, or PDF.
+- Use Diagnosis to run read-only commands on several switches and review saved logs. It can also show 802.1X/MAB authentication status, stack ports, and stack power. Run Commands and Log Analysis keep separate results and status. Log reports can be downloaded as CSV, Excel, or PDF.
 - Include stack member, stack port, and stack power status in readiness and pre/post-upgrade checks. Missing members, stack ports that go down, and power-stack changes are reported.
 - Optionally request an AI second opinion from a configured Anthropic, Google Gemini, or OpenAI-compatible service. AI analysis is off by default.
 - Adjust command timeouts, save named timeout profiles, and run command-time checks on a switch before a rollout. Review device events, backups, and per-device command history.
