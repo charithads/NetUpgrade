@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v1.0.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v1.0.2 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -98,16 +98,16 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "1.0.1"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "1.0.2"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
-    {"version": "1.0.1", "date": "2026-10-31", "features": [
-        "Add Google Gemini as an optional AI analysis provider.",
-        "Improve AI error messages and refine the Troubleshoot and Settings screens."]},
+    {"version": "1.0.2", "date": "2026-11-02", "features": [
+        "Add stack port, stack power, and 802.1X/MAB authentication details to switch diagnosis and reports.",
+        "Avoid repeating the same command within each upgrade pre-check or post-check."]},
     {"version": "1.0.0", "date": "2026-10-28", "features": [
         "Upgrade multiple Cisco switches at the same time, with a configurable limit and queued jobs.",
         "Check and upload IOS-XE images, run readiness checks, schedule upgrades, and verify switches after reload.",
@@ -2769,13 +2769,23 @@ TIMEOUT_ITEMS = {i["key"]: i for i in SETTINGS_ITEMS if i["group"] == "timeouts"
 # kind: "command" (one command), "stream" (streamed and answered like the real upgrade does, can be stopped),
 # "bundle" (several commands in one login, timed one by one and in total) or a special step (upload, md5, boot,
 # activate). "warn" marks the steps that change the switch; the GUI asks for confirmation first.
-_PRECHECK_STEPS = ([("show version", "show_cmd"), ("show boot", "show_cmd")]
-                   + [(cmd, "snapshot_cmd") for _key, cmd in SNAPSHOT_COMMANDS]
-                   + [("show processes cpu", "health_cmd"), ("show processes memory", "health_cmd"),
-                      ("show switch", "health_cmd")])
-_POSTCHECK_STEPS = ([("show version", "show_cmd"), ("show processes cpu", "health_cmd"),
-                     ("show processes memory", "health_cmd"), ("show switch", "health_cmd")]
-                    + [(cmd, "snapshot_cmd") for _key, cmd in SNAPSHOT_COMMANDS])
+def _unique_steps(steps):
+    """Each command runs once per check stage ('show switch' is both a health and a snapshot command)."""
+    seen, out = set(), []
+    for cmd, key in steps:
+        if cmd not in seen:
+            seen.add(cmd)
+            out.append((cmd, key))
+    return out
+
+
+_PRECHECK_STEPS = _unique_steps([("show version", "show_cmd"), ("show boot", "show_cmd")]
+                                + [(cmd, "snapshot_cmd") for _key, cmd in SNAPSHOT_COMMANDS]
+                                + [("show processes cpu", "health_cmd"), ("show processes memory", "health_cmd"),
+                                   ("show switch", "health_cmd")])
+_POSTCHECK_STEPS = _unique_steps([("show version", "show_cmd"), ("show processes cpu", "health_cmd"),
+                                  ("show processes memory", "health_cmd"), ("show switch", "health_cmd")]
+                                 + [(cmd, "snapshot_cmd") for _key, cmd in SNAPSHOT_COMMANDS])
 G_PRE, G_PREP, G_INST, G_INST1, G_POST = ("1. Pre-Check", "2. Prepare The Switch", "3. Install - Activate/Distribute",
                                           "3. Install - Full Upgrade", "4. Post-Check")
 COMMAND_TEST_PRESETS = [
@@ -5250,7 +5260,10 @@ DIAG_COMMAND_WORDS = ("show", "ping", "traceroute", "dir", "more", "verify")    
 DIAG_MAX_COMMANDS = 30
 DIAG_MAX_COMMAND_LEN = 200
 DIAG_PIPE_BLOCK_RE = re.compile(r"\|\s*(redirect|tee|append|format)\b", re.I)    # would write a file on the switch
-DIAG_LOG_COMMANDS = ["show logging", "show clock", "show version", "show switch", "show interfaces status err-disabled"]
+DIAG_LOG_COMMANDS = ["show logging", "show clock", "show version", "show switch", "show switch stack-ports", "show stack-power",
+                     "show authentication sessions", "show interfaces status err-disabled"]
+DIAG_MAX_DOT1X = 500                                 # not-authenticated devices kept per switch in the analysis
+_DIAG_COMPLEX_FACTS = ("stack", "stack_ports", "stack_power", "dot1x")      # facts that are lists / dicts, shown separately
 DIAG_LOOKBACK_HOURS = (0, 24, 72, 168, 720)          # 0 = everything still in the log buffer
 DIAG_FLAP_WARN = 10                                  # state changes of one interface that count as flapping
 DIAG_STP_WARN = 20                                   # spanning-tree topology changes that count as a storm
@@ -5415,6 +5428,25 @@ def parse_show_switch(text):
     return rows or None
 
 
+_AUTH_ROW_RE = re.compile(r"^\s*([A-Za-z][A-Za-z-]*\d[\w/.:-]*)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\S+)\s+(\S+)\s+(.+?)\s+([0-9A-Fa-f]{16,})\s*$", re.I)
+_AUTH_OK_STATES = ("auth", "authz success", "auth success", "authc success")
+
+
+def parse_auth_sessions(text):
+    """[{port, mac, method, domain, status, ok}] from 'show authentication sessions' (802.1X / MAB / web-auth),
+    or None when the command is not available on this switch. An empty list means no sessions exist."""
+    if not text or re.search(r"(?im)^\s*%\s*(invalid|ambiguous|incomplete)", text) or "Invalid input" in text:
+        return None
+    rows = []
+    for line in text.splitlines():
+        m = _AUTH_ROW_RE.match(line)
+        if m:
+            status = " ".join(m.group(5).split())
+            rows.append({"port": m.group(1), "mac": m.group(2).lower(), "method": m.group(3).lower(), "domain": m.group(4).upper(),
+                         "status": status, "ok": status.lower() in _AUTH_OK_STATES})
+    return rows
+
+
 def analyze_switch_logs(sections, lookback_hours=0, label="", host=""):
     """Rule-based analysis of the output of DIAG_LOG_COMMANDS ({command: output}). Pure function, no network.
     Returns a JSON-friendly dict: verdict (green/amber/red), findings, top messages, facts, notes."""
@@ -5561,6 +5593,34 @@ def analyze_switch_logs(sections, lookback_hours=0, label="", host=""):
                 "Every stack member must be Ready before an upgrade; a member that is not Ready can be left behind or fail to join.", None)
             findings["stack_state"]["count"] = len(bad)
             findings["stack_state"]["examples"] = [f"switch {r['switch']} ({r['role']}): {r['state']}" for r in bad[:5]]
+    # ---- stack ports, stack power, devices that are not authenticated (802.1X / MAB) ----
+    members = len(stack) if stack else 0
+    sp = parse_stack_ports(sections.get("show switch stack-ports", ""))
+    if sp:
+        ordered = sorted(sp.items(), key=lambda kv: int(kv[0]))
+        facts["stack_ports"] = [{"switch": k, "ports": v} for k, v in ordered]
+        down_sp = [f"switch {k} port {i}: {x}" for k, v in ordered for i, x in enumerate(v, 1) if x.lower() == "down"]
+        if down_sp and members > 1:
+            add("stack_port_down", "Stack port down", "Stack", "warn",
+                "A stack cable or port is down, so the stack has lost redundancy (or is running as a chain). Fix it before upgrading a stack.", None)
+            findings["stack_port_down"]["count"] = len(down_sp)
+            findings["stack_port_down"]["examples"] = down_sp[:5]
+    pw = parse_stack_power(sections.get("show stack-power", ""))
+    if pw:
+        facts["stack_power"] = [{"name": nm, "mode": v["mode"], "topology": v["topology"], "total_w": v["total"],
+                                 "switches": v["sw"], "supplies": v["ps"]} for nm, v in pw.items()]
+    dot1x_unauth = []
+    auth = parse_auth_sessions(sections.get("show authentication sessions", ""))
+    if auth is not None:
+        bad_auth = [x for x in auth if not x["ok"]]
+        facts["dot1x"] = {"sessions": len(auth), "authenticated": len(auth) - len(bad_auth), "not_authenticated": len(bad_auth)}
+        dot1x_unauth = [{k: x[k] for k in ("port", "mac", "method", "domain", "status")} for x in bad_auth[:DIAG_MAX_DOT1X]]
+        if bad_auth:
+            add("dot1x_unauth", f"{len(bad_auth)} device(s) not authenticated (802.1X / MAB)", "Access control", "info",
+                "These clients are connected but have not passed authentication (failed, unauthorized or still running). "
+                "Check them before the upgrade so you can tell afterwards whether the upgrade changed anything. The full list is below.", None)
+            findings["dot1x_unauth"]["count"] = len(bad_auth)
+            findings["dot1x_unauth"]["examples"] = [f"{x['port']}  {x['mac']}  {x['method']}  {x['status']}" for x in bad_auth[:DIAG_MAX_EXAMPLES]]
     ed_text = sections.get("show interfaces status err-disabled", "")
     if ed_text and "Invalid input" not in ed_text and not re.search(r"(?m)^\s*%", ed_text):
         n_ed = len([l for l in ed_text.splitlines() if re.match(r"^\s*[A-Za-z]{2,}\d\S*\s.*\berr-disabled\b", l, re.I)])
@@ -5594,7 +5654,7 @@ def analyze_switch_logs(sections, lookback_hours=0, label="", host=""):
                    "last": max(times).strftime("%b %d %H:%M:%S") if times else ""},
         "severity": sev_counts, "findings": flist,
         "top": [{"key": k, "count": n, "example": key_example.get(k, "")} for k, n in key_counts.most_common(8)],
-        "facts": facts, "notes": notes,
+        "facts": facts, "notes": notes, "dot1x_unauth": dot1x_unauth,
     }
 
 
@@ -5608,9 +5668,17 @@ def format_analysis_report(a, files=None):
     b = a["buffer"]
     out.append(f"Log buffer  : {b['lines']} message line(s) analyzed" + (f", {b['first']} -> {b['last']}" if b["first"] else ""))
     if a["facts"]:
-        out.append("Facts       : " + "; ".join(f"{k}={v}" for k, v in a["facts"].items() if k != "stack"))
+        out.append("Facts       : " + "; ".join(f"{k}={v}" for k, v in a["facts"].items() if k not in _DIAG_COMPLEX_FACTS))
         for r in a["facts"].get("stack", []):
             out.append(f"  stack member {r['switch']}: {r['role']}, {r['state']}")
+        for r in a["facts"].get("stack_ports", []):
+            out.append(f"  stack ports of member {r['switch']}: port 1 {r['ports'][0]}, port 2 {r['ports'][1]}")
+        for r in a["facts"].get("stack_power", []):
+            out.append(f"  stack power {r['name']}: mode {r['mode']}, topology {r['topology']}, {r['total_w']} W, "
+                       f"{r['switches']} switch(es), {r['supplies']} PSU")
+        d1 = a["facts"].get("dot1x")
+        if d1:
+            out.append(f"  802.1X / MAB: {d1['sessions']} session(s), {d1['authenticated']} authenticated, {d1['not_authenticated']} not authenticated")
     for n in a["notes"]:
         out.append(f"Note        : {n}")
     out += ["", "Severity counts: " + ", ".join(f"{SEV_NAMES[int(k)]}={v}" for k, v in a["severity"].items() if v), "",
@@ -5621,6 +5689,9 @@ def format_analysis_report(a, files=None):
         out.append(f"    What to do: {f['advice']}")
         for ex in f["examples"]:
             out.append(f"    evidence: {ex}")
+    if a.get("dot1x_unauth"):
+        out += ["", "DEVICES NOT AUTHENTICATED (802.1X / MAB)", f"  {'Port':<14} {'MAC address':<16} {'Method':<8} {'Domain':<8} Status"]
+        out += [f"  {x['port']:<14} {x['mac']:<16} {x['method']:<8} {x['domain']:<8} {x['status']}" for x in a["dot1x_unauth"]]
     if a["top"]:
         out += ["", "MOST FREQUENT MESSAGES"]
         out += [f"{t['count']:>6}  {t['key']}   {t['example']}" for t in a["top"]]
@@ -5637,7 +5708,7 @@ DIAG_REPORT_FORMATS = {"csv": ("text/csv; charset=utf-8", "csv"),
 _REPORT_FINDING_HEAD = ["Switch", "IP address", "Verdict", "Analyzed", "Look-back", "Level", "Category", "Finding", "Count",
                         "First seen", "Last seen", "What to do", "Evidence"]
 _REPORT_SUMMARY_HEAD = ["Switch", "IP address", "Verdict", "Advice", "Analyzed", "Look-back", "Critical", "Warnings", "Info",
-                        "Log lines", "Log from", "Log to", "Version", "Uptime", "Last reload", "Stack", "Err-disabled ports", "Notes",
+                        "Log lines", "Log from", "Log to", "Version", "Uptime", "Last reload", "Stack", "Err-disabled ports", "Stack ports", "Stack power", "802.1X not authenticated", "Notes",
                         "Raw output file", "Report file"]
 
 
@@ -5656,11 +5727,21 @@ def diag_summary_rows(analyses):
         crit, warn, info = _report_counts(a)
         f = a.get("facts") or {}
         stack = "; ".join(f"switch {r['switch']} {r['role']} {r['state']}" for r in f.get("stack", []))
+        sp_txt = "; ".join(f"switch {r['switch']}: {r['ports'][0]}/{r['ports'][1]}" for r in f.get("stack_ports", []))
+        pw_txt = "; ".join(f"{r['name']} {r['topology']} ({r['switches']} sw, {r['supplies']} PSU)" for r in f.get("stack_power", []))
+        d1 = f.get("dot1x")
+        dx_txt = f"{d1['not_authenticated']} of {d1['sessions']}" if d1 else ""
         rows.append([a["label"], a["host"], a["verdict"].upper(), a["verdict_text"], a["time"], _report_lookback(a), crit, warn, info,
                      a["buffer"]["lines"], a["buffer"]["first"], a["buffer"]["last"], f.get("version", ""), f.get("uptime", ""),
-                     f.get("reload_reason", ""), stack, f.get("err_disabled", ""), " | ".join(a.get("notes", [])),
+                     f.get("reload_reason", ""), stack, f.get("err_disabled", ""), sp_txt, pw_txt, dx_txt, " | ".join(a.get("notes", [])),
                      (a.get("files") or {}).get("logs", ""), (a.get("files") or {}).get("report", "")])
     return rows
+
+
+def _ai_line(ai):
+    """One line that says where an AI second opinion came from."""
+    return f"{ai.get('provider', '')}, {ai.get('model', '')} - {ai.get('time', '')}" + (
+        " - identifiers masked" if ai.get("masked") else " - identifiers NOT masked")
 
 
 def diag_finding_rows(analyses):
@@ -5672,6 +5753,8 @@ def diag_finding_rows(analyses):
         for f in a["findings"]:
             rows.append(base + [_LEVEL_LABEL[f["level"]], f["category"], f["title"], f["count"], f["first"], f["last"], f["advice"],
                                 "\n".join(f["examples"])])
+        if a.get("ai"):                                            # the AI second opinion, when it was asked for
+            rows.append(base + ["AI", "AI second opinion", _ai_line(a["ai"]), "", "", "", a["ai"].get("text", ""), ""])
     return rows
 
 
@@ -5698,7 +5781,7 @@ def build_diag_xlsx(analyses):
     wb = Workbook()
     head_fill, head_font = PatternFill("solid", fgColor="1F4E78"), Font(bold=True, color="FFFFFF")
     verdict_fill = {"GREEN": "C6EFCE", "AMBER": "FFEB9C", "RED": "FFC7CE"}
-    level_fill = {"CRITICAL": "FFC7CE", "WARNING": "FFEB9C", "INFO": "DDEBF7"}
+    level_fill = {"CRITICAL": "FFC7CE", "WARNING": "FFEB9C", "INFO": "DDEBF7", "AI": "E4DFEC"}
 
     def sheet(ws, head, rows, widths, verdict_col=None, level_col=None):
         ws.append(head)
@@ -5723,7 +5806,7 @@ def build_diag_xlsx(analyses):
     ws = wb.active
     ws.title = "Summary"
     sheet(ws, _REPORT_SUMMARY_HEAD, diag_summary_rows(analyses),
-          [22, 16, 10, 46, 19, 16, 9, 9, 7, 10, 16, 16, 14, 28, 26, 34, 12, 50, 34, 34], verdict_col=2)
+          [22, 16, 10, 46, 19, 16, 9, 9, 7, 10, 16, 16, 14, 28, 26, 34, 12, 26, 34, 14, 50, 34, 34], verdict_col=2)
     sheet(wb.create_sheet("Findings"), _REPORT_FINDING_HEAD, diag_finding_rows(analyses),
           [22, 16, 10, 19, 16, 10, 12, 38, 8, 16, 16, 60, 70], verdict_col=2, level_col=5)
     top = []
@@ -5731,6 +5814,16 @@ def build_diag_xlsx(analyses):
         for t in a.get("top", []):
             top.append([a["label"], a["host"], t["count"], t["key"], t["example"]])
     sheet(wb.create_sheet("Top messages"), ["Switch", "IP address", "Count", "Message ID", "Example"], top, [22, 16, 8, 30, 110])
+    ai_rows = [[a["label"], a["host"], a["ai"].get("provider", ""), a["ai"].get("model", ""), a["ai"].get("time", ""),
+                "Yes" if a["ai"].get("masked") else "No", a["ai"].get("text", "")] for a in analyses if a.get("ai")]
+    if ai_rows:
+        sheet(wb.create_sheet("AI analysis"), ["Switch", "IP address", "Provider", "Model", "Time", "Identifiers masked", "AI analysis"],
+              ai_rows, [22, 16, 22, 24, 19, 12, 120])
+    unauth = [[a["label"], a["host"], x["port"], x["mac"], x["method"], x["domain"], x["status"]]
+              for a in analyses for x in a.get("dot1x_unauth", [])]
+    if unauth:
+        sheet(wb.create_sheet("Not authenticated"), ["Switch", "IP address", "Port", "MAC address", "Method", "Domain", "Status"],
+              unauth, [22, 16, 16, 18, 10, 10, 20])
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -5868,7 +5961,10 @@ def build_diag_pdf(analyses, site=""):
         facts = [f"version {f['version']}" if f.get("version") else "", f"uptime {f['uptime']}" if f.get("uptime") else "",
                  f"last reload: {f['reload_reason']}" if f.get("reload_reason") else "",
                  ("stack: " + ", ".join(f"{r['switch']} {r['state']}" for r in f["stack"])) if f.get("stack") else "",
-                 f"{f['err_disabled']} err-disabled port(s)" if isinstance(f.get("err_disabled"), int) else ""]
+                 f"{f['err_disabled']} err-disabled port(s)" if isinstance(f.get("err_disabled"), int) else "",
+                 ("stack ports: " + ", ".join(f"{r['switch']}:{r['ports'][0]}/{r['ports'][1]}" for r in f["stack_ports"])) if f.get("stack_ports") else "",
+                 ("stack power: " + ", ".join(f"{r['name']} {r['topology']}" for r in f["stack_power"])) if f.get("stack_power") else "",
+                 (f"802.1X: {f['dot1x']['not_authenticated']} of {f['dot1x']['sessions']} not authenticated") if f.get("dot1x") else ""]
         facts = [x for x in facts if x]
         if facts:
             pdf.line(" | ".join(facts), "F1", 8.5, rgb=(0.35, 0.35, 0.35), after=1)
@@ -5885,6 +5981,11 @@ def build_diag_pdf(analyses, site=""):
             for ex in fd["examples"]:
                 pdf.line(ex, "F3", 7.5, indent=10, rgb=(0.25, 0.25, 0.25), after=0.5)
             pdf.gap(4)
+        if a.get("ai"):
+            pdf._need(40)
+            pdf.line("AI analysis (advisory - check it against the evidence above)", "F2", 10, rgb=(0.27, 0.2, 0.55), after=1)
+            pdf.line(_ai_line(a["ai"]), "F1", 8.5, indent=10, rgb=(0.35, 0.35, 0.35), after=2)
+            pdf.line(a["ai"].get("text", ""), "F1", 9, indent=10, after=4)
         pdf.gap(8)
     return pdf.build()
 
@@ -6010,18 +6111,30 @@ def ai_build_prompt(a, masker=None):
              f"Look-back: {'whole buffer' if not a['lookback_hours'] else str(a['lookback_hours']) + ' hours'}"]
     f = a.get("facts") or {}
     if f:
-        lines.append("Facts: " + "; ".join(f"{k}={m(v)}" for k, v in f.items() if k != "stack"))
+        lines.append("Facts: " + "; ".join(f"{k}={m(v)}" for k, v in f.items() if k not in _DIAG_COMPLEX_FACTS))
         for r in f.get("stack", []):
             lines.append(f"Stack member {r['switch']}: {r['role']}, {r['state']}")
+        for r in f.get("stack_ports", []):
+            lines.append(f"Stack ports of member {r['switch']}: port 1 {r['ports'][0]}, port 2 {r['ports'][1]}")
+        for r in f.get("stack_power", []):
+            lines.append(f"Stack power {m(r['name'])}: mode {r['mode']}, topology {r['topology']}, {r['total_w']} W, "
+                         f"{r['switches']} switch(es), {r['supplies']} PSU")
+        if f.get("dot1x"):
+            d1 = f["dot1x"]
+            lines.append(f"802.1X / MAB sessions: {d1['sessions']} total, {d1['not_authenticated']} not authenticated")
     for n in a.get("notes", []):
         lines.append("Note: " + m(n))
     lines.append("Severity counts: " + ", ".join(f"{SEV_NAMES[int(k)]}={v}" for k, v in a["severity"].items() if v))
+    unauth = a.get("dot1x_unauth") or []
+    if unauth:
+        lines.append("Devices not authenticated (port, MAC, method, status)" + (f" - first 30 of {len(unauth)}:" if len(unauth) > 30 else ":"))
+        lines += [f"  {x['port']} {m(x['mac'])} {x['method']} {x['status']}" for x in unauth[:30]]
     lines.append("")
     lines.append("Findings:")
     for fd in a["findings"]:
         span = f", {fd['first']} to {fd['last']}" if fd["first"] else ""
         lines.append(f"- [{_LEVEL_LABEL[fd['level']]}] {fd['title']} ({fd['category']}), {fd['count']} time(s){span}")
-        for ex in fd["examples"]:
+        for ex in fd["examples"][:15]:
             lines.append("    evidence: " + m(ex))
     if a.get("top"):
         lines += ["", "Most frequent messages:"] + [f"- {t['count']}x {m(t['example'])}" for t in a["top"]]
@@ -9338,6 +9451,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .modal { position:fixed; inset:0; z-index:1300; background:rgba(0,0,0,.45); display:flex; align-items:center;
            justify-content:center; padding:16px; }
   .modal[hidden] { display:none; }
+  .ad-modes { margin:0 0 4px; }
+  #new-platform::-webkit-calendar-picker-indicator, #new-platform::-webkit-list-button { display:none !important; opacity:0; }
+  #new-platform { appearance:none; -webkit-appearance:none; background-image:none; }
+  #adddev-box input[type=text], #adddev-box input[type=file] { width:100%; margin-top:8px; }
   .modal-card { background:var(--pn); border:1px solid var(--bd); border-radius:12px; padding:16px 18px; width:100%;
                 max-width:340px; box-shadow:0 14px 50px rgba(0,0,0,.4); }
   .modal-card h2 { font-size:15px; margin:0 0 6px; }
@@ -9381,6 +9498,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tip { display:inline-grid; place-items:center; vertical-align:middle; width:16px; height:16px; margin-left:6px; flex:none; padding:0;
          border-radius:50%; border:1.5px solid var(--ac); color:var(--ac); background:transparent; cursor:help; user-select:none;
          font:700 11px/1 system-ui,Segoe UI,sans-serif; text-transform:none; letter-spacing:0; }
+  .tip[hidden] { display:none; }
   .tip.w { border-color:var(--am); color:var(--am); }
   .tip.bad { border-color:var(--rd); color:var(--rd); }
   .tip:hover, .tip:focus-visible, .tip.on { background:var(--ac); color:var(--pn); }
@@ -9467,6 +9585,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .card.tb { flex:1; }
   .card.max { position:fixed; inset:10px; z-index:1000; height:auto; box-shadow:0 14px 60px rgba(0,0,0,.45); }
   .card.max .sc { max-height:none; }
+  .card.max { overflow:auto; background:var(--pn); }
+  .card > h4 > .ib.mx, .st-bar > .ib.mx { margin-left:6px; }
   body.card-max { overflow:hidden; }
   .card > h4 .ib.mx { width:26px; height:26px; margin:-3px -6px -3px 0; flex:0 0 auto; }
   .card.e > h4 .ib.mx { margin-left:auto; }
@@ -9553,8 +9673,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .fold-btn { flex:1; min-width:0; display:flex; align-items:center; gap:6px; background:none; border:0; padding:0; color:inherit;
               font:inherit; font-weight:700; text-align:left; cursor:pointer; }
   .fold-btn:focus-visible { outline:2px solid var(--ac); outline-offset:3px; border-radius:4px; }
-  .fold-btn .chev { display:inline-grid; transition:transform .15s; color:var(--mu); order:2; margin-left:auto; }
-  .dr-fold.open .chev { transform:rotate(180deg); }
+  .fold-btn .chev { order:2; margin-left:auto; }
   .dr-fold > h5 .sp { display:none; }
   .dr-fold > h5 .pill { order:1; }
   .dr-fold > h5 { display:flex; }
@@ -9637,6 +9756,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dr-term .tb { background:transparent; border:1px solid #3b4a7a; color:#d6e2ff; border-radius:6px; padding:3px 9px; font:inherit; font-size:11.5px; cursor:pointer; }
   .dr-term .tb:hover:not(:disabled) { background:rgba(255,255,255,.12); }
   .dr-term .tb:disabled { opacity:.4; cursor:not-allowed; }
+  .dr-term .tb.sq { width:26px; height:26px; padding:0; display:inline-grid; place-items:center; border-radius:8px; }
+  .dr-term .tb.sq .i { width:16px; height:16px; }
   .dr-term .tb.go { background:#2f6fe4; border-color:#2f6fe4; color:#fff; font-weight:600; }
   .dr-term .tout { flex:1; min-height:0; margin:0; padding:8px 11px; overflow:auto; white-space:pre-wrap; word-break:break-word;
                    font:12px/1.45 ui-monospace,Consolas,"Courier New",monospace; }
@@ -9691,6 +9812,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dx-grid { display:grid; grid-template-columns:290px minmax(0,1fr); flex:1; min-height:0; }
   .dx-pick { border-right:1px solid var(--bd); padding:0 14px 14px; overflow:auto; }
   .dx-work { padding:14px 18px 22px; overflow:auto; min-width:0; }
+  .aib { display:inline-flex; align-items:center; justify-content:center; gap:5px; }
+  .aib .i { width:17px; height:17px; }
   .dx-intro { font-size:13px; color:var(--mu); margin:0 0 10px; line-height:1.5; }
   .dx-work textarea { width:100%; height:170px; box-sizing:border-box; }
   .dx-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:10px 0 4px; }
@@ -9949,6 +10072,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   #nt-root .set-ctl .set-def { padding:5px 10px; }
   #nt-root .set-def:not(:disabled) { cursor:pointer; }
   #nt-root .set-label label { cursor:default; }
+  /* the ?/! icon sits right after the label text on the same line, never under it */
+  .set-label label { display:inline; margin:0; }
+  .set-label .tip { display:inline-grid; margin-left:6px; }
   .nt-last { color:var(--mu); font-size:12px; margin-top:10px; }
   .nt-last.ok { color:var(--gr); } .nt-last.bad { color:var(--rd); }
   .card.e { cursor:default; }
@@ -9992,19 +10118,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tr-grid { display:grid; grid-template-columns:minmax(0,1fr); grid-template-rows:minmax(0,1fr); gap:12px; flex:1 1 auto; min-height:0; }
   .tr-right { min-width:0; min-height:0; display:flex; flex-direction:column; gap:12px; }
   .tr-side .ct-rail { border:0; background:none; padding:0 8px 12px; flex:none; }
-  .tr-top { flex:1 1 55%; min-height:0; overflow:visible; }
+  .tr-top { flex:1 1 auto; min-height:0; overflow:visible; }
   .tr-tabs { display:flex; gap:4px; align-items:center; }
   .tr-tab { background:none; border:0; border-bottom:2px solid transparent; color:var(--mu); font:inherit; font-size:14px; font-weight:600; padding:2px 10px 6px; cursor:pointer; }
   .tr-tab:hover { color:var(--tx); }
   .tr-tab[aria-selected="true"] { color:var(--ac); border-bottom-color:var(--ac); }
   .tr-pane[hidden] { display:none; }
-  .tr-pane { flex:1; min-height:0; }
+  .tr-pane { flex:1; min-height:0; overflow:auto; }
   .tr-pane-detail { overflow:auto; }
   .tr-setup { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px 16px; align-items:start; padding:12px 18px 16px; }
   .tr-fields { display:contents; }
   .tr-setup .ct-f { min-width:0; }
   .tr-setup .tr-profile { min-width:0; }
-  .tr-top.is-setup { flex:0 0 auto; }
+  .tr-top.is-setup { flex:1 1 auto; }
   /* every field = one label line (same height) + one 38px control, so rows line up */
   .tr-setup .ct-f > label { display:flex; align-items:center; gap:6px; height:18px; margin:0 0 5px; }
   .tr-setup select, .tr-setup .btn, .tr-setup .site-btn { height:38px; box-sizing:border-box; }
@@ -10022,22 +10148,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tr-setup-btns { display:flex; flex-wrap:wrap; gap:8px; padding:4px 18px 14px; }
   #tr-msg { margin:0 18px 8px; }
   #tr-detail .ct-d { border:0; background:none; padding:12px 18px 16px; }
-  .tr-console { flex:1 1 45%; min-height:150px; overflow:hidden; }
-  .tr-console > #cc-slot { display:flex; flex-direction:column; flex:1; min-height:0; }
-  .tr-console #cc-root { display:flex; flex-direction:column; flex:1; min-height:0; }
-  .tr-console .cc:not(.max) { flex:1; height:auto; min-height:0; max-height:none; resize:none; }
   /* Results And Profile: minimizable, minimized by default */
   .tr-res { flex:none; }
   .tr-res > h4 { align-items:center; }
-  .tr-res-btn { margin-left:auto; width:28px; height:28px; display:inline-grid; place-items:center; border:0; background:none; color:var(--mu); border-radius:8px; cursor:pointer; }
-  .tr-res-btn:hover { background:var(--pn2); color:var(--tx); }
-  .tr-res-btn svg { width:18px; height:18px; transition:transform .15s; }
-  .tr-res.collapsed .tr-res-btn svg { transform:rotate(180deg); }
+  .tr-res-btn { margin-left:auto; width:28px; height:28px; display:inline-grid; place-items:center; border:0; background:none; color:var(--mu); padding:0; cursor:pointer; }
+  .tr-res-btn:hover { color:var(--tx); background:none; }
+  .tr-res-btn svg { transition:transform .15s; transform:rotate(180deg); }
+  .tr-res.collapsed .tr-res-btn svg { transform:none; }
   .tr-res.collapsed > h4 { padding-bottom:16px; }
   .tr-res.collapsed #tr-result { display:none; }
   #tr-result { padding:6px 18px 18px; max-height:38vh; overflow:auto; }
   #tr-result .ct-result-g { margin-top:6px; }
-  @media (max-width:1000px) { .tr-setup { grid-template-columns:minmax(0,1fr); } #troubleshoot main { overflow:auto; } .tr-grid { grid-template-columns:minmax(0,1fr); flex:none; } .tr-top, .tr-console { flex:none; } .tr-console .cc:not(.max) { height:300px; } }
+  @media (max-width:1000px) { .tr-setup { grid-template-columns:minmax(0,1fr); } #troubleshoot main { overflow:auto; } .tr-grid { grid-template-columns:minmax(0,1fr); flex:none; } .tr-top { flex:none; } }
   .ct-toggle { display:flex; align-items:center; gap:8px; width:100%; background:none; border:0; color:var(--tx); font:inherit; font-weight:600; font-size:14px; cursor:pointer; padding:0; text-align:left; }
   .ct-toggle .sub { font-weight:400; font-size:12px; color:var(--mu); }
   .ct-toggle .car { margin-left:auto; transition:transform .15s; display:inline-grid; }
@@ -10053,8 +10175,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ct-rs-h { display:flex; align-items:center; gap:7px; width:100%; background:none; border:0; color:var(--mu); font:inherit; font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; padding:8px 8px 5px; cursor:pointer; text-align:left; }
   .ct-rs-h:hover { color:var(--tx); }
   .ct-rs-c { margin-left:auto; font-weight:600; letter-spacing:0; }
-  .ct-car { display:inline-grid; transition:transform .15s; transform:rotate(-90deg); }
-  .ct-rs.open .ct-car { transform:none; }
+  .ct-car { display:inline-grid; transition:transform .15s; }
+  .ct-rs.open .ct-car { transform:rotate(180deg); }
   .ct-r { display:flex; align-items:center; gap:9px; width:100%; background:none; border:0; border-radius:7px; padding:7px 8px; font:inherit; font-size:13px; color:var(--tx); cursor:pointer; text-align:left; }
   .ct-r:hover { background:var(--pn2); }
   .ct-rs.off .ct-r, .ct-rs.off .ct-rs-h { opacity:.5; }
@@ -10116,20 +10238,20 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .btn.dg { border-color:var(--rd); color:var(--rd); }
   /* Colour-coded function buttons: green = run / save / add, blue = check / read / refresh, amber = schedule / reset,
      red = delete / cancel / stop. They reuse the theme colours, so light and dark mode both match. */
-  .btn.ok, .btn.in, .btn.wn, .btn.dg, #btn-backup, #btn-upgrade, #btn-add-device, #btn-upload-devices, #btn-prof-save,
+  .btn.ok, .btn.in, .btn.wn, .btn.dg, #btn-backup, #btn-upgrade, #btn-add-device, #btn-add-device-go, #btn-upload-devices, #btn-prof-save,
   #btn-upload-image, #btn-site-create, #btn-prof-create, #set-save, #nt-save, #ai-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
   [data-ct="saveform"], #ck-save, #btn-prof-assign, #btn-prof-test, #btn-readiness, #btn-version, #dg-run, #st-refresh,
   #img-refresh, #dg-refresh, [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test, #ai-test, #btn-schedule, #set-reset,
   [data-tp="update"], #btn-delete-devices, #btn-prof-delete, #btn-unschedule, [data-tp="delete"], [data-ct="stop"],
   #ck-add-pre, #ck-add-post { font-weight:600; }
-  .btn.ok, #btn-backup, #btn-upgrade, #btn-add-device, #btn-upload-devices, #btn-prof-save, #btn-upload-image,
+  .btn.ok, #btn-backup, #btn-upgrade, #btn-add-device, #btn-add-device-go, #btn-upload-devices, #btn-prof-save, #btn-upload-image,
   #btn-site-create, #btn-prof-create, #set-save, #nt-save, #ai-save, #rep-go, [data-tp="create"], [data-ct="run"], [data-ct="save"],
   [data-ct="saveform"], #ck-save, #ck-add-pre, #ck-add-post { background:var(--t-gn); border-color:var(--gr); color:var(--gr); }
   .btn.in, #btn-prof-assign, #btn-prof-test, #btn-readiness, #btn-version, #dg-run, #st-refresh, #img-refresh, #dg-refresh,
   [data-verify], [data-tp="apply"], #cmp-go, #st-compare, #nt-test, #ai-test { background:var(--acs); border-color:var(--ac); color:var(--ac); }
   .btn.wn, #btn-schedule, #set-reset, [data-tp="update"] { background:var(--t-a); border-color:var(--am); color:var(--c-a); }
   .btn.dg, #btn-delete-devices, #btn-prof-delete, #btn-unschedule, [data-tp="delete"], [data-ct="stop"] { background:var(--t-r); border-color:var(--rd); color:var(--rd); }
-  .btn.ok:hover:not(:disabled), #btn-backup:hover:not(:disabled), #btn-upgrade:hover:not(:disabled), #btn-add-device:hover:not(:disabled),
+  .btn.ok:hover:not(:disabled), #btn-backup:hover:not(:disabled), #btn-upgrade:hover:not(:disabled), #btn-add-device:hover:not(:disabled), #btn-add-device-go:hover:not(:disabled),
   #btn-upload-devices:hover:not(:disabled), #btn-prof-save:hover:not(:disabled), #btn-upload-image:hover:not(:disabled),
   #btn-site-create:hover:not(:disabled), #btn-prof-create:hover:not(:disabled), #set-save:hover:not(:disabled), #nt-save:hover:not(:disabled), #ai-save:hover:not(:disabled), #rep-go:hover:not(:disabled),
   [data-tp="create"]:hover:not(:disabled), [data-ct="run"]:hover:not(:disabled), [data-ct="save"]:hover:not(:disabled),
@@ -10266,6 +10388,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ib { border-radius:50%; width:40px; height:40px; background:var(--glass); border:1px solid var(--bd); }
   .ib:hover { background:var(--acs); border-color:var(--ac); }
   .card > h4 .ib.mx { border:0; background:none; border-radius:8px; }
+  /* square maximize / minimize button used by every collapsible section (same as the one on the device list) */
+  .ib.mx, .sqb { width:26px; height:26px; border:0; background:none; border-radius:8px; flex:none; color:var(--mu);
+        display:inline-grid; place-items:center; padding:0; cursor:pointer; }
+  .ib.mx:hover, .sqb:hover, button:hover > .sqb, summary:hover > .sqb { background:var(--acs); color:var(--ac); }
+  .ib.mx .i, .sqb .i { width:16px; height:16px; }
   .userbtn { height:44px; padding:0 14px 0 5px; border-radius:999px; background:var(--glass); border:1px solid var(--bd); }
   .userbtn svg { width:32px; height:32px; padding:6px; border-radius:50%; background:linear-gradient(135deg,#3b8cff,#7c5cff); color:#fff; }
   .badge { border-radius:999px; }
@@ -10465,6 +10592,42 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ndt-ft { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:12px; }
   .ndt-ft .btn { flex:1; }
   @media (prefers-reduced-motion: reduce) { .ndt-pop { transition:none; } }
+
+  /* ---- Settings On / Off switches: no blue halo on hover, focus or press ---- */
+  .set-chk input[type=checkbox]:hover:not(:disabled), .set-chk input[type=checkbox]:focus, .set-chk input[type=checkbox]:active { box-shadow:none; }
+  .set-chk input[type=checkbox]:focus-visible { box-shadow:none; outline:0; }
+  /* the pale-blue card that .chk:has(input:checked) paints behind a ticked option must not appear behind an On/Off switch */
+  .chk.set-chk, .chk.set-chk:hover, .chk.set-chk:has(input:checked), .chk.set-chk:has(input:focus), .chk.set-chk:focus-within {
+        background:none; border-color:transparent; box-shadow:none; outline:0; }
+  /* ---- console command line stays dark with light text in light mode too ---- */
+  .cc .cc-in input[type=text], .cc .cc-in input[type=password], .dr-term .tin input[type=text], .dr-term .tin input[type=password] {
+    background:transparent; color:#f3f6ff; border:0; border-radius:0; box-shadow:none; caret-color:#4ade80; }
+  .cc .cc-in input:focus, .dr-term .tin input:focus { border:0; box-shadow:none; }
+  .cc .cc-in input::placeholder, .dr-term .tin input::placeholder { color:#93a1c0; opacity:1; }
+  /* ---- full-screen console (Troubleshoot > Console button) ---- */
+  .cc-modal { position:fixed; inset:0; z-index:1150; display:flex; padding:28px; background:rgba(5,10,24,.62); }
+  .cc-modal[hidden] { display:none; }
+  .cc-modal #cc-slot, .cc-modal #cc-root { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; }
+  .cc-modal .cc { flex:1; height:auto; max-height:none; resize:none; box-shadow:0 14px 60px rgba(0,0,0,.55); }
+  .cc-modal .cc-out { font-size:13.5px; }
+  @media (max-width:700px) { .cc-modal { padding:8px; } }
+  /* ---- Diagnosis > Log Analysis: expand / minimize per switch ---- */
+  .dx-sw > .hd { cursor:pointer; }
+  .dx-sw > .hd .sp { cursor:default; }
+  .dx-chev { margin-left:auto; flex:none; width:26px; height:26px; display:inline-grid; place-items:center; border:0; background:none; color:var(--mu); padding:0; cursor:pointer; border-radius:8px; }
+  .dx-chev:hover { background:var(--acs); color:var(--ac); }
+  .dx-chev svg { width:16px; height:16px; transition:transform .15s; transform:rotate(180deg); }
+  .dx-sw.min .dx-chev svg { transform:none; }
+  .dx-sw > .hd .sp { margin-left:auto; } .dx-sw > .hd .sp + .dx-chev { margin-left:6px; }
+  .dx-sw.min > .bd { display:none; }
+  .dx-sw.min > .hd { border-bottom:0; }
+  .dx-sw .dx-sum { display:none; color:var(--mu); font-size:12px; }
+  .dx-sw.min .dx-sum { display:inline; }
+  .dx-bar { display:flex; gap:8px; justify-content:flex-end; }
+  .dx-sub { font-weight:600; font-size:12px; margin:10px 0 4px; color:var(--mu); }
+  .dx-top th { text-align:left; font-weight:600; color:var(--mu); padding:2px 14px 2px 0; }
+  .dx-top td { padding-right:14px; }
+  .dx-top td.ok { color:var(--gr); } .dx-top td.bad { color:var(--rd); }
 </style>
 </head>
 <body class="role-__ROLE__">
@@ -10499,18 +10662,27 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="sec" data-sec="1">
       <h3 tabindex="0" role="button" title="Device List"><span data-i="1"></span><span class="lbl">Device List</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
-        <label for="device-file" style="margin-top:0">Upload device list (.xlsx)<span class="tip" data-tip="Excel columns: ip (required), hostname and platform. Use Download template for a ready-made file."></span></label>
-        <input type="file" id="device-file" accept=".xlsx">
-        <div class="note" id="device-file-last"></div>
-        <div class="row"><button class="btn p" id="btn-upload-devices" disabled>Upload List</button></div>
-        <div class="note"><a class="lnk" id="btn-device-template" href="/api/devices/template.xlsx" download="device_list_template.xlsx" title="Download an empty Excel file with the right columns (ip, hostname, platform) to fill in and upload">Download template</a></div>
-        <hr class="sep">
-        <label for="new-hostname">Add device manually</label>
-        <input type="text" id="new-hostname" placeholder="Hostname (required)" autocomplete="off" spellcheck="false">
-        <input type="text" id="new-ip" placeholder="IP address (required)" autocomplete="off" spellcheck="false">
-        <input type="text" id="new-platform" list="platform-options" placeholder="Platform (e.g. C9200L-48P-4G)" autocomplete="off" spellcheck="false" maxlength="40">
-        <datalist id="platform-options"><option value="C9200"><option value="C9200L"><option value="C9300"><option value="C9300L"><option value="C9500"><option value="2960X"></datalist>
-        <div class="row"><button class="btn p" id="btn-add-device">Add Device</button></div>
+        <div class="row ad-modes" role="tablist" aria-label="How to add devices" style="margin-top:0">
+          <button type="button" class="btn p" data-ad="manual" role="tab" aria-selected="true">Manually</button>
+          <button type="button" class="btn" data-ad="list" role="tab" aria-selected="false">From List</button>
+        </div>
+        <div id="adddev-box">
+<div id="ad-p-manual">
+      <input type="text" id="new-hostname" placeholder="Hostname (required)" autocomplete="off" spellcheck="false">
+      <input type="text" id="new-ip" placeholder="IP address (required)" autocomplete="off" spellcheck="false">
+      <input type="text" id="new-platform" list="platform-options" placeholder="Platform (e.g. C9200L-48P-4G)" autocomplete="off" spellcheck="false" maxlength="40">
+      <datalist id="platform-options"><option value="C9200"><option value="C9200L"><option value="C9300"><option value="C9300L"><option value="C9500"><option value="2960X"></datalist>
+      <div class="row"><button class="btn p" id="btn-add-device-go" title="Add this device to the list">Add Device</button></div>
+    </div>
+    <div id="ad-p-list" hidden>
+      <label for="device-file" style="margin-top:0">Device List (.xlsx)<span class="tip" data-tip="Excel columns: ip (required), hostname and platform. Use Download Template for a ready-made file."></span></label>
+      <input type="file" id="device-file" accept=".xlsx">
+      <div class="note" id="device-file-last"></div>
+      <div class="row"><button class="btn p" id="btn-upload-devices" disabled>Upload List</button></div>
+      <div class="note"><a class="lnk" id="btn-device-template" href="/api/devices/template.xlsx" download="device_list_template.xlsx" title="Download an empty Excel file with the right columns (ip, hostname, platform) to fill in and upload">Download Template</a></div>
+    </div>
+
+        </div>
         <div class="msg" id="msg-1" role="status" aria-live="polite"></div>
       </div>
     </div>
@@ -10537,13 +10709,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               title="Log in (and enable, if a secret is typed) on the switches selected in the Devices table using the details above - nothing is saved or assigned">Test Credentials</button>
           <button class="btn p" id="btn-prof-save">Save Profile</button>
         </div>
+        <div class="row"><button class="btn p" id="btn-prof-assign" disabled title="Use the profile chosen above on the devices selected in the Devices table">Assign To Selected</button></div>
         <div class="row"><button class="btn" id="btn-prof-delete" disabled>Delete Profile</button></div>
-        <hr class="sep">
-        <label for="prof-assign">Use a saved profile on the selected devices</label>
-        <select id="prof-assign"></select>
-        <div class="row" style="flex-direction:column;align-items:stretch;gap:8px">
-          <button class="btn p" id="btn-prof-assign" disabled>Assign To Selected</button>
-        </div>
         <div class="msg" id="msg-2" role="status" aria-live="polite"></div>
       </div>
     </div>
@@ -10564,12 +10731,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <h3 tabindex="0" role="button" title="Firmware Upgrade"><span data-i="4"></span><span class="lbl">Firmware Upgrade</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
         <label for="image-select" id="image-select-label" style="margin-top:0">Select image to install<span class="tip" data-tip="To add an image, open Storage and use IOS-XE images (upload + MD5 check). Rollout options (switches at the same time, stop on failure) and command timeouts are in Settings (gear icon)."></span></label>
-        <select id="image-select"><option value="">No images uploaded yet</option></select>
+        <select id="image-select"><option value="">No Images Uploaded Yet</option></select>
         <label for="upgrade-action">Action<span class="tip" id="action-tip" data-tip="Full upgrade: uploads the image, activates it and reloads the switch in one step."></span></label>
         <select id="upgrade-action">
-          <option value="full">Full upgrade</option>
-          <option value="distribute">Distribute only</option>
-          <option value="activate">Activate only</option>
+          <option value="full">Full Upgrade</option>
+          <option value="distribute">Distribute Only</option>
+          <option value="activate">Activate Only</option>
         </select>
         <div class="row"><button class="btn" id="btn-readiness" disabled
               title="Log in and check version, free flash space, CPU, memory and stack health - read-only, no upload or reload">Readiness Check</button></div>
@@ -10588,13 +10755,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="sec" data-sec="5">
       <h3 tabindex="0" role="button" title="Reports"><span data-i="5"></span><span class="lbl">Reports</span><span class="ch" data-i="dn"></span></h3>
       <div class="body">
-        <label for="rep-type">Report Type</label>
+        <label for="rep-type">Report Type<span class="tip" id="rep-desc" data-tip=""></span></label>
         <select id="rep-type">
           <option value="xlsx">Excel (.xlsx)</option>
           <option value="pdf">Print / PDF</option>
           <option value="csv">CSV (.csv)</option>
         </select>
-        <p class="muted" id="rep-desc" style="margin:6px 0 10px"></p>
         <button type="button" class="btn p" id="rep-go" style="width:100%">Generate</button>
       </div>
     </div>
@@ -10642,23 +10808,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <button type="button" class="st-clear" id="dev-clear" title="Clear search" hidden>&times;</button>
           </div>
           <select id="dev-f-upgrade" aria-label="Filter by upgrade state">
-            <option value="all">Upgrade: any</option>
+            <option value="all">Upgrade: Any</option>
             <option value="running">Running</option>
             <option value="scheduled">Scheduled</option>
             <option value="completed">Completed</option>
             <option value="failed">Failed</option>
-            <option value="attention">Needs attention</option>
-            <option value="none">Not started</option>
+            <option value="attention">Needs Attention</option>
+            <option value="none">Not Started</option>
           </select>
           <select id="dev-f-ready" aria-label="Filter by readiness">
-            <option value="all">Readiness: any</option>
+            <option value="all">Readiness: Any</option>
             <option value="ready">Ready</option>
             <option value="warning">Warning</option>
-            <option value="not_ready">Not ready</option>
+            <option value="not_ready">Not Ready</option>
             <option value="checking">Checking</option>
-            <option value="none">Not checked</option>
+            <option value="none">Not Checked</option>
           </select>
-          <select id="dev-f-platform" aria-label="Filter by platform"><option value="all">Platform: any</option></select>
+          <select id="dev-f-platform" aria-label="Filter by platform"><option value="all">Platform: Any</option></select>
           <span class="dev-shown" id="dev-shown"></span>
           <button type="button" class="btn sm" id="dev-reset" hidden>Reset Filters</button>
         </div>
@@ -10690,7 +10856,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </aside>
   <main>
     <div class="card dg-card" id="dg-card">
-      <h4>Topology<span class="tip" data-tip="Built from CDP: each selected switch is asked for its CDP neighbours, so the links shown are the ones the switches report. Devices need a credentials profile. The top of each tree is picked automatically (the switch in the middle of the network). Only the switches ticked for the last Discover are shown. Drag a switch to place it anywhere; drag empty space to move the whole diagram; scroll the mouse wheel to zoom."></span>
+      <h4>Topology<span class="tip" data-tip="Built from CDP: each selected switch is asked for its CDP neighbours, so the links shown are the ones the switches report. Devices need a credentials profile. The top of each tree is picked automatically (the switch in the middle of the network). Only the switches ticked for the last Discover are shown. Drag a switch to place it anywhere; drag empty space to move the whole diagram; scroll the mouse wheel to zoom. Drag a switch to move it, drag the background to pan, use the mouse wheel to zoom."></span>
         <span class="a">
           <label class="chk" style="margin:0"><input type="checkbox" id="dg-ports" checked>Port labels</label>
           <label class="chk" style="margin:0"><input type="checkbox" id="dg-other">APs, phones &amp; hosts</label>
@@ -10700,13 +10866,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <button type="button" class="btn sm" id="dg-fit" title="Fit the whole diagram in the window">Fit</button>
           <button type="button" class="btn sm" id="dg-png" title="Save the diagram as a PNG picture, with the switches where you placed them" disabled>Export PNG</button>
           <button type="button" class="btn sm" id="dg-refresh">Refresh</button>
-          <button type="button" class="btn sm dg-ico" id="dg-full" title="Full screen (Esc to exit)" aria-label="Full screen" aria-pressed="false"><span data-i="expand"></span></button>
+          <button type="button" class="ib mx" id="dg-full" title="Full screen (Esc to exit)" aria-label="Full screen" aria-pressed="false"><span data-i="expand"></span></button>
         </span></h4>
       <div class="dg-banner" id="dg-banner" hidden></div>
       <div class="dg-wrap" id="dg-wrap">
         <svg id="dg-svg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Network topology"></svg>
         <div class="dg-empty" id="dg-empty"></div>
-        <div class="dg-hint" id="dg-hint">Drag a switch to move it &middot; drag the background to pan &middot; mouse wheel to zoom</div>
         <aside class="dg-detail" id="dg-detail" hidden></aside>
       </div>
       <div class="dg-legend">
@@ -10736,14 +10901,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
         <div class="dx-work">
           <div id="dx-p-cmd">
-            <p class="dx-intro">Type the commands to run (one per line) and tick the switches on the left. Each switch's output is saved in the Storage tab under <b>Diagnosis</b>, in that switch's folder. Only read-only commands are accepted: <span id="dx-words"></span>. Nothing here changes a switch.</p>
             <textarea id="dx-cmds" spellcheck="false" autocomplete="off" placeholder="show ip interface brief&#10;show version&#10;show logging"></textarea>
-            <div class="dx-row"><button type="button" class="btn p" id="dx-run" disabled>Run Commands</button><span class="hint" id="dx-cmd-count"></span></div>
+            <div class="dx-row"><button type="button" class="btn p" id="dx-run" disabled>Run Commands</button><span class="hint" id="dx-cmd-count"></span><span class="tip" id="dx-tip-cmd" data-tip=""></span></div>
           </div>
           <div id="dx-p-log" hidden>
-            <p class="dx-intro">Reads the log of each ticked switch (<span id="dx-logcmds"></span>) and checks it on this computer against built-in rules for things that can disturb an upgrade: stack problems, power / fan / temperature, flash errors, crashes, unexpected reloads, failed installs, flapping ports and more. The verdict is advice for you to judge; it never blocks or starts anything. The raw output and a report are saved in Storage under <b>Diagnosis</b>.</p>
             <div class="dx-row"><label for="dx-look">Look back</label><select id="dx-look"></select>
-              <button type="button" class="btn p" id="dx-analyze" disabled>Analyze Logs</button></div>
+              <button type="button" class="btn p" id="dx-analyze" disabled>Analyze Logs</button>
+              <button type="button" id="dx-askai" class="btn p aib" disabled title="Ask AI - analyze the logs of the ticked switches, then ask the AI for a second opinion on each" aria-label="Ask AI"><span data-i="ai"></span><span>Ask AI</span></button>
+              <span class="tip w" id="dx-ai-hint" data-tip="" hidden></span><span class="tip" id="dx-tip-log" data-tip=""></span></div>
           </div>
           <div class="msg" id="dx-msg" role="status" aria-live="polite"></div>
           <div class="dx-rep" id="dx-rep" hidden></div>
@@ -10790,6 +10955,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <button type="button" class="btn sm in" id="st-compare" title="Compare two backups of this switch" hidden>Compare Backups</button>
         <a class="btn sm" id="st-zip" href="#" title="Download this folder as a ZIP file">Download Folder (.zip)</a>
         <button type="button" class="btn sm" id="st-refresh">Refresh</button>
+        
       </div>
       <div class="msg" id="st-msg" role="status" aria-live="polite" style="margin:6px 14px 0"></div>
       <div class="sc">
@@ -10824,6 +10990,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
               <button type="button" class="btn sm" id="tr-collapse" data-ct="stages" data-v="0" disabled>Collapse All</button>
               <button type="button" class="btn sm" id="tr-clear" data-ct="clear" disabled>Clear Results</button>
             </span>
+            
           </h4>
           <div class="msg" id="tr-msg" role="status" aria-live="polite"></div>
           <div class="tr-pane" id="tr-pane-setup" role="tabpanel" aria-labelledby="tr-tab-setup">
@@ -10840,13 +11007,12 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="tr-pane tr-pane-detail" id="tr-pane-detail" role="tabpanel" aria-labelledby="tr-tab-detail" hidden><div id="tr-detail"></div></div>
         </div>
-        <div class="card tr-console"><div id="cc-slot"></div></div>
       </div>
     </div>
 
     <div class="card tr-res collapsed" id="tr-res-card">
       <h4>Results And Profile
-        <button type="button" class="tr-res-btn" id="tr-res-btn" data-ct="restoggle" aria-expanded="false" aria-controls="tr-result" title="Show or hide Results And Profile" aria-label="Show or hide Results And Profile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg></button>
+        <button type="button" class="tr-res-btn" id="tr-res-btn" data-ct="restoggle" aria-expanded="false" aria-controls="tr-result" title="Expand Results And Profile" aria-label="Expand Results And Profile"><span data-i="dn"></span></button>
       </h4>
       <div id="tr-result"></div>
     </div>
@@ -10861,7 +11027,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <main>
     <div class="card set-card">
       <h4><span id="set-title">Settings</span>
-        <span class="a"><span id="set-dirty"></span>
+        <span class="a"><span id="set-own" style="display:contents"></span><span id="set-dirty"></span>
           <button type="button" class="btn sm" id="set-reset" title="Put every value on this tab back to its default (not saved until you click Save)">Restore Defaults</button>
           <button type="button" class="btn p sm" id="set-save">Save Settings</button></span></h4>
       <div class="msg" id="set-msg" role="status" aria-live="polite" style="margin:8px 18px 0"></div>
@@ -10897,7 +11063,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="cmp-top">
       <h2 id="cmp-title">Compare backups</h2>
       <div class="cmp-seg" id="cmp-view" role="group" aria-label="Comparison layout">
-        <button type="button" data-v="side" class="on">Side by side</button><button type="button" data-v="uni">Unified</button>
+        <button type="button" data-v="side" class="on">Side By Side</button><button type="button" data-v="uni">Unified</button>
       </div>
       <button type="button" class="btn sm" id="cmp-close">Close</button>
     </div>
@@ -10949,6 +11115,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+<div id="cc-modal" class="cc-modal" hidden role="dialog" aria-modal="true" aria-label="Console"><div id="cc-slot"></div></div>
 <div id="toasts" role="status" aria-live="polite"></div>
 
 <aside id="drawer" class="drawer" role="dialog" aria-label="Switch details" hidden>
@@ -10966,7 +11133,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <button type="button" class="tb go" id="dr-term-connect">Connect</button>
       <button type="button" class="tb" id="dr-term-ctrlc" title="Send Ctrl+C to the switch">Ctrl+C</button>
       <button type="button" class="tb" id="dr-term-clear" title="Clear this window (the session stays open)">Clear</button>
-      <button type="button" class="tb" id="dr-term-max" title="Maximise / restore (Esc restores)">Maximise</button>
+      <button type="button" class="tb sq" id="dr-term-max" title="Maximize (Esc restores)" aria-label="Maximize"><span data-i="expand"></span></button>
     </div>
     <pre class="tout" id="dr-term-out"></pre>
     <div class="tin" id="dr-term-tin"><span>&gt;</span><input type="text" id="dr-term-in" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Type a command and press Enter" disabled></div>
@@ -10988,6 +11155,9 @@ const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
 const fmtDur = sec => { sec = Math.max(0, Math.round(sec));
   return Math.floor(sec / 60) + "m " + String(sec % 60).padStart(2, "0") + "s"; };
 const fmtMs = v => v == null ? "-" : v.toFixed(1) + " ms";
+// ? = how it works, ! = important / careful. Text that warns gets the ! icon, everything else the ? icon.
+const tipKind = t => /\b(warning|careful|do not|don't|never|must|cannot|can't|not your|only tick|danger|risk|reload|reboot|loses|clear text|is off|not saved|irreversible|overwrite|delete|remove)/i.test(t) ? "w" : "";
+const tipHtml = (t, kind) => t ? '<span class="tip' + ((kind === undefined ? tipKind(t) : kind) ? " " + (kind === undefined ? tipKind(t) : kind) : "") + '" data-tip="' + esc(t) + '"></span>' : "";
 
 // ---- Icons (same set as the Cloud Control theme) ----
 const I = p => '<svg class="i" viewBox="0 0 24 24">' + p + "</svg>";
@@ -11014,9 +11184,31 @@ const IC = {
   user: I('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'),
   bell: I('<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/>'),
   site: I('<path d="M12 21s7-6.2 7-11a7 7 0 1 0-14 0c0 4.8 7 11 7 11z"/><circle cx="12" cy="10" r="2.5"/>'),
+  ai: I('<path d="M10 3.5 11.9 9 17.5 11 11.9 13 10 18.5 8.1 13 2.5 11 8.1 9z"/><path d="M18 3v4M16 5h4M19 15v4M17 17h4"/>'),
   gear: I('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>')
 };
 document.querySelectorAll("[data-i]").forEach(el => { el.innerHTML = IC[el.dataset.i]; });
+
+// ---- One wording rule for the whole dashboard: every word of a button caption starts with a capital letter ----
+const TC_BTN = "button.btn, button.tab, button.tb, #dx-nav button, .cmp-seg button, .fl button, .tabs button";
+function tcWord(w) {
+  if (!/^[(\[\-]*[a-z]/.test(w) || /[0-9._\/\\:@=<>;&]/.test(w)) return w;
+  return w.replace(/^([(\[\-]*)([a-z])/, (m, p, c) => p + c.toUpperCase()).replace(/-([a-z])/g, (m, c) => "-" + c.toUpperCase());
+}
+function tcFix(root) {
+  const list = root.matches && root.matches(TC_BTN) ? [root] : [];
+  if (root.querySelectorAll) root.querySelectorAll(TC_BTN).forEach(b => list.push(b));
+  for (const b of list) for (const n of b.childNodes) if (n.nodeType === 3 && n.nodeValue.trim()) {
+    const t = n.nodeValue.split(/(\s+)/).map(x => /^\s*$/.test(x) ? x : tcWord(x)).join("");
+    if (t !== n.nodeValue) n.nodeValue = t;
+  }
+}
+tcFix(document.body);
+{ let q = false; const pend = new Set();
+  new MutationObserver(ms => { for (const m of ms) pend.add(m.type === "characterData" ? m.target.parentNode : m.target);
+    if (q) return; q = true;
+    requestAnimationFrame(() => { q = false; const items = [...pend]; pend.clear(); for (const el of items) if (el && el.nodeType === 1) { tcFix(el); if (el.closest) { const b = el.closest(TC_BTN); if (b) tcFix(b); } } }); })
+    .observe(document.body, {childList: true, subtree: true, characterData: true}); }
 
 // ---- Help tips: a small ? (how it works) or ! (important) icon; its text shows on hover, focus or click ----
 const tipPop = document.createElement("div");
@@ -11069,6 +11261,9 @@ function tipInit(el) {
   });
 }
 document.querySelectorAll(".tip").forEach(tipInit);
+new MutationObserver(ms => { for (const m of ms) for (const n of m.addedNodes) {          // tips drawn later (settings, results ...)
+  if (n.nodeType !== 1) continue; if (n.classList.contains("tip")) tipInit(n); n.querySelectorAll(".tip").forEach(tipInit); } })
+  .observe(document.body, {childList: true, subtree: true});
 document.addEventListener("click", ev => { if (tipEl && !ev.target.closest(".tip")) tipHide(); });
 document.addEventListener("keydown", ev => { if (ev.key === "Escape") tipHide(); });
 window.addEventListener("resize", tipHide);
@@ -11421,7 +11616,7 @@ function syncDevFilters(d) {
     sel.innerHTML = "";
     for (const v of ["all"].concat(plats)) {
       const o = document.createElement("option");
-      o.value = v; o.textContent = v === "all" ? "Platform: any" : v;
+      o.value = v; o.textContent = v === "all" ? "Platform: Any" : v;
       sel.appendChild(o);
     }
     sel.value = DF.plat;
@@ -11460,19 +11655,20 @@ function ntSay(kind, text) { NT.msg = text ? {kind: kind, text: text} : null; co
 function ntEnabledState() {
   const root = $("nt-root"); if (!root) return;
   const on = !!(NT.draft && NT.draft.enabled);
-  root.querySelectorAll("[data-nt-dep]").forEach(el => { el.disabled = !SET_CAN_EDIT || !on; });
+  document.querySelectorAll("#nt-root [data-nt-dep], #set-own [data-nt-dep]").forEach(el => { el.disabled = !SET_CAN_EDIT || !on; });
 }
 function ntRender() {
   const root = $("nt-root"); if (!root) return;
-  if (!NT.data) { root.innerHTML = '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" style="margin-top:14px">' + esc(NT.msg ? NT.msg.text : "Loading ...") + "</div>"; return; }
+  const ownEl = $("set-own");
+  if (!NT.data) { if (ownEl) ownEl.innerHTML = ""; root.innerHTML = '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" style="margin-top:14px">' + esc(NT.msg ? NT.msg.text : "Loading ...") + "</div>"; return; }
   const d = NT.draft, dis = SET_CAN_EDIT ? "" : " disabled";
   const secOpts = NT.data.security_options.map(o => '<option value="' + esc(o.key) + '"' + (o.key === d.security ? " selected" : "") + ">" + esc(o.label) + "</option>").join("");
   const last = NT.data.last && NT.data.last.time ? '<div class="nt-last ' + (NT.data.last.ok ? "ok" : "bad") + '">Last e-mail ' + esc(NT.data.last.time) + ": " + esc(NT.data.last.detail || "") + "</div>" : "";
-  const row = (label, help, ctl, id) => '<div class="set-row"><div class="set-info"><div class="set-label">' + (id ? '<label for="' + id + '" style="margin:0;font:inherit">' + label + "</label>" : label) + "</div>" +
-    (help ? '<div class="set-help">' + help + "</div>" : "") + '</div><div class="set-ctl">' + ctl + "</div></div>";
+  const row = (label, help, ctl, id) => '<div class="set-row"><div class="set-info"><div class="set-label">' + (id ? '<label for="' + id + '" style="margin:0;font:inherit">' + label + "</label>" : label) + tipHtml(help) + '</div></div><div class="set-ctl">' + ctl + "</div></div>";
   const sw = (id, on, txt, extra) => '<label class="chk set-chk"><input type="checkbox"' + (id ? ' id="' + id + '"' : "") + (extra || "") + (on ? " checked" : "") + "><span>" + txt + "</span></label>";
   const kinds = NT.data.kinds.map(k => row(esc(k.label), "", sw("", d.kinds.includes(k.key), d.kinds.includes(k.key) ? "On" : "Off", ' data-nt-kind="' + esc(k.key) + '" data-nt-dep'))).join("");
   root.innerHTML =
+    '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" id="nt-msg" role="status" aria-live="polite" style="margin:0 0 10px">' + esc(NT.msg ? NT.msg.text : "") + "</div>" + last +
     '<div class="set-sec">E-mail delivery</div>' +
     row("Send e-mail notifications", "Copies of the notifications shown under the bell icon.", sw("nt-enabled", d.enabled, d.enabled ? "On" : "Off", dis)) +
     row("SMTP server", "Mail server that sends the e-mails.", '<input type="text" id="nt-host" data-nt-dep autocomplete="off" spellcheck="false" maxlength="200" value="' + esc(d.host) + '">', "nt-host") +
@@ -11481,11 +11677,8 @@ function ntRender() {
     row("App password", NT.data.password_saved ? "Password saved - leave empty to keep it." : "Use a Gmail app password, not your normal password.", '<input type="password" id="nt-pw" data-nt-dep autocomplete="new-password" maxlength="200" value="' + esc(NT.pw) + '">', "nt-pw") +
     row("Send to", "Several recipients: separate them with commas.", '<input type="text" id="nt-to" data-nt-dep autocomplete="off" spellcheck="false" maxlength="2000" value="' + esc(d.to) + '">', "nt-to") +
     '<div class="set-sec">E-mail me about</div>' +
-    row("Quick select", "Choose the notification types in one click.", '<button type="button" class="set-def" data-nt-q="all" data-nt-dep>Select All</button><button type="button" class="set-def" data-nt-q="problems" data-nt-dep>Problems Only</button><button type="button" class="set-def" data-nt-q="none" data-nt-dep>Clear</button>') +
-    kinds +
-    '<div class="set-sec">Test and save</div>' +
-    row("E-mail settings", "Send a test e-mail first, then save.", '<button type="button" class="btn sm" id="nt-test" data-nt-dep>Send Test E-Mail</button><button type="button" class="btn p sm" id="nt-save"' + dis + ">Save Notification Settings</button>") +
-    '<div class="msg ' + (NT.msg ? NT.msg.kind : "") + '" id="nt-msg" role="status" aria-live="polite" style="margin:10px 0 0">' + esc(NT.msg ? NT.msg.text : "") + "</div>" + last;
+    kinds;
+  if (ownEl) ownEl.innerHTML = '<button type="button" class="btn sm" id="nt-test" data-nt-dep>Send Test E-Mail</button><button type="button" class="btn p sm" id="nt-save"' + dis + ">Save Notification Settings</button>";
   ntEnabledState();
 }
 function ntValues() {
@@ -11498,13 +11691,7 @@ function ntCollect() {
   if (g("nt-host") !== null) { d.host = g("nt-host"); d.port = g("nt-port").trim(); d.security = g("nt-sec"); d.username = g("nt-user"); d.to = g("nt-to"); NT.pw = g("nt-pw"); }
 }
 document.addEventListener("click", async e => {
-  const root = $("nt-root"); if (!root || !root.contains(e.target) || !SET_CAN_EDIT || !NT.data) return;
-  const q = e.target.closest("[data-nt-q]");
-  if (q) {
-    ntCollect();
-    NT.draft.kinds = q.dataset.ntQ === "all" ? NT.data.kinds.map(k => k.key) : q.dataset.ntQ === "problems" ? NT.data.problem_kinds.slice() : [];
-    ntRender(); return;
-  }
+  const root = $("nt-root"), own = $("set-own"); if (!root || !(root.contains(e.target) || (own && own.contains(e.target))) || !SET_CAN_EDIT || !NT.data) return;
   if (e.target.id === "nt-test" || e.target.id === "nt-save") {
     if (NT.busy) return;
     ntCollect();
@@ -11640,7 +11827,9 @@ function updateButtons() {
   $("btn-prof-test").disabled = n === 0 || profTestBusy;
   $("btn-prof-test").title = n === 0 ? "Select one or more switches in the Devices table first - the test logs in to them with the details typed above"
     : "Log in on the " + n + " selected switch" + (n === 1 ? "" : "es") + " with the details above - nothing is saved or assigned";
-  $("btn-prof-assign").disabled = n === 0 || !$("prof-assign").value;
+  $("btn-prof-assign").disabled = n === 0 || !$("prof-edit").value;
+  $("btn-prof-assign").title = !$("prof-edit").value ? "Choose a saved profile in 'Create Or Edit A Profile' first"
+    : n === 0 ? "Select one or more devices in the Devices table first" : "Use the profile '" + $("prof-edit").value + "' on the " + n + " selected device" + (n === 1 ? "" : "s");
   $("btn-readiness").disabled = n === 0 || anyActive;
   $("btn-delete-devices").disabled = n === 0 || anyBusy;
   $("btn-delete-devices").title = anyBusy
@@ -11685,14 +11874,10 @@ function fillProfileLists(d) {
   const sig = JSON.stringify(d.profiles || []);
   if (sig === fillProfileLists.sig) return;
   fillProfileLists.sig = sig;
-  const a = $("prof-assign"), e = $("prof-edit");
-  const keepA = a.value, keepE = e.value;
-  a.innerHTML = names.length ? names.map(n => '<option value="' + esc(n) + '">' + esc(n) + "</option>").join("")
-                             : '<option value="">No profiles yet - create one below</option>';
+  const e = $("prof-edit"), keepE = e.value;
   e.innerHTML = '<option value="">New profile...</option>' + (d.profiles || []).map(p =>
     '<option value="' + esc(p.name) + '">' + esc(p.name) + " (" + esc(p.username) + ", " + (p.protocol === "telnet" ? "Telnet" : "SSH") + " " + (p.port || (p.protocol === "telnet" ? 23 : 22)) + ", " + p.devices + " device" +
     (p.devices === 1 ? "" : "s") + ")</option>").join("");
-  if (names.includes(keepA)) a.value = keepA;
   if (names.includes(keepE)) e.value = keepE;
   updateButtons();
 }
@@ -11710,6 +11895,7 @@ function loadProfileForm() {
                                    : "Enable secret (optional)";
   $("prof-clear-wrap").hidden = !(p && p.has_secret);
   $("btn-prof-delete").disabled = !p;
+  updateButtons();
 }
 function protoNote() {
   $("prof-port").placeholder = profProto() === "telnet" ? "23" : "22";
@@ -11720,7 +11906,6 @@ document.querySelectorAll('input[name="prof-proto"]').forEach(r => r.addEventLis
   protoNote();
 }));
 $("prof-edit").addEventListener("change", loadProfileForm);
-$("prof-assign").addEventListener("change", updateButtons);
 $("prof-show").addEventListener("change", e => {
   const t = e.target.checked ? "text" : "password";
   $("prof-pass").type = t; $("prof-secret").type = t;
@@ -11787,7 +11972,7 @@ $("btn-prof-delete").addEventListener("click", async () => {
 });
 $("btn-prof-assign").addEventListener("click", async () => {
   try {
-    const r = await post("/api/profile/assign", {hosts: [...selected], profile: $("prof-assign").value});
+    const r = await post("/api/profile/assign", {hosts: [...selected], profile: $("prof-edit").value});
     sayIn(2, "ok", r.message); refresh();
   } catch (e) { sayIn(2, "err", e.message); }
 });
@@ -11928,7 +12113,7 @@ async function refreshImages() {
     const sel = $("image-select");
     const current = sel.value;
     if (!d.images.length) {
-      sel.innerHTML = '<option value="">No images uploaded yet</option>';
+      sel.innerHTML = '<option value="">No Images Uploaded Yet</option>';
       return;
     }
     sel.innerHTML = d.images.map(name => '<option value="' + esc(name) + '">' + esc(name) + "</option>").join("");
@@ -11936,6 +12121,13 @@ async function refreshImages() {
   } catch (e) { /* dashboard poll will report the lost connection */ }
 }
 
+function adSay(kind, text) { sayIn(1, kind, text); }
+function adMode(mode) {
+  $("ad-p-manual").hidden = mode !== "manual"; $("ad-p-list").hidden = mode !== "list";
+  document.querySelectorAll("[data-ad]").forEach(b => { const on = b.dataset.ad === mode; b.classList.toggle("p", on); b.setAttribute("aria-selected", String(on)); });
+  sayIn(1, "", "");
+}
+document.querySelectorAll("[data-ad]").forEach(b => b.addEventListener("click", () => adMode(b.dataset.ad)));
 $("device-file").addEventListener("change", () => {
   $("btn-upload-devices").disabled = !$("device-file").files.length;
 });
@@ -11945,13 +12137,13 @@ $("btn-upload-devices").addEventListener("click", async () => {
   $("btn-upload-devices").disabled = true;
   try {
     const r = await postFile("/api/devices/upload", file);
-    sayIn(1, "ok", r.message);
+    adSay( "ok", r.message);
     // The native file input always reverts to "No file chosen" once cleared - keep the
     // name visible ourselves so it doesn't look like nothing happened.
     $("device-file-last").textContent = "Last uploaded: " + file.name;
     $("device-file").value = "";
     refresh();
-  } catch (e) { sayIn(1, "err", e.message); }
+  } catch (e) { adSay( "err", e.message); }
   finally { $("btn-upload-devices").disabled = !$("device-file").files.length; }
 });
 
@@ -11965,17 +12157,17 @@ $("new-ip").addEventListener("input", e => {
   e.target.style.borderColor = v && !isIpAddress(v) ? "var(--rd)" : "";
   e.target.title = v && !isIpAddress(v) ? "This is not a valid IP address" : "";
 });
-$("btn-add-device").addEventListener("click", async () => {
+$("btn-add-device-go").addEventListener("click", async () => {
   const hostname = $("new-hostname").value.trim(), ip = $("new-ip").value.trim();
   const platform = $("new-platform").value.trim();
-  if (!hostname || !ip) { sayIn(1, "err", "Both hostname and IP address are required."); return; }
-  if (!isIpAddress(ip)) { sayIn(1, "err", "'" + ip + "' is not a valid IP address (for example 10.10.0.11)."); $("new-ip").focus(); return; }
+  if (!hostname || !ip) { adSay( "err", "Both hostname and IP address are required."); return; }
+  if (!isIpAddress(ip)) { adSay( "err", "'" + ip + "' is not a valid IP address (for example 10.10.0.11)."); $("new-ip").focus(); return; }
   try {
     const r = await post("/api/devices/add", {hostname, ip, platform});
-    sayIn(1, "ok", r.message);
+    adSay( "ok", r.message);
     $("new-hostname").value = ""; $("new-ip").value = ""; $("new-platform").value = "";
     refresh();
-  } catch (e) { sayIn(1, "err", e.message); }
+  } catch (e) { adSay( "err", e.message); }
 });
 
 // ---- IOS-XE images (Storage page): upload with its Cisco MD5, list, re-verify ----
@@ -12535,7 +12727,7 @@ const REP_TYPES = {
   xlsx: {url: "/api/upgrade-report.xlsx", desc: "Excel workbook: summary, current status and the full run history."},
   pdf: {url: "/api/upgrade-report/print", blank: true, desc: "Printable page - use Print, then Save as PDF."},
   csv: {url: "/api/upgrade-report.csv", desc: "Plain CSV file of the current status."}};
-function repSync() { $("rep-desc").textContent = REP_TYPES[$("rep-type").value].desc; }
+function repSync() { tipSet($("rep-desc"), REP_TYPES[$("rep-type").value].desc, ""); }
 $("rep-type").addEventListener("change", repSync); repSync();
 $("rep-go").addEventListener("click", () => {
   const t = REP_TYPES[$("rep-type").value];
@@ -13019,8 +13211,8 @@ function setRow(item) {
     ? '<label class="chk set-chk"><input type="checkbox" data-sk="' + k + '"' + (v ? " checked" : "") + dis + "><span>" + (v ? "On" : "Off") + "</span></label>"
     : '<input type="number" data-sk="' + k + '" min="' + item.min + '" max="' + item.max + '" step="1" value="' + (Number.isNaN(v) ? "" : v) + '"' + dis + ">" +
       '<span class="set-unit">' + esc(item.unit) + '</span><span class="set-hint">' + esc(setMinutes(item, v)) + "</span>";
-  return '<div class="set-row' + (v !== def ? " chg" : "") + '" data-row="' + k + '"><div class="set-info"><div class="set-label">' + esc(item.label) +
-    '</div><div class="set-help">' + esc(item.help) + '</div></div><div class="set-ctl">' + ctl +
+  return '<div class="set-row' + (v !== def ? " chg" : "") + '" data-row="' + k + '"><div class="set-info"><div class="set-label">' + esc(item.label) + tipHtml(item.help) +
+    '</div></div><div class="set-ctl">' + ctl +
     '<button type="button" class="set-def" data-sdef="' + k + '" title="Use the default value"' + dis + ">Default: " + esc(setUnit(item, def)) + "</button></div></div>";
 }
 function aboutRender() {
@@ -13041,6 +13233,7 @@ function renderSettings() {
     (g.id === SET.tab ? "on" : "") + '" aria-selected="' + (g.id === SET.tab) + '">' + esc(g.title) + "</button>").join("");
   const g = SET.data.groups.find(x => x.id === SET.tab);
   $("set-title").textContent = g.title;
+  $("set-own").innerHTML = "";
   $("set-note").hidden = SET_CAN_EDIT;
   let html = '<div class="set-intro">' + esc(g.intro) + "</div>" +
     (g.id === "timeouts" ? '<div id="tp-root"></div>' : "") +
@@ -13389,12 +13582,12 @@ function ctFieldsHtml(hosts, images, busy) {
   const cur = (CT.picks[CT.host] && profs.some(x => x.name === CT.picks[CT.host])) ? CT.picks[CT.host] : ((h && h.profile) || "");
   return '<div class="ct-f tr-f-switch"><label for="ct-host">Switch</label><select id="ct-host"' + dis + ">" + hosts.map(x => '<option value="' + esc(x.host) + '"' + (x.host === CT.host ? " selected" : "") + ">" +
       esc(x.host + (x.label ? " - " + x.label : "") + (x.platform ? " (" + x.platform + ")" : "")) + "</option>").join("") + "</select></div>" +
-    '<div class="ct-f tr-f-image"><label for="ct-image">Image</label><select id="ct-image"' + dis + '><option value="">- choose the image to test with -</option>' +
+    '<div class="ct-f tr-f-image"><label for="ct-image">Image</label><select id="ct-image"' + dis + '><option value="">- Choose The Image To Test With -</option>' +
       images.map(n => '<option value="' + esc(n) + '"' + (n === CT.image ? " selected" : "") + ">" + esc(n) + "</option>").join("") + "</select></div>" +
-    '<div class="ct-f tr-f-type"><label for="ct-path">Test type<span class="tr-req"> *</span></label><select id="ct-path"' + dis + '><option value="">- choose what to test -</option>' +
+    '<div class="ct-f tr-f-type"><label for="ct-path">Test type<span class="tr-req"> *</span></label><select id="ct-path"' + dis + '><option value="">- Choose What To Test -</option>' +
       CT_PATHS.map(x => '<option value="' + x[0] + '"' + (x[0] === CT.path ? " selected" : "") + ">" + esc(x[1]) + "</option>").join("") + "</select></div>" +
     '<div class="ct-f tr-cred-f"><label for="ct-cred">Credential profile<span class="tr-req"> *</span></label><select id="ct-cred"' + dis + ">" +
-      '<option value="">- choose a profile -</option>' + profs.map(x => '<option value="' + esc(x.name) + '"' + (x.name === cur ? " selected" : "") + ">" + esc(x.name + " (" + x.username + ", " + (x.protocol === "telnet" ? "Telnet" : "SSH") + ")") + "</option>").join("") + "</select></div>" +
+      '<option value="">- Choose A Profile -</option>' + profs.map(x => '<option value="' + esc(x.name) + '"' + (x.name === cur ? " selected" : "") + ">" + esc(x.name + " (" + x.username + ", " + (x.protocol === "telnet" ? "Telnet" : "SSH") + ")") + "</option>").join("") + "</select></div>" +
     '<div class="ct-f tr-f-btn"><label>&nbsp;</label><button type="button" class="btn p" id="ct-cred-test" data-ct="credtest"' + ((busy || CT.credBusy || !profs.length) ? " disabled" : "") + ">" + (CT.credBusy ? "Testing ..." : "Test Credentials") + "</button></div>" +
     '<div class="ct-f tr-dev-f"><label>Switch details (read automatically)</label><div class="tr-dev" id="ct-dev">' + ctDevHtml(h) + "</div></div>";
 }
@@ -13459,15 +13652,15 @@ function ctDetailHtml(p, num, total) {
     (ctGateOk() ? "" : '<span class="ct-badge n">test the credentials in Test Setup first</span>');
   const act = running ? '<button type="button" class="btn dg" data-ct="stop"' + (CT.running.stopping ? " disabled" : "") + ">" + (CT.running.stopping ? "Stopping ..." : "Stop") + "</button>"
     : '<button type="button" class="btn p" data-ct="run" data-id="' + esc(p.id) + '"' + ((busy || !ctGateOk()) ? " disabled" : "") + (ctGateOk() ? "" : ' title="Attach a credential profile and test it in Test Setup first"') + ">Execute</button>";
+  const conBtn = '<button type="button" class="btn" data-ct="console" title="Open the console of this switch in full screen">Console</button>';
   const idx = TP.data.presets.findIndex(x => x.id === p.id), nxt = TP.data.presets.slice(idx + 1).find(x => !ctPathOff(x.group));
   const chips = p.keys.length ? p.keys.map(k => '<span class="ct-chip">' + esc(ctFeeds([k])) + "</span>").join("") : '<span class="ct-chip">no timeout setting - for your information</span>';
   const body = running ? '<div class="ct-panel" id="ct-live">' + ctLiveHtml() + "</div>"
     : CT.outs[key] ? '<div class="ct-panel">' + ctOutHtml(CT.outs[key]) + "</div>"
-    : '<div class="ct-empty">Not run yet. Press Execute: the output appears here and in the console below.</div>';
+    : '<div class="ct-empty">Not run yet. Press Execute: the output appears here, and in the console (press Console).</div>';
   return '<div class="ct-d"><div class="ct-d-h"><div class="ct-d-id"><div class="ct-d-k">Step ' + num + " of " + total + " &middot; " + esc(p.group.replace(/^\d+\.\s*/, "")) + "</div>" +
-    '<div class="ct-d-t">' + esc(p.title) + badges + '</div><code class="ct-cmd">' + esc(p.command) + "</code></div>" +
-    '<div class="ct-d-a">' + act + (nxt ? '<button type="button" class="btn" data-ct="next">Next Step</button>' : "") + "</div></div>" +
-    '<p class="ct-d-desc">' + esc(p.desc) + "</p>" +
+    '<div class="ct-d-t">' + esc(p.title) + tipHtml(p.desc, p.warn ? "w" : "") + badges + '</div><code class="ct-cmd">' + esc(p.command) + "</code></div>" +
+    '<div class="ct-d-a">' + conBtn + act + (nxt ? '<button type="button" class="btn" data-ct="next">Next Step</button>' : "") + "</div></div>" +
     '<div class="ct-chips">Feeds: ' + chips + "</div>" +
     '<div class="ct-tiles"><div class="ct-tile"><span>Last</span><b>' + (st.lastS != null ? fmtS(st.lastS) + " s" : "-") + '</b></div><div class="ct-tile"><span>Slowest</span><b>' + (st.max != null ? fmtS(st.max) + " s" : "-") +
     '</b></div><div class="ct-tile"><span>Average</span><b>' + (st.avg != null ? fmtS(st.avg) + " s" : "-") + '</b></div><div class="ct-tile"><span>Runs</span><b>' + st.n + "</b></div></div>" +
@@ -13642,24 +13835,35 @@ function ccAppend(host, text) {
   if (host === CT.host) ccPaint();
 }
 const ccSecretPrompt = c => /(?:password|secret|passphrase)[^\n]*:\s*$/i.test(c.text.slice(c.text.lastIndexOf("\n") + 1));
+function ccOpen() {                        // show the console full screen
+  if (!CT.host) { setSay("err", "Choose a switch in Test Setup first."); return; }
+  CT.open = true; ccSync();
+  const slot = $("cc-slot"); if (slot && CC_EL.parentNode !== slot) slot.appendChild(CC_EL);
+  $("cc-modal").hidden = false; ccPaint();
+  const o = $("cc-out"); if (o) o.scrollTop = o.scrollHeight;
+  const inp = $("cc-input"); if (inp && !inp.disabled) inp.focus();
+}
+function ccClose() { CT.open = false; $("cc-modal").hidden = true; }
+document.addEventListener("keydown", e => { if (e.key === "Escape" && $("cc-modal") && !$("cc-modal").hidden) ccClose(); });
+$("cc-modal").addEventListener("mousedown", e => { if (e.target === $("cc-modal")) ccClose(); });
 function ccSync() {                        // (re)build the panel when the switch changed
   const want = CT.open && CT.host ? CT.host : "";
   if (CC_EL.dataset.host !== want || (want && !CC_EL.querySelector("#cc-out"))) ccRender();
 }
 function ccRender() {
-  const root = CC_EL;
+  const root = CC_EL, $ = id => root.querySelector("#" + id);   // the panel may not be in the page yet, so look inside it
   const want = CT.open && CT.host ? CT.host : "";
   root.dataset.host = want;
   if (!want) { root.innerHTML = ""; return; }
   root.innerHTML = '<div class="cc" id="cc"><div class="cc-h"><span class="cc-t" id="cc-title"></span><span class="cc-st" id="cc-state"></span><span class="cc-sp"></span>' +
     '<button type="button" class="cc-b go" id="cc-connect">Connect</button><button type="button" class="cc-b" id="cc-ctrlc">Ctrl+C</button>' +
-    '<button type="button" class="cc-b" id="cc-clear">Clear</button><button type="button" class="cc-b" id="cc-max">Maximise</button></div>' +
+    '<button type="button" class="cc-b" id="cc-clear">Clear</button><button type="button" class="cc-b" id="cc-close">Close</button></div>' +
     '<pre class="cc-out" id="cc-out"></pre><div class="cc-in"><span>&gt;</span><input id="cc-input" type="text" autocomplete="off" spellcheck="false" aria-label="Command for the switch"></div>' +
     '<div class="cc-n">The commands and output of every step appear here as the switch prints them. Connect opens an interactive SSH session to this switch, so you can also type commands, for example show install summary.</div></div>';
   $("cc-connect").addEventListener("click", () => { const c = ccGet(CT.host); (c.state === "on" || c.state === "connecting") ? ccDisconnect(CT.host) : ccConnect(CT.host); });
   $("cc-ctrlc").addEventListener("click", () => { ccSend({raw: "ctrl_c"}); $("cc-input").focus(); });
   $("cc-clear").addEventListener("click", () => { ccGet(CT.host).text = ""; ccPaint(); });
-  $("cc-max").addEventListener("click", () => { const m = $("cc").classList.toggle("max"); $("cc-max").textContent = m ? "Restore" : "Maximise"; const o = $("cc-out"); o.scrollTop = o.scrollHeight; });
+  $("cc-close").addEventListener("click", ccClose);
   $("cc-out").addEventListener("click", () => { if (!String(getSelection()) && !$("cc-input").disabled) $("cc-input").focus(); });
   $("cc-input").addEventListener("keydown", e => {
     const c = ccGet(CT.host), inp = e.target;
@@ -13680,6 +13884,7 @@ function ccRender() {
   });
   const c = ccGet(CT.host);
   if (c.sid && !c.polling) ccPoll(CT.host);
+  const slot = document.getElementById("cc-slot"); if (slot && CC_EL.parentNode !== slot) slot.appendChild(CC_EL);
   ccPaint();
 }
 function ccPaint() {
@@ -13764,8 +13969,10 @@ ctOn("click", e => {
   const c = e.target.closest("[data-ct]"); if (!c) return;
   switch (c.dataset.ct) {
     case "toggle": CT.open = !CT.open; ctRender(); break;
+    case "console": ccOpen(); break;
     case "tab": CT.tab = c.dataset.t === "detail" ? "detail" : "setup"; ctTabs(); ctPersist(); break;
-    case "restoggle": { const card = $("tr-res-card"), shut = card.classList.toggle("collapsed"); c.setAttribute("aria-expanded", shut ? "false" : "true"); break; }
+    case "restoggle": { const card = $("tr-res-card"), shut = card.classList.toggle("collapsed"); c.setAttribute("aria-expanded", shut ? "false" : "true");
+      c.title = (shut ? "Expand" : "Minimize") + " Results And Profile"; c.setAttribute("aria-label", c.title); break; }
     case "run": CT.tab = "detail"; ctTabs(); ctRun(c.dataset.id); break;
     case "stop": ctStop(); break;
     case "sel": { CT.tab = "detail"; CT.sel = c.dataset.id; ctPersist(); ctRender(); break; }
@@ -14330,7 +14537,8 @@ document.addEventListener("keydown", e => { if (e.key === "Escape" && $("dg-card
 // ---- Diagnosis tab: run read-only commands on switches, or analyze their logs locally ----
 const DX_SAMPLE = "show ip interface brief\nshow version\nshow logging";
 const dx = {data: null, tool: "cmd", picked: new Set(), busy: false, timer: null, tick: 0, site: null, resKey: null, listKey: "", repKey: "",
-            was: {commands: false, logs: false}, open: new Set(), cmdInit: false, aiBusy: new Set()};
+            was: {commands: false, logs: false}, open: new Set(), min: new Set(), cmdInit: false, aiBusy: new Set(), askAll: false};
+const dxSleep = ms => new Promise(r => setTimeout(r, ms));
 // Run Commands and Log Analysis keep separate runs and separate results; each tab only ever shows its own.
 const dxKind = () => dx.tool === "cmd" ? "commands" : "logs";
 const dxOn = r => !!(r && !r.finished);
@@ -14348,7 +14556,7 @@ async function dxLoad(force) {
   dx.busy = true;
   try {
     const d = await getJSON("/api/diag");
-    if (d.site !== dx.site) { dx.site = d.site; dx.picked = new Set(); dx.listKey = ""; dx.resKey = null; dx.repKey = ""; dx.open = new Set(); dx.cmdInit = false; }
+    if (d.site !== dx.site) { dx.site = d.site; dx.picked = new Set(); dx.listKey = ""; dx.resKey = null; dx.repKey = ""; dx.open = new Set(); dx.min = new Set(); dx.cmdInit = false; }
     for (const k of ["commands", "logs"]) {
       const r = d.runs[k], on = dxOn(r);
       if (dx.was[k] && !on && r && k === dxKind()) {
@@ -14360,10 +14568,10 @@ async function dxLoad(force) {
     dx.data = d;
     if (!dx.cmdInit) { dx.cmdInit = true; $("dx-cmds").value = d.commands || DX_SAMPLE; }
     if (!$("dx-look").options.length) {
-      $("dx-look").innerHTML = d.lookbacks.map(h => '<option value="' + h + '">' + (h === 0 ? "Whole log buffer" : h < 48 ? "Last " + h + " hours" : "Last " + (h / 24) + " days") + "</option>").join("");
+      $("dx-look").innerHTML = d.lookbacks.map(h => '<option value="' + h + '">' + (h === 0 ? "Whole Log Buffer" : h < 48 ? "Last " + h + " Hours" : "Last " + (h / 24) + " Days") + "</option>").join("");
     }
-    $("dx-words").textContent = d.allowed_words.join(", ");
-    $("dx-logcmds").textContent = d.log_commands.join(", ");
+    tipSet($("dx-tip-cmd"), "Type the commands to run (one per line) and tick the switches on the left. Each switch's output is saved in the Storage tab under Diagnosis, in that switch's folder. Only read-only commands are accepted: " + d.allowed_words.join(", ") + ". Nothing here changes a switch.", "");
+    tipSet($("dx-tip-log"), "Reads the log of each ticked switch (" + d.log_commands.join(", ") + ") and checks it on this computer against built-in rules for things that can disturb an upgrade: stack problems, power / fan / temperature, flash errors, crashes, unexpected reloads, failed installs, flapping ports and more. It also reads the stack status (members, stack ports and stack power) and lists the devices that are not authenticated through 802.1X / MAB, with their MAC addresses and ports. The AI button runs the same analysis on the ticked switches and then asks the configured AI for a second opinion on each. The verdict is advice for you to judge; it never blocks or starts anything. The raw output is saved in Storage under Diagnosis.", "");
     dxRender();
   } catch (e) { dxSay("err", e.message); }
   finally { dx.busy = false; }
@@ -14377,7 +14585,11 @@ function dxRender() {
   $("dx-p-cmd").hidden = !cmd; $("dx-p-log").hidden = cmd;
   dxRenderList(); dxRenderResults(); dxRenderReports();
   const n = [...dx.picked].filter(h => d.devices.some(v => v.host === h && v.has_creds)).length;
-  $("dx-run").disabled = runC || n === 0; $("dx-analyze").disabled = runL || n === 0;
+  const aiOn = !!d.ai.enabled, ask = $("dx-askai");
+  $("dx-run").disabled = runC || n === 0; $("dx-analyze").disabled = runL || n === 0 || dx.askAll;
+  ask.disabled = runL || n === 0 || !aiOn || dx.askAll;
+  ask.innerHTML = IC.ai + "<span>" + (dx.askAll ? "Asking AI ..." : "Ask AI" + (n ? " (" + n + ")" : "")) + "</span>"; ask.title = dx.askAll ? "Asking the AI ..." : "Ask AI" + (n ? " (" + n + " switch" + (n > 1 ? "es" : "") + ")" : "");
+  { const h = $("dx-ai-hint"); h.hidden = aiOn; if (!aiOn) tipSet(h, "Ask AI is off - an administrator can turn it on under Settings > AI Analysis.", "w"); }
   $("dx-run").textContent = runC ? "Running " + d.runs.commands.done + "/" + d.runs.commands.total : "Run Commands" + (n ? " (" + n + ")" : "");
   $("dx-analyze").textContent = runL ? "Analyzing " + d.runs.logs.done + "/" + d.runs.logs.total : "Analyze Logs" + (n ? " (" + n + ")" : "");
   const pickable = d.devices.filter(v => v.has_creds).length, all = $("dx-all"), allOn = pickable > 0 && n === pickable;
@@ -14417,6 +14629,28 @@ function dxFindingsHtml(host, a) {
       (f.examples.length ? '<div class="dx-ev">' + f.examples.map(esc).join("\n") + "</div>" : "") + "</div></details>";
   }).join("");
 }
+const DX_CHEV = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>';
+function dxTable(head, rows) { return '<table class="dx-top"><tr>' + head.map(h => "<th>" + esc(h) + "</th>").join("") + "</tr>" + rows.join("") + "</table>"; }
+function dxStackHtml(host, a) {
+  const f = a.facts || {}, parts = [];
+  if (f.stack && f.stack.length) parts.push('<div class="dx-sub">Stack members</div>' + dxTable(["Switch", "Role", "State"],
+    f.stack.map(r => "<tr><td>" + esc(r.switch) + "</td><td>" + esc(r.role) + '</td><td class="' + (String(r.state).toLowerCase() === "ready" ? "ok" : "bad") + '">' + esc(r.state) + "</td></tr>")));
+  if (f.stack_ports && f.stack_ports.length) parts.push('<div class="dx-sub">Stack ports</div>' + dxTable(["Switch", "Port 1", "Port 2"],
+    f.stack_ports.map(r => "<tr><td>" + esc(r.switch) + "</td>" + r.ports.map(x => '<td class="' + (String(x).toLowerCase() === "ok" ? "ok" : String(x).toLowerCase() === "down" ? "bad" : "") + '">' + esc(x) + "</td>").join("") + "</tr>")));
+  if (f.stack_power && f.stack_power.length) parts.push('<div class="dx-sub">Stack power</div>' + dxTable(["Power stack", "Mode", "Topology", "Total (W)", "Switches", "Power supplies"],
+    f.stack_power.map(r => "<tr><td>" + esc(r.name) + "</td><td>" + esc(r.mode) + "</td><td>" + esc(r.topology) + "</td><td>" + esc(r.total_w) + "</td><td>" + esc(r.switches) + "</td><td>" + esc(r.supplies) + "</td></tr>")));
+  if (!parts.length) return "";
+  const key = host + "|stack", sum = [f.stack ? f.stack.length + " member(s)" : "", f.stack_power && f.stack_power.length ? f.stack_power.length + " power stack(s)" : ""].filter(Boolean).join(", ");
+  return '<details class="dx-f" data-key="' + esc(key) + '"' + (dx.open.has(key) ? " open" : "") + '><summary>Stack status<span class="m">' + esc(sum) + '</span></summary><div class="fb">' + parts.join("") + "</div></details>";
+}
+function dxDot1xHtml(host, a) {
+  const d = (a.facts || {}).dot1x, list = a.dot1x_unauth || []; if (!d) return "";
+  const key = host + "|dot1x", head = d.sessions ? d.not_authenticated + " of " + d.sessions + " session(s) not authenticated" : "no 802.1X / MAB sessions found";
+  const body = list.length ? dxTable(["Port", "MAC address", "Method", "Domain", "Status"], list.map(x => "<tr><td>" + esc(x.port) + "</td><td>" + esc(x.mac) + "</td><td>" + esc(x.method) + "</td><td>" + esc(x.domain) + '</td><td class="bad">' + esc(x.status) + "</td></tr>")) +
+      (d.not_authenticated > list.length ? '<div class="dx-note">Showing the first ' + list.length + " of " + d.not_authenticated + ".</div>" : "")
+    : '<div class="dx-note">' + (d.sessions ? "Every 802.1X / MAB session on this switch is authenticated." : "802.1X / MAB is not in use on this switch, or no clients are connected.") + "</div>";
+  return '<details class="dx-f" data-key="' + esc(key) + '"' + (dx.open.has(key) ? " open" : "") + '><summary>Devices not authenticated (802.1X / MAB)<span class="m">' + esc(head) + '</span></summary><div class="fb">' + body + "</div></details>";
+}
 function dxAnalysisHtml(host, label, a, canAi) {
   const sev = ["emergency", "alert", "critical", "error", "warning", "notice", "informational", "debug"];
   const facts = a.facts || {}, parts = [];
@@ -14424,19 +14658,22 @@ function dxAnalysisHtml(host, label, a, canAi) {
   if (facts.uptime) parts.push("uptime " + facts.uptime);
   if (facts.reload_reason) parts.push("last reload: " + facts.reload_reason);
   if (facts.stack) parts.push("stack: " + facts.stack.map(r => r.switch + " " + r.state).join(", "));
+  if (facts.stack_power && facts.stack_power.length) parts.push("stack power: " + facts.stack_power.map(r => r.name + " " + r.topology).join(", "));
+  if (facts.dot1x) parts.push("802.1X: " + facts.dot1x.not_authenticated + " of " + facts.dot1x.sessions + " not authenticated");
   if (typeof facts.err_disabled === "number") parts.push(facts.err_disabled + " err-disabled port(s)");
   const counts = Object.entries(a.severity).filter(e => e[1] > 0).map(e => sev[+e[0]] + " " + e[1]).join(", ");
   const b = a.buffer;
   let ai = "";
-  if (a.ai) ai = '<div class="dx-ai"><b>AI second opinion</b> <span class="dx-note">' + esc(a.ai.provider + ", " + a.ai.model + " - " + a.ai.time + (a.ai.masked ? " - identifiers masked" : " - identifiers NOT masked")) +
+  if (a.ai) ai = '<div class="dx-ai"><b>AI analysis</b> <span class="dx-note">' + esc(a.ai.provider + ", " + a.ai.model + " - " + a.ai.time + (a.ai.masked ? " - identifiers masked" : " - identifiers NOT masked")) +
     ' - advisory, check it against the evidence above</span><pre>' + esc(a.ai.text) + "</pre></div>";
-  const aiBtn = canAi ? '<button type="button" class="btn sm" data-dx-ai="' + esc(host) + '"' + (dx.aiBusy.has(host) ? " disabled" : "") + ">" + (dx.aiBusy.has(host) ? "Asking ..." : a.ai ? "Ask Again" : "AI Second Opinion") + "</button>" : "";
-  return '<div class="dx-sw"><div class="hd"><span class="dx-v ' + a.verdict + '">' + a.verdict.toUpperCase() + "</span><b>" + esc(label) + '</b><span class="dx-note" style="margin:0">' + esc(host) + " - " + esc(a.time) +
-    '</span><span class="sp">' + aiBtn + '<button type="button" class="btn sm" data-dx-file="' + esc(a.files.report) + '">Report</button><button type="button" class="btn sm" data-dx-file="' + esc(a.files.logs) +
-    '">Raw Output</button><button type="button" class="btn sm" data-dx-folder="' + esc(dxFolderOf(a.files.report)) + '">Open Folder</button></span></div><div class="bd"><div><b>' + esc(a.verdict_text) + "</b></div>" +
+  const aiBtn = canAi ? '<button type="button" class="btn sm aib" data-dx-ai="' + esc(host) + '"' + (dx.aiBusy.has(host) ? " disabled" : "") + ' title="' + (dx.aiBusy.has(host) ? "Asking the AI ..." : a.ai ? "Ask AI again" : "Ask AI") + '" aria-label="' + (a.ai ? "Ask AI again" : "Ask AI") + '">' + IC.ai + "<span>" + (dx.aiBusy.has(host) ? "Asking ..." : a.ai ? "Ask Again" : "Ask AI") + "</span></button>" : "";
+  const min = dx.min.has(host);
+  return '<div class="dx-sw' + (min ? " min" : "") + '"><div class="hd" data-host="' + esc(host) + '"><span class="dx-v ' + a.verdict + '">' + a.verdict.toUpperCase() + "</span><b>" + esc(label) + '</b><span class="dx-note" style="margin:0">' + esc(host) + " - " + esc(a.time) +
+    '</span><span class="dx-sum">' + esc(a.verdict_text) + '</span><span class="sp">' + aiBtn + '<button type="button" class="btn sm" data-dx-file="' + esc(a.files.logs) +
+    '">Raw Output</button></span><button type="button" class="dx-chev" data-dx-min="' + esc(host) + '" aria-expanded="' + (!min) + '" title="' + (min ? "Expand this switch" : "Minimize this switch") + '" aria-label="' + (min ? "Expand " : "Minimize ") + esc(label) + '">' + IC.dn + '</button></div><div class="bd"><div><b>' + esc(a.verdict_text) + "</b></div>" +
     '<div class="dx-note">' + esc(b.lines + " log message(s) analyzed" + (b.first ? ", " + b.first + " to " + b.last : "") + (a.lookback_hours ? " - last " + a.lookback_hours + " hours" : " - whole buffer")) + (counts ? " - " + esc(counts) : "") + "</div>" +
     (parts.length ? '<div class="dx-note">' + esc(parts.join(" | ")) + "</div>" : "") +
-    a.notes.map(n => '<div class="dx-note">Note: ' + esc(n) + "</div>").join("") + dxFindingsHtml(host, a) +
+    a.notes.map(n => '<div class="dx-note">Note: ' + esc(n) + "</div>").join("") + dxFindingsHtml(host, a) + dxStackHtml(host, a) + dxDot1xHtml(host, a) +
     (a.top.length ? '<details class="dx-f" data-key="' + esc(host + "|top") + '"' + (dx.open.has(host + "|top") ? " open" : "") + '><summary>Most frequent messages</summary><div class="fb"><table class="dx-top">' +
       a.top.map(t => "<tr><td>" + t.count + "x</td><td>" + esc(t.example) + "</td></tr>").join("") + "</table></div></details>" : "") + ai + "</div></div>";
 }
@@ -14450,11 +14687,12 @@ function dxRenderResults() {
       for (const [h, s] of Object.entries(r.hosts)) {
         const cls = s.state === "ok" ? "green" : s.state === "failed" ? "bad" : s.state === "skipped" ? "amber" : "run";
         html += '<div class="dx-line"><span class="dx-v ' + cls + '">' + esc(s.state.toUpperCase()) + "</span><b>" + esc(label(h)) + "</b><span>" + esc(s.detail || "") + "</span>" +
-          (s.file ? '<span class="sp"><button type="button" class="btn sm" data-dx-file="' + esc(s.file) + '">View Output</button><button type="button" class="btn sm" data-dx-folder="' + esc(dxFolderOf(s.file)) + '">Open Folder</button></span>' : "") + "</div>";
+          (s.file ? '<span class="sp"><button type="button" class="btn sm" data-dx-file="' + esc(s.file) + '">View Output</button></span>' : "") + "</div>";
       }
     }
   } else {
     const r = d.runs.logs, hosts = r ? Object.keys(r.hosts) : Object.keys(d.results);
+    if (hosts.filter(h => d.results[h]).length > 1) html += '<div class="dx-bar"><button type="button" class="btn sm" data-dx-minall="0">Expand All</button><button type="button" class="btn sm" data-dx-minall="1">Minimize All</button></div>';
     for (const h of hosts) {
       const a = d.results[h], s = r && r.hosts[h];
       if (a) html += dxAnalysisHtml(h, label(h), a, d.ai.enabled);
@@ -14526,17 +14764,43 @@ $("dx-analyze").addEventListener("click", async () => {
   try { const r = await post("/api/diag/logs", {hosts, lookback_hours: +$("dx-look").value}); dxSay("ok", r.message); await dxLoad(false); }
   catch (e) { dxSay("err", e.message); }
 });
+function dxToggleMin(host) { if (!host) return; if (dx.min.has(host)) dx.min.delete(host); else dx.min.add(host); dx.resKey = null; dxRenderResults(); }
+function dxMinAll(on) { if (!dx.data) return; dx.min = on ? new Set(Object.keys(dx.data.results)) : new Set(); dx.resKey = null; dxRenderResults(); }
 $("dx-res").addEventListener("click", async e => {
+  const mn = e.target.closest("[data-dx-min]"); if (mn) { dxToggleMin(mn.dataset.dxMin); return; }
+  const ma = e.target.closest("[data-dx-minall]"); if (ma) { dxMinAll(ma.dataset.dxMinall === "1"); return; }
+  const hd = e.target.closest(".dx-sw > .hd");
+  if (hd && !e.target.closest("button, a, summary, .sp")) { dxToggleMin(hd.dataset.host); return; }
   const f = e.target.closest("[data-dx-file]"); if (f) { dxOpenFile(f.dataset.dxFile); return; }
   const o = e.target.closest("[data-dx-folder]"); if (o) { dxOpenFolder(o.dataset.dxFolder); return; }
   const ai = e.target.closest("[data-dx-ai]"); if (!ai) return;
   const h = ai.dataset.dxAi, d = dx.data; if (!d || dx.aiBusy.has(h)) return;
-  if (!confirm("Send the condensed findings of this switch (not the whole log) to " + d.ai.provider + " (model " + d.ai.model + ")?\n\n" +
-               (d.ai.mask ? "IP / MAC addresses, host names and user names are masked first." : "Masking is OFF: addresses and names are sent as they are.") + "\n\nThe answer is advisory only.")) return;
   dx.aiBusy.add(h); dx.resKey = null; dxRenderResults(); dxSay("", "Asking the AI ...");
   try { const r = await post("/api/diag/ai", {host: h}); if (dx.data && dx.data.results[h]) dx.data.results[h].ai = r.ai; dxSay("ok", "AI second opinion added."); }
   catch (err) { dxSay("err", err.message); }
   finally { dx.aiBusy.delete(h); dx.resKey = null; dxLoad(false); }
+});
+$("dx-askai").addEventListener("click", async () => {
+  const d = dx.data; if (!d || dx.askAll || !d.ai.enabled) return;
+  const hosts = [...dx.picked].filter(h => d.devices.some(v => v.host === h && v.has_creds)); if (!hosts.length) return;
+  dx.askAll = true; dx.resKey = null; dx.open = new Set(); dxRender(); dxSay("", "Analyzing the logs ...");
+  try {
+    await post("/api/diag/logs", {hosts, lookback_hours: +$("dx-look").value});
+    let guard = 0;
+    do { await dxSleep(1200); await dxLoad(false); guard++; } while (dx.data && dxOn(dx.data.runs.logs) && guard < 600);
+    const lr = dx.data && dx.data.runs.logs;
+    const ok = hosts.filter(h => lr && lr.hosts[h] && lr.hosts[h].state === "ok" && dx.data.results[h]);
+    if (!ok.length) { dxSay("err", "No switch could be analyzed, so there is nothing to send to the AI. The switch list shows the reason."); return; }
+    let done = 0, failed = 0, last = "";
+    for (const h of ok) {
+      dx.aiBusy.add(h); dx.resKey = null; dxRenderResults(); dxSay("", "Asking the AI " + (done + failed + 1) + " of " + ok.length + " ...");
+      try { const r = await post("/api/diag/ai", {host: h}); if (dx.data && dx.data.results[h]) dx.data.results[h].ai = r.ai; done++; }
+      catch (err) { failed++; last = err.message; }
+      finally { dx.aiBusy.delete(h); dx.resKey = null; dxRenderResults(); }
+    }
+    dxSay(failed ? "err" : "ok", "AI analysis added for " + done + " of " + ok.length + " switch(es)." + (failed ? " " + last : ""));
+  } catch (err) { dxSay("err", err.message); }
+  finally { dx.askAll = false; dx.resKey = null; await dxLoad(false); if (dx.data) dxRender(); }
 });
 $("dx-res").addEventListener("toggle", e => {
   const k = e.target.dataset && e.target.dataset.key; if (!k) return;
@@ -14558,24 +14822,23 @@ async function aiLoad() {
 function aiSay(kind, text) { AIS.msg = text ? {kind: kind, text: text} : null; const m = $("ai-msg"); if (m) { m.className = "msg " + (kind || ""); m.textContent = text || ""; } }
 function aiRender() {
   const root = $("ai-root"); if (!root) return;
-  if (!AIS.data) { root.innerHTML = '<div class="msg ' + (AIS.msg ? AIS.msg.kind : "") + '" style="margin-top:14px">' + esc(AIS.msg ? AIS.msg.text : "Loading ...") + "</div>"; return; }
+  const ownEl = $("set-own");
+  if (!AIS.data) { if (ownEl) ownEl.innerHTML = ""; root.innerHTML = '<div class="msg ' + (AIS.msg ? AIS.msg.kind : "") + '" style="margin-top:14px">' + esc(AIS.msg ? AIS.msg.text : "Loading ...") + "</div>"; return; }
   const d = AIS.draft, dis = SET_CAN_EDIT ? "" : " disabled";
   const prov = AIS.data.providers.map(p => '<option value="' + esc(p.key) + '"' + (p.key === d.provider ? " selected" : "") + ">" + esc(p.label) + "</option>").join("");
   root.innerHTML =
+    '<div class="msg ' + (AIS.msg ? AIS.msg.kind : "") + '" id="ai-msg" role="status" aria-live="polite" style="margin:0 0 10px">' + esc(AIS.msg ? AIS.msg.text : "") + "</div>" +
     '<div class="nt-form">' +
-    '<label for="ai-enabled">Use a cloud AI for a second opinion</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="ai-enabled"' + (d.enabled ? " checked" : "") + dis + "><span>" + (d.enabled ? "On" : "Off") + "</span></label>" +
+    '<label for="ai-enabled">Use a cloud AI for a second opinion' + tipHtml("What is sent: only when you press Ask AI, and only the condensed findings of the local analysis (rule results, a few evidence lines, counts) - never the whole log, never passwords. Log analysis itself always runs locally; with this option off nothing leaves this computer.", "w") + '</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="ai-enabled"' + (d.enabled ? " checked" : "") + dis + "><span>" + (d.enabled ? "On" : "Off") + "</span></label>" +
     '<label for="ai-prov">Provider</label><select id="ai-prov"' + dis + ">" + prov + "</select>" +
     '<label for="ai-model">Model</label><input type="text" id="ai-model" autocomplete="off" spellcheck="false" maxlength="100" value="' + esc(d.model) + '"' + dis + ">" +
     (d.provider === "openai" ? '<label for="ai-url">API base URL</label><input type="text" id="ai-url" autocomplete="off" spellcheck="false" maxlength="300" placeholder="https://api.openai.com/v1" value="' + esc(d.base_url) + '"' + dis + ">" : "") +
-    '<label for="ai-key">API key</label><input type="password" id="ai-key" autocomplete="new-password" maxlength="400" value=""' + dis + ">" +
-    '<div class="nt-hint">' + (AIS.data.key_saved ? "A key is saved (stored encrypted, never shown again) - leave empty to keep it." : "No key saved yet.") + "</div>" +
+    '<label for="ai-key">API key' + tipHtml(AIS.data.key_saved ? "A key is saved (stored encrypted, never shown again) - leave empty to keep it." : "No key saved yet.", AIS.data.key_saved ? "" : "w") + '</label><input type="password" id="ai-key" autocomplete="new-password" maxlength="400" value=""' + dis + ">" +
     (AIS.data.key_saved ? '<label for="ai-clear">Remove saved key</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="ai-clear"' + dis + "><span>Remove it when I save</span></label>" : "") +
-    '<label for="ai-mask">Mask identifiers</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="ai-mask"' + (d.mask ? " checked" : "") + dis + "><span>" + (d.mask ? "On (recommended)" : "Off") + "</span></label>" +
-    '<div class="nt-hint">When on, IP and MAC addresses, host names and user names are replaced with tokens before anything is sent, and put back into the answer you read.</div></div>' +
-    '<div class="nt-hint" style="margin-top:12px"><b>What is sent:</b> only when you press <i>AI Second Opinion</i> on one switch, and only the condensed findings of the local analysis (rule results, a few evidence lines, counts) - never the whole log, never passwords. ' +
-    "Log analysis itself always runs locally; with this option off nothing leaves this computer.</div>" +
-    '<div class="nt-actions"><button type="button" class="btn sm" id="ai-test"' + dis + '>Test Connection</button><button type="button" class="btn p sm" id="ai-save"' + dis + ">Save AI Settings</button></div>" +
-    '<div class="msg ' + (AIS.msg ? AIS.msg.kind : "") + '" id="ai-msg" role="status" aria-live="polite" style="margin:10px 0 0">' + esc(AIS.msg ? AIS.msg.text : "") + "</div>";
+    '<label for="ai-mask">Mask identifiers' + tipHtml("When on, IP and MAC addresses, host names and user names are replaced with tokens before anything is sent, and put back into the answer you read.", "") + '</label><label class="chk set-chk" style="font-weight:400"><input type="checkbox" id="ai-mask"' + (d.mask ? " checked" : "") + dis + "><span>" + (d.mask ? "On (recommended)" : "Off") + "</span></label>" +
+    '</div>' +
+    "";
+  if (ownEl) ownEl.innerHTML = '<button type="button" class="btn sm" id="ai-test"' + dis + '>Test Connection</button><button type="button" class="btn p sm" id="ai-save"' + dis + ">Save AI Settings</button>";
 }
 function aiCollect() {
   const d = AIS.draft, g = id => { const el = $(id); return el ? el : null; };
@@ -14592,7 +14855,7 @@ document.addEventListener("change", e => {
   else if (e.target.id === "ai-enabled" || e.target.id === "ai-mask") { aiCollect(); aiRender(); }
 });
 document.addEventListener("click", async e => {
-  const root = $("ai-root"); if (!root || !root.contains(e.target) || !SET_CAN_EDIT || !AIS.data) return;
+  const root = $("ai-root"), own = $("set-own"); if (!root || !(root.contains(e.target) || (own && own.contains(e.target))) || !SET_CAN_EDIT || !AIS.data) return;
   if (e.target.id !== "ai-test" && e.target.id !== "ai-save") return;
   if (AIS.busy) return;
   const key = aiCollect(), test = e.target.id === "ai-test", btn = e.target;
@@ -14635,7 +14898,7 @@ const drFoldOpen = (k, dflt) => DR_FOLD[k] === undefined ? dflt : !!DR_FOLD[k];
 function drFold(key, title, right, inner, dflt) {
   const open = drFoldOpen(key, dflt);
   return '<div class="dr-sec dr-fold' + (open ? " open" : "") + '"><h5><button type="button" class="fold-btn" data-fold="' + key +
-    '" aria-expanded="' + open + '">' + esc(title) + '<span class="chev">' + IC.dn + "</span></button>" + (right || "") + "</h5>" +
+    '" aria-expanded="' + open + '">' + esc(title) + '<span class="sqb chev">' + (open ? IC.shrink : IC.expand) + "</span></button>" + (right || "") + "</h5>" +
     (open ? '<div class="fold-body">' + inner + "</div>" : "") + "</div>";
 }
 const drHost = () => last && last.hosts.find(x => x.host === DR.host);
@@ -15070,7 +15333,7 @@ function termMax(on) {
   TUI.max = !!on;
   $("dr-term").classList.toggle("max", TUI.max);
   $("dr-term-bd").hidden = !TUI.max;
-  $("dr-term-max").textContent = TUI.max ? "Restore" : "Maximise";
+  { const mb = $("dr-term-max"); mb.innerHTML = TUI.max ? IC.shrink : IC.expand; mb.title = TUI.max ? "Restore (Esc)" : "Maximize (Esc restores)"; mb.setAttribute("aria-label", TUI.max ? "Restore" : "Maximize"); }
   const out = $("dr-term-out"); out.scrollTop = out.scrollHeight;
   if (!$("dr-term-in").disabled) $("dr-term-in").focus();
 }
