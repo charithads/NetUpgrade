@@ -1,7 +1,7 @@
 #define MyAppName "NetUpgrade"
 #define MyAppPublisher "Innovate Nexus"
 #ifndef AppVersion
-  #define AppVersion "1.0.2"
+  #define AppVersion "2.0.0-beta.1"
 #endif
 
 [Setup]
