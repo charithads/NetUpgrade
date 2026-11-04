@@ -1,5 +1,4 @@
 """Regression tests for stack checks and downloadable Diagnosis reports."""
-import csv
 import io
 import unittest
 
@@ -58,11 +57,10 @@ class DiagnosisReportTests(unittest.TestCase):
             "facts": {"version": "17.12.4"}, "notes": [], "files": {}, "top": [],
         }
 
-    def test_csv_export_has_bom_and_neutralizes_formula_cells(self):
-        content = manager.build_diag_csv([self.analysis()])
-        self.assertTrue(content.startswith(b"\xef\xbb\xbf"))
-        rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
-        self.assertIn("'=1+1", rows[1])
+    def test_csv_export_is_not_supported(self):
+        self.assertNotIn("csv", manager.DIAG_REPORT_FORMATS)
+        with self.assertRaises(ValueError):
+            manager.build_diag_report("csv", [self.analysis()])
 
     def test_excel_export_contains_summary_findings_and_safe_text(self):
         from openpyxl import load_workbook
