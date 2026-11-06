@@ -45,9 +45,12 @@ if sys.platform == "win32":
 
 
 # --- Worker / CLI dispatch: must run before any window is built --------------
-# The GUI starts each switch upgrade as "<this exe> --job <file>". Without this, every
-# job would open another launcher window. It comes after the console-hiding above so the
+# The GUI starts each switch upgrade as "<this exe> --job <file>", and each saved report script as
+# "<this exe> --report-script". Without this, every one would open another launcher window. It comes after the console-hiding above so the
 # pings made by a worker stay hidden too.
+if len(sys.argv) == 2 and sys.argv[1] == "--report-script":
+    import ios_xe_upgrade_manager as _m
+    sys.exit(_m.report_script_main())          # sandboxed worker for saved report scripts: JSON on stdin, JSON on stdout
 if len(sys.argv) == 3 and sys.argv[1] == "--job":
     import ios_xe_upgrade_manager as _m
     sys.exit(_m.job_main(sys.argv[2]))
@@ -82,7 +85,7 @@ import pystray
 from PIL import Image, ImageTk
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.0.0-beta.1"   # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
+APP_VERSION = "2.0.0-beta.2"   # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
 UI_FONT_SIZE = 8               # window size follows the font: 9 = the old, larger window; 8 = compact
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"
