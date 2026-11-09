@@ -60,6 +60,8 @@ var
   StoragePage: TInputDirWizardPage;
 
 procedure InitializeWizard;
+var
+  ExistingStoragePath: String;
 begin
   StoragePage := CreateInputDirPage(wpWelcome,
     'Choose storage location',
@@ -67,7 +69,13 @@ begin
     'Images, switch backups, reports, and upgrade logs will be kept under a NetUpgrade folder here. Use Make New Folder in Browse to create that folder if needed.',
     False, 'NetUpgrade');
   StoragePage.Add('Storage location:');
-  StoragePage.Values[0] := ExpandConstant('{localappdata}');
+
+  { Keep the existing location when the updater runs the installer silently. }
+  if RegQueryStringValue(HKCU, 'Software\Innovate Nexus\NetUpgrade',
+       'StoragePath', ExistingStoragePath) and (Trim(ExistingStoragePath) <> '') then
+    StoragePage.Values[0] := ExistingStoragePath
+  else
+    StoragePage.Values[0] := ExpandConstant('{localappdata}');
 end;
 
 function GetStoragePath(Param: String): String;
