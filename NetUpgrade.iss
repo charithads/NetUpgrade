@@ -1,7 +1,7 @@
 #define MyAppName "NetUpgrade"
 #define MyAppPublisher "Innovate Nexus"
 #ifndef AppVersion
-  #define AppVersion "2.0.0"
+  #define AppVersion "2.1.0"
 #endif
 
 [Setup]
@@ -60,6 +60,8 @@ var
   StoragePage: TInputDirWizardPage;
 
 procedure InitializeWizard;
+var
+  ExistingStoragePath: String;
 begin
   StoragePage := CreateInputDirPage(wpWelcome,
     'Choose storage location',
@@ -67,14 +69,28 @@ begin
     'Images, switch backups, reports, and upgrade logs will be kept under a NetUpgrade folder here. Use Make New Folder in Browse to create that folder if needed.',
     False, 'NetUpgrade');
   StoragePage.Add('Storage location:');
-  StoragePage.Values[0] := ExpandConstant('{localappdata}');
+
+  { Keep the existing location when the updater runs the installer silently. }
+  if RegQueryStringValue(HKCU, 'Software\Innovate Nexus\NetUpgrade',
+       'StoragePath', ExistingStoragePath) and (Trim(ExistingStoragePath) <> '') then
+    StoragePage.Values[0] := ExistingStoragePath
+  else
+    StoragePage.Values[0] := ExpandConstant('{localappdata}');
 end;
 
 function GetStoragePath(Param: String): String;
 var
   SelectedPath: String;
 begin
-  SelectedPath := ExpandConstant(Trim(StoragePage.Values[0]));
+  if WizardSilent then
+  begin
+    { Silent in-app updates have no wizard page; retain the installed location. }
+    if not RegQueryStringValue(HKCU, 'Software\Innovate Nexus\NetUpgrade',
+         'StoragePath', SelectedPath) or (Trim(SelectedPath) = '') then
+      SelectedPath := ExpandConstant('{localappdata}');
+  end
+  else
+    SelectedPath := ExpandConstant(Trim(StoragePage.Values[0]));
   while (Length(SelectedPath) > 3) and (Copy(SelectedPath, Length(SelectedPath), 1) = '\') do
     Delete(SelectedPath, Length(SelectedPath), 1);
   if CompareText(ExtractFileName(SelectedPath), 'NetUpgrade') = 0 then
@@ -86,7 +102,7 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
-  if Trim(StoragePage.Values[0]) = '' then
+  if (not WizardSilent) and (Trim(StoragePage.Values[0]) = '') then
     Result := 'Select a storage location before continuing.'
   else if not ForceDirectories(GetStoragePath('')) then
     Result := 'NetUpgrade could not create the selected storage folder.';
