@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v2.0.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v2.1.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -97,13 +97,15 @@ from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote, unquote
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.0.0"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "2.1.0"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
+    {"version": "2.1.0", "date": "2026-11-09", "features": [
+        "Preserve the selected storage folder when installing updates silently."]},
     {"version": "2.0.0", "date": "2026-11-09", "features": [
         "Manage saved storage files and download selected files or folders as a ZIP.",
         "Export and import site profiles with their stored data, without exporting credentials.",
