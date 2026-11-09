@@ -18,7 +18,7 @@ from pathlib import Path
 APP_NAME = "NetUpgrade"
 INSTALL_RELATIVE = Path("Programs") / APP_NAME / f"{APP_NAME}.exe"
 UPDATE_RELATIVE = Path(APP_NAME) / "Updates"
-_INSTALLER_RE = re.compile(r"^NetUpgrade-Setup-v\d+\.\d+\.\d+\.exe$")
+_INSTALLER_RE = re.compile(r"^NetUpgrade-Setup-v\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?\.exe$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 WAIT_TIMEOUT_SECONDS = 180
 INSTALL_TIMEOUT_SECONDS = 600

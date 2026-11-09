@@ -26,6 +26,39 @@ class UpdateServiceTests(unittest.TestCase):
         self.assertIsNone(update_service.parse_version("v5.12.2-rc1"))
         self.assertIsNone(update_service.parse_version("latest"))
 
+    def test_prerelease_versions_follow_semver_order(self):
+        key = update_service.version_key
+        self.assertLess(key("2.0.0-beta.2"), key("2.0.0-beta.10"))
+        self.assertLess(key("2.0.0-beta.10"), key("2.0.0-rc.1"))
+        self.assertLess(key("2.0.0-rc.1"), key("2.0.0"))
+        self.assertLess(key("2.0.0"), key("v2.0.1-beta.1"))
+        self.assertIsNone(key("2.0.0-beta/../x"))
+        self.assertEqual(update_service.installer_asset_name("v2.0.0-beta.3"), "NetUpgrade-Setup-v2.0.0-beta.3.exe")
+
+    def test_betas_are_offered_only_to_beta_installations(self):
+        releases = [{"tag_name": "v2.0.0-beta.3", "prerelease": True},
+                    {"tag_name": "v1.9.0"},
+                    {"tag_name": "v2.0.0-beta.4", "prerelease": True, "draft": True}]
+        pick = update_service.pick_update_release
+        self.assertEqual(pick(releases, "2.0.0-beta.2")["tag_name"], "v2.0.0-beta.3")
+        self.assertIsNone(pick(releases, "1.9.0"))                       # stable stays on stable
+        self.assertIsNone(pick(releases, "2.0.0-beta.3"))                # up to date
+        releases.append({"tag_name": "v2.0.0"})
+        self.assertEqual(pick(releases, "2.0.0-beta.2")["tag_name"], "v2.0.0")
+        self.assertEqual(pick(releases, "1.9.0")["tag_name"], "v2.0.0")
+
+    def test_beta_installer_is_selected_and_accepted_by_updater(self):
+        release, _, _ = self.release(name="NetUpgrade-Setup-v2.0.0-beta.3.exe")
+        release["tag_name"] = "v2.0.0-beta.3"
+        self.assertEqual(update_service.pick_installer_asset(release)["name"], "NetUpgrade-Setup-v2.0.0-beta.3.exe")
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as temp:
+            app_path, update_dir = updater_helper.expected_paths(temp)
+            update_dir.mkdir(parents=True)
+            installer = update_dir / "NetUpgrade-Setup-v2.0.0-beta.3.exe"
+            installer.write_bytes(b"x")
+            normalized, _, _ = updater_helper.validate_request(1234, installer, "a" * 64, app_path, temp)
+            self.assertEqual(normalized, installer.resolve())
+
     def test_only_exact_versioned_installer_is_selected(self):
         release, _, _ = self.release()
         release["assets"].insert(0, {"name": "NetUpgrade.exe", "browser_download_url": "https://github.com/x"})

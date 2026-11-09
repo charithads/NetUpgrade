@@ -14,6 +14,9 @@ from urllib.request import Request, urlopen
 APP_NAME = "NetUpgrade"
 MAX_INSTALLER_BYTES = 512 * 1024 * 1024
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+# x.y.z with an optional SemVer prerelease such as -beta.2 or -rc1 (letters, digits and dots only).
+_ANY_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*))?$")
+INSTALLER_NAME_RE = re.compile(r"^NetUpgrade-Setup-v\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?\.exe$")
 _SHA256_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 
 
@@ -23,18 +26,60 @@ def parse_version(value: str) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups()) if match else None
 
 
+def normalize_version(value: str) -> str | None:
+    """'v2.0.0-beta.2' -> '2.0.0-beta.2'; None for anything that is not x.y.z[-prerelease]."""
+    match = _ANY_VERSION_RE.fullmatch(str(value or "").strip())
+    if not match:
+        return None
+    core = ".".join(str(int(part)) for part in match.groups()[:3])
+    return core + (f"-{match.group(4)}" if match.group(4) else "")
+
+
+def version_key(value: str):
+    """A sortable key that follows SemVer precedence: 2.0.0-beta.2 < 2.0.0-beta.10 < 2.0.0-rc.1 < 2.0.0.
+    None for a malformed version."""
+    match = _ANY_VERSION_RE.fullmatch(str(value or "").strip())
+    if not match:
+        return None
+    core = tuple(int(part) for part in match.groups()[:3])
+    pre = match.group(4)
+    if not pre:
+        return core + (1, ())                       # a stable release sorts after all its prereleases
+    ids = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split("."))
+    return core + (0, ids)
+
+
+def is_prerelease_version(value: str) -> bool:
+    key = version_key(value)
+    return key is not None and key[3] == 0
+
+
 def is_newer_release(release: dict, current_version: str) -> bool:
-    latest = parse_version(release.get("tag_name", ""))
-    current = parse_version(current_version)
-    return latest is not None and current is not None and latest > current
+    """True when the release is newer than the running version. Someone on a stable version is only
+    offered stable releases; someone on a beta/prerelease is offered newer betas and stable releases."""
+    if release.get("draft"):
+        return False
+    tag = release.get("tag_name", "")
+    latest, current = version_key(tag), version_key(current_version)
+    if latest is None or current is None:
+        return False
+    if (release.get("prerelease") or is_prerelease_version(tag)) and not is_prerelease_version(current_version):
+        return False
+    return latest > current
+
+
+def pick_update_release(releases, current_version: str) -> dict | None:
+    """The newest release (from GitHub's release list) this installation may update to, or None."""
+    candidates = [r for r in releases or [] if isinstance(r, dict) and is_newer_release(r, current_version)]
+    return max(candidates, key=lambda r: version_key(r.get("tag_name", "")), default=None)
 
 
 def installer_asset_name(tag: str) -> str:
     """Return the exact installer asset name expected for a release tag."""
-    version = parse_version(tag)
+    version = normalize_version(tag)
     if version is None:
         raise ValueError("GitHub returned an invalid release version.")
-    return f"{APP_NAME}-Setup-v{'.'.join(map(str, version))}.exe"
+    return f"{APP_NAME}-Setup-v{version}.exe"
 
 
 def pick_installer_asset(release: dict) -> dict | None:
@@ -60,7 +105,7 @@ def download_verified_installer(asset: dict, directory: str | os.PathLike,
                                 progress=None, opener=urlopen) -> Path:
     """Download to a temporary file, verify size and SHA-256, then atomically publish it."""
     expected_name = str(asset.get("name") or "")
-    if not re.fullmatch(r"NetUpgrade-Setup-v\d+\.\d+\.\d+\.exe", expected_name):
+    if not INSTALLER_NAME_RE.fullmatch(expected_name):
         raise ValueError("GitHub returned an unexpected installer filename.")
     url = urlparse(str(asset.get("browser_download_url") or ""))
     if url.scheme != "https" or url.hostname != "github.com":

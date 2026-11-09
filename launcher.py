@@ -45,9 +45,12 @@ if sys.platform == "win32":
 
 
 # --- Worker / CLI dispatch: must run before any window is built --------------
-# The GUI starts each switch upgrade as "<this exe> --job <file>". Without this, every
-# job would open another launcher window. It comes after the console-hiding above so the
+# The GUI starts each switch upgrade as "<this exe> --job <file>", and each saved report script as
+# "<this exe> --report-script". Without this, every one would open another launcher window. It comes after the console-hiding above so the
 # pings made by a worker stay hidden too.
+if len(sys.argv) == 2 and sys.argv[1] == "--report-script":
+    import ios_xe_upgrade_manager as _m
+    sys.exit(_m.report_script_main())          # sandboxed worker for saved report scripts: JSON on stdin, JSON on stdout
 if len(sys.argv) == 3 and sys.argv[1] == "--job":
     import ios_xe_upgrade_manager as _m
     sys.exit(_m.job_main(sys.argv[2]))
@@ -75,14 +78,14 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
-from update_service import download_verified_installer, is_newer_release, pick_installer_asset
+from update_service import download_verified_installer, pick_installer_asset, pick_update_release
 
 import psutil
 import pystray
 from PIL import Image, ImageTk
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.0.0-beta.1"   # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
+APP_VERSION = "2.0.0"   # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
 UI_FONT_SIZE = 8               # window size follows the font: 9 = the old, larger window; 8 = compact
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"
@@ -679,7 +682,7 @@ def startup_admin():
     if not settings.get("admin") and not admin_dialog(True):
         messagebox.showwarning(APP_NAME, "The admin account is not set up yet.\n\n"
                                          "The tool cannot be launched until you create it\n"
-                                         "(Launch Tool, or Security tab > Change...).")
+                                         "(Launch, or Security tab > Change...).")
 
 
 # --- Window ----------------------------------------------------------------
@@ -716,11 +719,21 @@ bottom.pack(side="bottom", fill="x")
 bottom.columnconfigure(0, weight=2)
 bottom.columnconfigure(1, weight=1)
 bottom.columnconfigure(2, weight=1)
-launch_btn = ttk.Button(bottom, text="Launch Tool", command=lambda: launch_tool())
+launch_btn = ttk.Button(bottom, text="Launch", command=lambda: launch_tool())
 launch_btn.grid(row=0, column=0, sticky="ew", ipady=2, padx=(0, 4))
 stop_btn = ttk.Button(bottom, text="Stop", command=lambda: stop_tool())
 stop_btn.grid(row=0, column=1, sticky="ew", ipady=2, padx=(0, 4))
 ttk.Button(bottom, text="Exit", command=lambda: quit_app()).grid(row=0, column=2, sticky="ew", ipady=2)
+
+# "New update available" banner: hidden until the silent start-up check finds a newer release.
+upd_banner = tk.Frame(root, bg="#fff4ce", highlightthickness=1, highlightbackground="#e0c060")
+upd_banner_var = tk.StringVar()
+tk.Label(upd_banner, textvariable=upd_banner_var, bg="#fff4ce", anchor="w",
+         font=("Segoe UI", UI_FONT_SIZE, "bold")).pack(side="left", padx=(8, 4), pady=4)
+upd_banner_close = ttk.Button(upd_banner, text="Later", width=6, command=lambda: upd_banner.pack_forget())
+upd_banner_close.pack(side="right", padx=(0, 6), pady=3)
+upd_banner_btn = ttk.Button(upd_banner, text="Update now", command=lambda: update_install_prompt())
+upd_banner_btn.pack(side="right", padx=(0, 4), pady=3)
 
 nb = ttk.Notebook(root)
 nb.pack(fill="both", expand=True, padx=6, pady=(6, 4))
@@ -863,7 +876,7 @@ def update_status():
         text, color = "● Stopped", RED
     status_lbl.config(text=text, fg=color)
     stop_btn.state(["!disabled"] if state != "stopped" else ["disabled"])
-    launch_btn.config(text="Open in browser" if state == "running" else "Launch Tool")
+    launch_btn.config(text="Open in browser" if state == "running" else "Launch")
     try:
         if tray:
             tray.title = f"{APP_NAME} - {'running' if state == 'running' else 'not running'}"
@@ -1104,7 +1117,9 @@ ttk.Label(sec, textvariable=save_msg, foreground=GREEN).grid(row=12, column=0, s
 # ============================ ABOUT TAB ====================================
 # Automatic updates are available in the per-user installed Windows application.
 GITHUB_REPO = "/".join(APP_REPO_URL.rstrip("/").split("/")[-2:])
-GITHUB_LATEST_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+# The release list (not /releases/latest) so beta builds can also be offered newer betas;
+# update_service.pick_update_release keeps stable installations on stable releases.
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=30"
 UPDATE_DIR = os.path.join(DATA_DIR, "Updates")
 update_q = queue.Queue()
 update_state = {"busy": False, "release": None, "asset": None}
@@ -1124,11 +1139,15 @@ def is_installed_app():
 
 
 def github_get_latest():
-    req = urllib.request.Request(GITHUB_LATEST_API, headers={
+    """The newest release this installation may update to (betas only for beta builds), or None."""
+    req = urllib.request.Request(GITHUB_RELEASES_API, headers={
         "Accept": "application/vnd.github+json", "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            releases = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(releases, list):
+            raise ValueError("unexpected release list")
+        return pick_update_release(releases, APP_VERSION)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             raise RuntimeError("No release has been published yet.")
@@ -1208,20 +1227,26 @@ def active_upgrade_job():
     return False
 
 
-def update_check():
+def update_check(silent=False):
+    """Check GitHub for a newer release. silent=True is the start-up check: it never opens
+    dialogs or the browser, and only shows the "new update available" banner when one exists."""
     if update_state["busy"]:
         return
-    update_state.update(release=None, asset=None)
+    update_state.update(release=None, asset=None, silent=silent)
     upd_notes_btn.pack_forget()
     upd_bar.grid_remove()
-    if active_upgrade_job():
+    if not silent:
+        upd_banner.pack_forget()
+    if not is_installed_app():
+        if not silent:
+            upd_var.set("Automatic updates need the installed Windows app. Install NetUpgrade from GitHub Releases first.")
+            webbrowser.open(APP_REPO_URL + "/releases")
+        return
+    if not silent and active_upgrade_job():
         upd_var.set("An upgrade is still running. Wait for all switch upgrades to finish before updating NetUpgrade.")
         return
-    if not is_installed_app():
-        upd_var.set("Automatic updates need the installed Windows app. Install NetUpgrade from GitHub Releases first.")
-        webbrowser.open(APP_REPO_URL + "/releases")
-        return
-    upd_var.set("Checking GitHub ...")
+    if not silent:
+        upd_var.set("Checking GitHub ...")
     update_set_busy(True)
     threading.Thread(target=update_check_worker, daemon=True).start()
     root.after(150, update_poll)
@@ -1269,18 +1294,31 @@ def update_poll():
                 continue
             update_set_busy(False)
             upd_bar.grid_remove()
+            silent = update_state.pop("silent", False)
             if kind == "error":
-                upd_var.set(data)
-                audit_event(f"update failed: {data}")
+                if not silent:          # the start-up check stays quiet when offline / rate limited
+                    upd_var.set(data)
+                    audit_event(f"update failed: {data}")
+            elif kind == "checked" and silent:
+                release = data              # already the newest allowed update, or None
+                asset = pick_installer_asset(release) if release else None
+                if release and asset:
+                    update_state.update(release=release, asset=asset)
+                    tag = release.get("tag_name") or "a new version"
+                    upd_var.set(f"Version {tag} is available (you have {APP_VERSION}).")
+                    upd_notes_btn.pack(side="left", padx=(6, 0))
+                    upd_banner_var.set(f"New update available: NetUpgrade {tag} (you have {APP_VERSION})")
+                    upd_banner.pack(side="top", fill="x", padx=6, pady=(6, 0), before=nb)
             elif kind == "checked":
-                release = data
+                release = data              # the newest allowed update, or None when up to date
                 update_state["release"] = release
-                asset = pick_installer_asset(release)
+                asset = pick_installer_asset(release) if release else None
                 update_state["asset"] = asset
-                tag = release.get("tag_name") or "unknown version"
-                if not is_newer_release(release, APP_VERSION):
+                if not release:
                     upd_var.set(f"NetUpgrade {APP_VERSION} is up to date.")
-                elif not asset:
+                    continue
+                tag = release.get("tag_name") or "unknown version"
+                if not asset:
                     upd_var.set(f"Version {tag} is available, but its verified Windows installer is missing.")
                     upd_notes_btn.pack(side="left", padx=(6, 0))
                 else:
@@ -1297,6 +1335,23 @@ def update_poll():
         pass
     if update_state["busy"]:
         root.after(150, update_poll)
+
+
+def update_install_prompt():
+    """'Update now' on the start-up banner: confirm, then download, verify and install."""
+    asset, release = update_state.get("asset"), update_state.get("release")
+    if update_state["busy"] or not asset or not release:
+        return
+    if active_upgrade_job():
+        messagebox.showwarning(APP_NAME, "An upgrade is still running. Wait for all switch upgrades "
+                                         "to finish before updating NetUpgrade.")
+        return
+    tag = release.get("tag_name") or "The new version"
+    if messagebox.askyesno(APP_NAME, f"NetUpgrade {tag} is available.\n\n"
+            "Download, verify, and install it now? The application will close and restart."):
+        upd_banner.pack_forget()
+        nb.select(about)
+        update_start_download(asset)
 
 
 upd_check_btn.config(command=update_check)
@@ -1319,4 +1374,5 @@ root.protocol("WM_DELETE_WINDOW", quit_app)
 make_tray()
 root.after(2000, tick)
 root.after(400, startup_admin)          # first start: ask for the admin account
+root.after(3000, lambda: update_check(silent=True))   # show "New update available" when there is one
 root.mainloop()

@@ -2,27 +2,30 @@
 
 NetUpgrade is a Windows desktop application for upgrading Cisco switches in parallel. The desktop launcher runs in the Windows notification area and opens a local web dashboard.
 
-The current application version is **2.0.0-beta.1 (beta)**. Upgrade workflows are designed for Cisco Catalyst 9200/9300 switches and IOS-XE INSTALL mode.
+![NetUpgrade dashboard](docs/images/netupgrade-dashboard.png)
+
+The current application version is **2.0.0**. Upgrade workflows are designed for Cisco Catalyst 9200/9300 switches and IOS-XE INSTALL mode.
 
 ## Features
 
 - Monitor switch availability using ICMP or a TCP connection.
-- Organize devices into site profiles and import inventories from Excel workbooks.
+- Organize devices into site profiles, export and import site data without credentials, and import inventories from Excel workbooks.
 - Test and manage device credentials.
-- Back up running configuration, version, boot, inventory, and optional additional commands. Each upgrade also saves its pre-check and post-check results in an upgrade record.
+- Manage saved storage files, download selected files or folders as a ZIP, and back up running configuration, version, boot, inventory, and optional additional commands. Each upgrade also saves its pre-check and post-check results in an upgrade record.
 - Compare the pre-check and post-check results from an upgrade, or compare two saved records for the same switch.
 - Run readiness checks before upgrading, distribute IOS-XE images, activate upgrades, and verify the version after reload.
 - Check each IOS-XE image against Cisco's MD5 checksum during upload; images with missing or mismatched checksums are rejected.
 - Set the dashboard-wide upgrade limit (1–10 switches at a time). Extra switches wait in a queue, and an Administrator can choose whether a failure stops queued upgrades.
 - Start upgrades now or schedule them for later; view each switch's live progress and console output in the dashboard.
 - Use Diagnosis to run read-only commands, review saved logs, and run separate Pre & Post Checks. Compare switch health before and after a change, including switch clock, software, ports, and stack details. Log analysis handles switch clock offsets and uptime timestamps, reports unsynchronized clocks, and exports its results as Excel or PDF.
-- Include stack member, stack port, stack power, and stack port neighbor details in readiness and pre/post-upgrade checks. Missing members, stack port failures, neighbor changes, and power-stack changes are reported.
+- Include stack member, stack port, stack power, and CDP/LLDP neighbor details in readiness, topology diagrams, and pre/post-upgrade checks. Missing members, stack port failures, neighbor changes, and power-stack changes are reported.
 - Use optional AI command suggestions and custom Excel/PDF reports from configured AI providers. AI is off by default, suggestions are read-only, and the application never runs AI-suggested commands.
+- Save restricted report scripts to rebuild reports from switch command outputs without another AI request.
 - Adjust command timeouts, save named timeout profiles, and run command-time checks on a switch before a rollout. Review device events, backups, and per-device command history.
 - Get optional email alerts for upgrade starts, completion, failures, attention items, post-check results, missed schedules, and sign-ins. Configure SMTP and test delivery in **Settings > Notifications**.
 - Use Administrator, Operator, and Viewer dashboard roles, access controls, and optional HTTPS from the desktop launcher.
 - Run the interactive command-line upgrade flow with `--cli`.
-- Check for releases from **About**. The installed Windows app verifies the installer, asks before installing, then closes and restarts. Updates are blocked while a switch upgrade is running.
+- Check for releases from **About** or a startup update notice. Beta versions can update to newer beta releases. The installed Windows app verifies the installer, asks before installing, then closes and restarts. Updates are blocked while a switch upgrade is running.
 
 ## Requirements
 
