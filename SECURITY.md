@@ -31,6 +31,29 @@ management security boundary.
   an explicit stop decision before expanding a rollout.
 - Do not expose the dashboard directly to the public internet.
 
+## How stored secrets are protected
+
+- Device passwords, enable secrets, the SMTP password, the AI API key and the
+  HTTPS key passphrase are stored only in the vault (`%LOCALAPPDATA%\NetUpgrade\vault.db`).
+  Each is encrypted with AES-256-GCM, using a fresh nonce and its record id as
+  associated data.
+- The vault master key is kept in Windows Credential Manager for the current
+  user on this PC, wrapped again with DPAPI and application entropy. If
+  Credential Manager is unavailable, the DPAPI-wrapped key is stored in
+  `vault.key`. It is never stored in plain text.
+- The application database (`netupgrade.db`) holds only `vault:<id>`
+  references, never secrets. Both files are restricted to the user and SYSTEM,
+  and SQLite `secure_delete` is enabled.
+- Dashboard account passwords are stored as PBKDF2-HMAC-SHA256 hashes
+  (200,000 iterations), not as encrypted values.
+- Anyone who can run code as the same Windows user can ask Windows to decrypt
+  these secrets. Protect that account, lock the workstation, and use full-disk
+  encryption. Back up `netupgrade.db`; `vault.db` is useless without the
+  user's Credential Manager entry, so plan to re-enter passwords after a
+  Windows profile rebuild.
+- Do not delete the Credential Manager entry `NetUpgrade/Vault/MasterKey/v1`.
+  Without it, every stored password must be entered again.
+
 ## Known security limitations
 
 This application has not undergone an independent security assessment. It is a

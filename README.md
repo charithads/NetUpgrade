@@ -4,13 +4,13 @@ NetUpgrade is a Windows desktop application for upgrading Cisco switches in para
 
 ![NetUpgrade dashboard](docs/images/netupgrade-dashboard.png)
 
-The current application version is **2.1.0**. Upgrade workflows are designed for Cisco Catalyst 9200/9300 switches and IOS-XE INSTALL mode.
+The current application version is **2.2.0**. Upgrade workflows are designed for Cisco Catalyst 9200/9300 switches and IOS-XE INSTALL mode.
 
 ## Features
 
 - Monitor switch availability using ICMP or a TCP connection.
 - Organize devices into site profiles, export and import site data without credentials, and import inventories from Excel workbooks.
-- Test and manage device credentials.
+- Test and manage device credentials. Passwords and keys are kept in an encrypted vault (AES-256-GCM) whose key is protected by Windows Credential Manager; application data is kept in a local database.
 - Manage saved storage files, download selected files or folders as a ZIP, and back up running configuration, version, boot, inventory, and optional additional commands. Each upgrade also saves its pre-check and post-check results in an upgrade record.
 - Compare the pre-check and post-check results from an upgrade, or compare two saved records for the same switch.
 - Run readiness checks before upgrading, distribute IOS-XE images, activate upgrades, and verify the version after reload.
@@ -102,7 +102,7 @@ Install PyInstaller and the application dependencies, then build from PowerShell
 
 ```powershell
 py -m pip install -r requirements.txt pyinstaller==6.22.3
-py -m PyInstaller --noconsole --onefile --name NetUpgrade --icon app.ico --add-data "app.ico;." --hidden-import ios_xe_upgrade_manager --collect-all netmiko --collect-all cryptography launcher.py
+py -m PyInstaller --noconsole --onefile --name NetUpgrade --icon app.ico --add-data "app.ico;." --hidden-import ios_xe_upgrade_manager --collect-submodules netupgrade_app --collect-all netmiko --collect-all cryptography launcher.py
 py -m PyInstaller --noconsole --onefile --name NetUpgradeUpdater --hidden-import psutil updater_helper.py
 ```
 
@@ -112,11 +112,21 @@ The Windows installer is compiled from `NetUpgrade.iss` with Inno Setup 6 after 
 
 The desktop launcher supports administrator, operator, and viewer roles, an administrator-managed user list, allowed-client controls, and optional HTTPS. Protect administrator credentials and restrict access to trusted networks. The manager can issue privileged commands that change switch software.
 
-Application settings, audit logs, application logs, and TLS files are stored under:
+Application data, audit logs, application logs, and TLS files are stored under:
 
 ```text
 %LOCALAPPDATA%\NetUpgrade
+  netupgrade.db    application database (SQLite): settings, sites, devices, credential profile names and
+                   usernames, schedules, run history, notifications, dashboard accounts (PBKDF2 hashes)
+  vault.db         encrypted secrets: device passwords and enable secrets, SMTP password, AI API key,
+                   HTTPS key passphrase
+  tls\             HTTPS certificate and its private key (encrypted with the passphrase from the vault)
+  legacy-json-backup\   copies of the JSON files older versions used (secret values redacted)
 ```
+
+Both database files are restricted to the current Windows user and SYSTEM. Every secret in `vault.db` is encrypted with AES-256-GCM and bound to its record. The 256-bit master key is never stored in plain text: it is kept in **Windows Credential Manager** (`NetUpgrade/Vault/MasterKey/v1`, this user on this PC only), wrapped again with DPAPI. Secrets are decrypted only in memory when needed and are never logged or sent to the browser. Logins handed to a background upgrade worker are DPAPI-sealed in a private, short-lived file. Only the same Windows user on the same PC can read the secrets. After moving to another PC or user account, enter the passwords again.
+
+On first start, NetUpgrade imports the JSON files of older versions into the database and the vault. It keeps a backup copy, with secret values redacted, in `legacy-json-backup`, then overwrites and deletes the originals. Backups, reports, run logs, and IOS images remain as files in the storage folder chosen during installation.
 
 The direct manager defaults to loopback. Enabling remote access exposes switch-management capabilities to reachable clients, so configure authentication and network restrictions appropriately when using the launcher.
 

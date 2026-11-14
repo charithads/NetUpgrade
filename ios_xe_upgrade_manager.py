@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v2.1.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v2.2.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -96,20 +96,31 @@ from pathlib import Path
 from pprint import pprint
 from urllib.parse import urlsplit, urlparse, parse_qs, quote, unquote
 
+# Storage layer: application state lives in a SQLite database and every password / key in an encrypted vault
+# (AES-256-GCM, master key in Windows Credential Manager). See netupgrade_app/storage/.
+from netupgrade_app import storage as nu_storage
+from netupgrade_app.storage import repositories as nu_repo
+from netupgrade_app.storage.legacy import is_legacy_secret, unprotect_legacy
+
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.1.0"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "2.2.0"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
+    {"version": "2.2.0", "date": "2026-11-15", "features": [
+        "Store settings, sites, devices, schedules and run history in a local database instead of JSON files; existing data moves over automatically on first start.",
+        "Keep device passwords, enable secrets, the SMTP password and the AI key in an encrypted vault (AES-256-GCM) whose key is protected by Windows Credential Manager.",
+        "Encrypt the HTTPS private key and seal the login handed to background upgrade workers."]},
     {"version": "2.1.0", "date": "2026-11-09", "features": [
         "Preserve the selected storage folder when installing updates silently."]},
     {"version": "2.0.0", "date": "2026-11-09", "features": [
         "Manage saved storage files and download selected files or folders as a ZIP.",
         "Export and import site profiles with their stored data, without exporting credentials.",
-        "Add startup update notices and support updates between beta releases."]},    {"version": "2.0.0-beta.2", "date": "2026-11-07", "features": [
+        "Add startup update notices and support updates between beta releases."]},
+    {"version": "2.0.0-beta.2", "date": "2026-11-07", "features": [
         "Combine CDP and LLDP neighbor data in network topology diagrams.",
         "Add saved report scripts that rebuild reports from device command outputs in a restricted worker.",
         "Add a custom sign-in background image."]},
@@ -4850,7 +4861,14 @@ def job_main(job_path):
     STATUS.update(state='running', phase='starting', message='Starting ...')
     STATUS.start_heartbeat()
     set_console_title('Upgrade {} ({})'.format(device['name'], device['ipaddr']))
-    creds = (job['username'], job['password'], job.get('secret') or None)
+    try:
+        creds = (job['username'], nu_storage.open_from_worker(job['password']),
+                 nu_storage.open_from_worker(job.get('secret')) or None)
+    except OSError as exc:
+        print('Cannot read the credentials handed to this worker: {}'.format(exc))
+        STATUS.update(state='failed', phase='starting', message='Could not read the login handed to the worker.')
+        pause_before_exit()
+        return 2
     del job['password']
     set_host_protocol(job['ip'], 'ssh', job.get('port'))
 
@@ -5089,13 +5107,12 @@ def read_json_file(path):
 _VERSION_STORE_LOCK = threading.Lock()
 
 # --------------------------------------------------------------------------- #
-# Site profiles - everything under one site (device list, backups, reports,
-# version history) lives in its own folder tree, so multiple sites never mix:
+# Site profiles - a site's state (device list, credential profiles, schedules, run history, known
+# versions, notifications, topology) is kept in the database (netupgrade_app/storage), its secrets in the
+# vault. Its FILES (backups, reports, logs) live in its own folder tree, so multiple sites never mix:
 #
 #   Switch Configuration Backups/
 #     <Site A>/
-#       devices.json              <- this site's device list (persists across restarts)
-#       device_versions.json      <- this site's known-version store
 #       Switch Backups/
 #         <Hostname>_<ip-with-underscores>/     <- one PERMANENT folder per device
 #           config_backup_<timestamp>.txt       <- every backup run adds ONE new timestamped file
@@ -5273,6 +5290,7 @@ def settings_defaults():
 
 
 def settings_path():
+    """Where versions before the database kept the settings (read once by the storage migration)."""
     return this_program_path().parent / SETTINGS_FILENAME
 
 
@@ -5309,14 +5327,11 @@ def clean_settings(data, strict=False):
 
 
 def load_global_settings():
-    return clean_settings(read_json_file(settings_path()))
+    return clean_settings(nu_repo.get_setting("app", "settings"))
 
 
 def save_global_settings(values):
-    path = settings_path()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(values, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    nu_repo.set_setting("app", "settings", values)
 
 # --------------------------------------------------------------------------- #
 # Command duration profiles (Settings > Command Outputs). A profile is a named set of the command timeouts above.
@@ -5441,14 +5456,9 @@ def clean_timeout_values(values, strict=False):
     return out
 
 
-def timeout_profiles_path():
-    return this_program_path().parent / TIMEOUT_PROFILES_FILENAME
-
-
 def load_timeout_profiles():
     """{"profiles": {name: record}, "last_applied": name}. The built-in Default is not stored here."""
-    data = read_json_file(timeout_profiles_path())
-    data = data if isinstance(data, dict) else {}
+    data = nu_repo.load_timeout_profiles()
     raw = data.get("profiles") if isinstance(data.get("profiles"), dict) else {}
     profiles = {}
     for name, rec in raw.items():
@@ -5465,11 +5475,7 @@ def load_timeout_profiles():
 
 
 def save_timeout_profiles(store):
-    path = timeout_profiles_path()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"profiles": store["profiles"], "last_applied": store.get("last_applied", "")}, indent=2),
-                   encoding="utf-8")
-    tmp.replace(path)
+    nu_repo.save_timeout_profiles({"profiles": store["profiles"], "last_applied": store.get("last_applied", "")})
 
 
 def image_checksum_kind(image_path):
@@ -5532,10 +5538,6 @@ def site_dir(name):
     return sites_root() / safe_site_name(name)
 
 
-def site_devices_path(name):
-    return site_dir(name) / "devices.json"
-
-
 def site_backups_dir(name):
     return site_dir(name) / SITE_BACKUPS_SUBDIR
 
@@ -5556,29 +5558,16 @@ def site_diag_dir(name):
     return site_dir(name) / SITE_DIAG_SUBDIR
 
 
-def site_history_path(name):
-    return site_dir(name) / "upgrade_history.json"
-
-
 HISTORY_MAX = 2000                 # most recent finished runs kept per site
-_HISTORY_LOCK = threading.Lock()
 
 
 def load_history(name):
     """Finished upgrade runs of a site, oldest first (survives restarts; used by the reports)."""
-    data = read_json_file(site_history_path(name))
-    return data if isinstance(data, list) else []
+    return nu_repo.load_history(name)
 
 
 def append_history(name, record):
-    with _HISTORY_LOCK:
-        items = load_history(name)
-        items.append(record)
-        path = site_history_path(name)
-        tmp = str(path) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(items[-HISTORY_MAX:], fh)
-        os.replace(tmp, path)
+    nu_repo.append_history(name, record, HISTORY_MAX)
 
 
 def compute_image_stage(history):
@@ -5616,8 +5605,7 @@ def device_folder_name(label, host):
 
 def load_site_devices(name):
     """This site's saved device list: [{'host', 'label', 'type'}, ...]."""
-    data = read_json_file(site_devices_path(name))
-    return data if isinstance(data, list) else []
+    return nu_repo.load_devices(name)
 
 
 def save_site_devices(name, hosts):
@@ -5625,34 +5613,23 @@ def save_site_devices(name, hosts):
     this site profile is selected. Best-effort: never blocks the action that triggered it."""
     try:
         site_dir(name).mkdir(parents=True, exist_ok=True)
-        tmp = site_devices_path(name).with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(hosts, indent=2), encoding="utf-8")
-        tmp.replace(site_devices_path(name))
-    except OSError as exc:
-        print(f"Could not save the device list for site '{name}': {exc}", flush=True)
-
-
-def version_store_path():
-    """Site-scoped once a site is active (the normal case); falls back to a path next to the
-    program only if somehow called before any site has been selected."""
-    if SITE.name:
-        return site_dir(SITE.name) / "device_versions.json"
-    return this_program_path().parent / "device_versions.json"
+        nu_repo.save_devices(name, hosts)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not save the device list for site '{name}': {type(exc).__name__}: {exc}", flush=True)
 
 
 def load_known_versions():
-    """{ip: {'hostname':..., 'version':..., 'updated_at': 'YYYY-MM-DD HH:MM:SS'}}, persisted to
-    disk so a device's last-known software version survives restarting the program - the whole
+    """{ip: {'hostname':..., 'version':..., 'updated_at': 'YYYY-MM-DD HH:MM:SS'}} of the active site, kept in
+    the database so a device's last-known software version survives restarting the program - the whole
     point being to have something to compare a new upgrade's result against."""
-    data = read_json_file(version_store_path())
-    return data if isinstance(data, dict) else {}
+    return nu_repo.load_known_versions(SITE.name) if SITE.name else {}
 
 
 def save_known_version(ip, hostname, version, model=None, boot=None):
     """Record a device's current software version (plus its platform and boot mode, when known) to
     disk (overwrites any previous entry for that IP; a model/boot that is not passed is kept).
     Best-effort: a failure here never interrupts the backup/upgrade/check that found this version."""
-    if not version:
+    if not version or not SITE.name:
         return
     with _VERSION_STORE_LOCK:
         try:
@@ -5666,12 +5643,9 @@ def save_known_version(ip, hostname, version, model=None, boot=None):
                 entry["model"] = model
             if isinstance(boot, dict) and boot:
                 entry["boot"] = boot
-            data[ip] = entry
-            tmp = version_store_path().with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            tmp.replace(version_store_path())
-        except OSError as exc:
-            print(f"Could not save the known-version store: {exc}", flush=True)
+            nu_repo.save_known_version(SITE.name, ip, entry)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not save the known-version store: {type(exc).__name__}: {exc}", flush=True)
 
 
 def images_dir():
@@ -6248,11 +6222,15 @@ def site_export_zip(name):
         raise ApiError("That site does not exist.", 404)
     base = site_dir(name)
     files, total = [], 0
-    for fn in SITE_EXPORT_FILES:
-        fp = base / fn
-        if fp.is_file() and not fp.is_symlink():
-            files.append((str(fp), fn))
-            total += fp.stat().st_size
+    # The site's data comes from the database, written into the ZIP in the same JSON format as before, so an
+    # export can be imported by this and by older versions. Credential profiles are never included.
+    documents = {"devices.json": nu_repo.load_devices(name), "upgrade_history.json": nu_repo.load_history(name)}
+    for fn, kind in (("upgrade_settings.json", "upgrade_settings"), ("topology.json", "topology")):
+        doc = nu_repo.get_site_doc(name, kind)
+        if doc is not None:
+            documents[fn] = doc
+    documents = {fn: json.dumps(doc, indent=1).encode("utf-8") for fn, doc in documents.items()}
+    total += sum(len(b) for b in documents.values())
     for folder in STORAGE_FOLDERS:
         top = base / folder
         if not top.is_dir() or top.is_symlink():
@@ -6276,6 +6254,8 @@ def site_export_zip(name):
     try:
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(SITE_EXPORT_MANIFEST, json.dumps(manifest, indent=2))
+            for fn, data in documents.items():
+                zf.writestr(fn, data)
             for full, arc in files:
                 try:
                     zf.write(full, arc)
@@ -6367,11 +6347,36 @@ def site_import_zip(zip_path, name_hint=""):
             final = site_dir(name)
             if final.exists():
                 raise ApiError(f"A site called '{name}' already exists - choose another name.", 409)
+            nu_repo.delete_site(name)          # never mix in leftovers of an earlier site with this name
             os.rename(str(scratch), str(final))
         except BaseException:
             shutil.rmtree(str(scratch), ignore_errors=True)
             raise
+    migrate_site_legacy_files(name)           # the imported device list, history, ... go into the database
     return name
+
+
+def migrate_site_legacy_files(name, log=None):
+    """Move a site's JSON files (from an older version, or an imported site export) into the database."""
+    from netupgrade_app.storage import migrate as nu_migrate
+    try:
+        folder = site_dir(name)
+        if nu_migrate.site_has_legacy_files(folder):
+            nu_migrate.migrate_site(name, folder, log=log or (lambda m: print(m, flush=True)))
+    except Exception as exc:  # noqa: BLE001 - the files stay where they are and are tried again next time
+        print(f"Could not move the saved files of site '{name}' into the database: {type(exc).__name__}: {exc}",
+              flush=True)
+
+
+def run_storage_migration():
+    """Startup: import any JSON files older versions left behind, then tidy the vault."""
+    from netupgrade_app.storage import migrate as nu_migrate
+    try:
+        nu_migrate.migrate_everything(this_program_path().parent, sites_root(), list_site_profiles(),
+                                      log=lambda m: print(m, flush=True))
+    except Exception as exc:  # noqa: BLE001
+        print(f"Storage migration did not finish ({type(exc).__name__}: {exc}). The JSON files are kept and the "
+              "migration is tried again at the next start.", flush=True)
 
 
 class KeepAwake(object):
@@ -6475,14 +6480,11 @@ EMAIL_DEFAULTS = {"enabled": False, "host": "smtp.gmail.com", "port": 587, "secu
                   "kinds": [k for k, _label, on in EMAIL_KINDS if on]}
 
 
-def email_settings_path():
-    return this_program_path().parent / EMAIL_SETTINGS_FILENAME
-
-
 def load_email_settings():
-    """The saved e-mail settings, always complete and valid in shape (a damaged file gives the defaults)."""
+    """The saved e-mail settings, always complete and valid in shape (damaged data gives the defaults).
+    password_enc holds a vault reference, never the password."""
     cfg = dict(EMAIL_DEFAULTS)
-    data = read_json_file(email_settings_path())
+    data = nu_repo.get_setting("email", "config")
     if isinstance(data, dict):
         for key in EMAIL_DEFAULTS:
             if key in data:
@@ -6496,10 +6498,7 @@ def load_email_settings():
 
 
 def save_email_settings(cfg):
-    path = email_settings_path()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    nu_repo.set_setting("email", "config", cfg)
 
 
 def parse_recipients(text):
@@ -7155,135 +7154,43 @@ def launch_background_worker(argv, console_log):
 
 # --------------------------------------------------------------------------- #
 # Credential profiles: named username/password/enable-secret sets, saved per site and
-# assigned to devices. Passwords are stored ENCRYPTED, never in plain text:
-#   * Windows: DPAPI - only the Windows user who saved them can read them back.
-#   * Fallback (DPAPI unavailable / other OS): Fernet with a key file in the user's profile.
+# assigned to devices. Passwords are NEVER stored in plain text: protect_secret() puts them in the
+# encrypted vault (AES-256-GCM, master key in Windows Credential Manager - see netupgrade_app/storage/vault.py)
+# and the database only keeps the 'vault:<id>' reference.
 # --------------------------------------------------------------------------- #
 PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$")
 
 
-def _profile_key_path():
-    root = Path(os.environ.get("LOCALAPPDATA") or Path.home())
-    legacy = root / "IOSXEUpgradeManager"
-    base = root / "NetUpgrade"
-    if legacy.is_dir() and not base.exists():
-        try:
-            import shutil
-            shutil.copytree(legacy, base)
-        except OSError:
-            base = legacy  # Preserve access to existing credentials if migration is blocked.
-    base.mkdir(parents=True, exist_ok=True)
-    return base / "profile.key"
-
-
-def _fernet():
-    from cryptography.fernet import Fernet
-    path = _profile_key_path()
-    if not path.is_file():
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(Fernet.generate_key())
-    return Fernet(path.read_bytes().strip())
-
-
-def _dpapi(data, protect):
-    import ctypes
-    from ctypes import wintypes
-
-    class BLOB(ctypes.Structure):
-        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
-
-    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
-    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
-    fn.argtypes = [ctypes.POINTER(BLOB), ctypes.c_void_p, ctypes.POINTER(BLOB), ctypes.c_void_p,
-                   ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(BLOB)]
-    fn.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel32.LocalFree.restype = ctypes.c_void_p
-    buf = ctypes.create_string_buffer(data, len(data))
-    blob_in = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
-    blob_out = BLOB()
-    if not fn(ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
-        raise OSError("DPAPI call failed")
-    try:
-        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
-
-
-def protect_secret(text):
-    """Encrypt a string for storage. '' stays ''."""
-    if not text:
-        return ""
-    import base64
-    raw = text.encode("utf-8")
-    if os.name == "nt":
-        try:
-            blob = _dpapi(raw, True)
-            if _dpapi(blob, False) == raw:                 # prove it round-trips before trusting it
-                return "dpapi:" + base64.b64encode(blob).decode("ascii")
-        except Exception:                                  # noqa: BLE001 - fall back below
-            pass
-    return "fernet:" + _fernet().encrypt(raw).decode("ascii")
+def protect_secret(text, purpose="secret"):
+    """Store a secret in the vault and return its reference. '' stays ''."""
+    return nu_storage.protect(text, purpose) if text else ""
 
 
 def unprotect_secret(blob):
+    """Decrypt a vault reference (or, while migrating, a value saved by an older version)."""
     if not blob:
         return ""
-    import base64
-    kind, _, body = blob.partition(":")
-    if kind == "dpapi":
-        return _dpapi(base64.b64decode(body), False).decode("utf-8")
-    if kind == "fernet":
-        return _fernet().decrypt(body.encode("ascii")).decode("utf-8")
+    if nu_storage.is_ref(blob):
+        return nu_storage.reveal(blob)
+    if is_legacy_secret(blob):
+        return unprotect_legacy(blob)
     raise ValueError("unknown format")
 
 
-def site_schedule_path(name):
-    return site_dir(name) / "schedules.json"
-
-
-def site_upgrade_settings_path(name):
-    return site_dir(name) / "upgrade_settings.json"
-
-
-def site_notes_path(name):
-    return site_dir(name) / "notifications.json"
-
-
-def site_profiles_path(name):
-    return site_dir(name) / "credential_profiles.json"
-
-
 def load_site_profiles(name):
-    """(profiles, assignments) saved for this site: {name: {username, password, secret}} and
-    {host: profile name}. Passwords are still encrypted here."""
-    data = read_json_file(site_profiles_path(name))
-    if not isinstance(data, dict):
-        return {}, {}
-    profiles = {}
-    for pname, rec in (data.get("profiles") or {}).items():
-        if isinstance(rec, dict) and isinstance(rec.get("username"), str) and isinstance(rec.get("password"), str):
-            profiles[str(pname)] = {"username": rec["username"], "password": rec["password"],
-                                    "secret": rec.get("secret") if isinstance(rec.get("secret"), str) else "",
-                                    "protocol": "telnet" if rec.get("protocol") == "telnet" else "ssh"}
-            try:
-                profiles[str(pname)]["port"] = clean_port(rec.get("port"), profiles[str(pname)]["protocol"])
-            except ValueError:
-                profiles[str(pname)]["port"] = default_port(profiles[str(pname)]["protocol"])
-    assign = {h: p for h, p in (data.get("assignments") or {}).items()
-              if isinstance(h, str) and p in profiles}
-    return profiles, assign
+    """(profiles, assignments) saved for this site: {name: {username, password, secret, protocol, port}} and
+    {host: profile name}. password/secret are vault references here, never the passwords."""
+    profiles, assign = nu_repo.load_profiles(name)
+    for rec in profiles.values():
+        try:
+            rec["port"] = clean_port(rec.get("port"), rec["protocol"])
+        except ValueError:
+            rec["port"] = default_port(rec["protocol"])
+    return profiles, {h: p for h, p in assign.items() if p in profiles}
 
 
 def save_site_profiles(name, profiles, assignments):
-    path = site_profiles_path(name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"profiles": profiles, "assignments": assignments}, fh, indent=2)
-    tmp.replace(path)
+    nu_repo.save_profiles(name, profiles, assignments)
 
 
 # --------------------------------------------------------------------------- #
@@ -7894,10 +7801,6 @@ class TerminalSession(object):
 # --------------------------------------------------------------------------- #
 # Diagram tab: CDP topology (what is connected to what)
 # --------------------------------------------------------------------------- #
-def site_topology_path(name):
-    return site_dir(name) / "topology.json"
-
-
 _CDP_SPLIT_RE = re.compile(r"^-{10,}\s*$", re.M)
 _CORE_HINT_RE = re.compile(r"9[456]\d\d|3850|3750|65\d\d|60\d\d|N[3579]K", re.I)
 
@@ -8154,13 +8057,8 @@ DIAG_TASK_NAME_MAX = 80
 DIAG_TASK_DESC_MAX = 300
 
 
-def diag_tasks_path():
-    return this_program_path().parent / DIAG_TASKS_FILENAME
-
-
 def load_diag_tasks():
-    data = read_json_file(diag_tasks_path())
-    items = data.get("tasks") if isinstance(data, dict) else None
+    items = nu_repo.load_diag_tasks()
     out = []
     for t in items if isinstance(items, list) else []:
         if not (isinstance(t, dict) and isinstance(t.get("id"), str) and isinstance(t.get("name"), str)
@@ -8179,10 +8077,7 @@ def load_diag_tasks():
 
 
 def save_diag_tasks(tasks):
-    path = diag_tasks_path()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"tasks": tasks}, indent=1), encoding="utf-8")
-    tmp.replace(path)
+    nu_repo.save_diag_tasks(tasks)
 
 
 DIAG_PLACEHOLDER_RE = re.compile(r"<[A-Za-z][\w .-]*>")
@@ -9163,13 +9058,10 @@ AI_SYSTEM_PROMPT = (
     "then a numbered list ordered by importance.")
 
 
-def ai_settings_path():
-    return this_program_path().parent / AI_SETTINGS_FILENAME
-
-
 def load_ai_settings():
+    """AI settings; api_key_enc holds a vault reference, never the key."""
     cfg = dict(AI_DEFAULTS)
-    data = read_json_file(ai_settings_path())
+    data = nu_repo.get_setting("ai", "config")
     if isinstance(data, dict):
         for key in AI_DEFAULTS:
             if key in data:
@@ -9185,10 +9077,7 @@ def load_ai_settings():
 
 
 def save_ai_settings(cfg):
-    path = ai_settings_path()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    nu_repo.set_setting("ai", "config", cfg)
 
 
 def ai_clean_features(value):
@@ -10021,6 +9910,8 @@ class Manager:
         except ValueError as exc:
             raise ApiError(str(exc))
         exists = site_dir(name).is_dir()
+        if exists:
+            migrate_site_legacy_files(name)           # a site folder copied in from an older version
         if mode == "select" and not exists:
             raise ApiError(f"Site '{name}' does not exist - pick one from the list or create it.", 404)
         if mode == "create" and exists:
@@ -10043,7 +9934,7 @@ class Manager:
             self._save_schedule()                            # the outgoing site's file, still the active one here
 
             site_dir(name).mkdir(parents=True, exist_ok=True)  # so it's listed even with 0 devices
-            SITE.name = name                                 # so version_store_path() follows along
+            SITE.name = name                                 # so the known-version store follows along
             self.site_name = name
             self.backup_dir = site_backups_dir(name)
             self.runs_dir = site_runs_dir(name)
@@ -10084,13 +9975,13 @@ class Manager:
                         save_site_profiles(name, self.profiles, self.assign)
                     except OSError as exc:
                         print(f"Could not clear the credential profile assignments of '{name}': {type(exc).__name__}", flush=True)
-            data = read_json_file(site_notes_path(name))
+            data = nu_repo.get_site_doc(name, "notes", [])
             with self.notes_lock:
                 carried = [n for n in self.notes if n.get("kind") in ("login", "logout")]   # not tied to a site
                 loaded = [n for n in (data if isinstance(data, list) else [])
                           if isinstance(n, dict) and isinstance(n.get("id"), int)]
                 self.notes = sorted(loaded + carried, key=lambda n: n["id"])[-NOTES_MAX:]
-            sched = read_json_file(site_schedule_path(name))     # saved schedules (they hold no passwords)
+            sched = nu_repo.load_schedules(name)                # saved schedules (they hold no passwords)
             self.schedule = {}
             for h, e in (sched.items() if isinstance(sched, dict) else []):
                 if h in self.info and isinstance(e, dict) and isinstance(e.get("run_at"), (int, float)):
@@ -10317,14 +10208,13 @@ class Manager:
             if not password and not old:
                 raise ApiError("Enter the password for this profile.")
             try:
-                new_pw = protect_secret(password) if password else old["password"]
+                new_pw = protect_secret(password, "device-password") if password else old["password"]
                 if secret:
-                    new_secret = protect_secret(secret)
+                    new_secret = protect_secret(secret, "device-enable-secret")
                 else:
                     new_secret = "" if (clear_secret or not old) else old.get("secret", "")
             except Exception as exc:  # noqa: BLE001
-                raise ApiError(f"Could not encrypt the password ({type(exc).__name__}). "
-                               "Make sure the 'cryptography' package is installed.", 500)
+                raise ApiError(f"Could not store the password in the secure vault ({type(exc).__name__}: {exc}).", 500)
             if editing and name != original:
                 del self.profiles[original]
                 for h, p in list(self.assign.items()):
@@ -10572,7 +10462,7 @@ class Manager:
         cfg["password_enc"] = self.email_cfg.get("password_enc", "")
         if password:
             try:
-                cfg["password_enc"] = protect_secret(password)
+                cfg["password_enc"] = protect_secret(password, "smtp-password")
             except (Exception, SystemExit) as exc:  # noqa: BLE001
                 raise ApiError(f"Could not encrypt the password ({type(exc).__name__}).", 500)
         was_on = self.email_cfg.get("enabled")
@@ -10707,6 +10597,10 @@ class Manager:
             shutil.rmtree(target)
         except OSError as exc:
             raise ApiError(f"Could not delete the site ({type(exc).__name__}). A file in it may be open in another program.", 500)
+        try:
+            nu_repo.delete_site(raw)            # its devices, profiles (and their vault secrets), history, ...
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not remove site '{raw}' from the database: {type(exc).__name__}: {exc}", flush=True)
         self._assign_cleared.discard(raw)
         self.events.add("-", "", f"Site '{raw}' deleted by {who or 'local'}", "info")
         return {"message": f"Site '{raw}' deleted.", "sites": list_site_profiles()}
@@ -10794,6 +10688,11 @@ class Manager:
                 os.rename(str(site_dir(old)), str(site_dir(new)))
             except OSError as exc:
                 raise ApiError(f"Could not rename the site ({type(exc).__name__}). A file in it may be open in another program.", 500)
+            try:
+                nu_repo.rename_site(old, new)
+            except Exception as exc:  # noqa: BLE001
+                os.rename(str(site_dir(new)), str(site_dir(old)))      # keep folder and database in step
+                raise ApiError(f"Could not rename the site in the database ({type(exc).__name__}).", 500)
             if active:
                 self.term_close_all()
                 SITE.name = new
@@ -11922,8 +11821,11 @@ class Manager:
             "started_by": started_by or "local", "phase_times": []}
         self._notify(host, "started", f"{verb} started",
                      (f"with {Path(image).name}" if image else "") or "Worker launched")
+        # The job file only lives until the worker has read it, in a private temp folder, and the password and
+        # enable secret inside it are additionally DPAPI-sealed for this Windows user (never plain text on disk).
         payload = {"ip": host, "name": self.label(host) or host, "action": action,
-                   "username": username, "password": password, "secret": secret,
+                   "username": username, "password": nu_storage.seal_for_worker(password),
+                   "secret": nu_storage.seal_for_worker(secret or ""),
                    "status_path": job["status_path"], "log_path": job["log_path"],
                    "timeouts": dict(TIMEOUTS)}
         if record_dir is not None:
@@ -12078,8 +11980,8 @@ class Manager:
                 del self.notes[:-NOTES_MAX]
                 if self.site_name:
                     try:
-                        site_notes_path(self.site_name).write_text(json.dumps(self.notes), encoding="utf-8")
-                    except OSError:
+                        nu_repo.set_site_doc(self.site_name, "notes", self.notes)
+                    except Exception:  # noqa: BLE001
                         pass
         except Exception:  # noqa: BLE001
             pass
@@ -12091,8 +11993,8 @@ class Manager:
             self.notes = []
             if self.site_name:
                 try:
-                    site_notes_path(self.site_name).write_text("[]", encoding="utf-8")
-                except OSError:
+                    nu_repo.set_site_doc(self.site_name, "notes", [])
+                except Exception:  # noqa: BLE001
                     pass
         return {"message": "Notifications cleared."}
 
@@ -12127,8 +12029,8 @@ class Manager:
         if not self.site_name:
             return {}
         try:
-            stamp = os.path.getmtime(site_history_path(self.site_name))
-        except OSError:
+            stamp = nu_repo.history_revision(self.site_name)
+        except Exception:  # noqa: BLE001
             stamp = None
         fresh = FRESH_START
         key = (self.site_name, stamp, fresh)
@@ -12189,7 +12091,7 @@ class Manager:
 
     # ---- Diagram tab: CDP topology ------------------------------------------- #
     def _topology_load(self):
-        data = read_json_file(site_topology_path(self.site_name)) if self.site_name else None
+        data = nu_repo.get_site_doc(self.site_name, "topology") if self.site_name else None
         data = data if isinstance(data, dict) else {}
         devices = data.get("devices") if isinstance(data.get("devices"), dict) else {}
         roots = [r for r in (data.get("roots") or []) if isinstance(r, str)]
@@ -12197,11 +12099,8 @@ class Manager:
 
     def _topology_save(self, store):
         try:
-            site_dir(self.site_name).mkdir(parents=True, exist_ok=True)
-            tmp = site_topology_path(self.site_name).with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(store, indent=1), encoding="utf-8")
-            tmp.replace(site_topology_path(self.site_name))
-        except OSError as exc:
+            nu_repo.set_site_doc(self.site_name, "topology", store)
+        except Exception as exc:  # noqa: BLE001
             print(f"Could not save the topology for site '{self.site_name}': {exc}", flush=True)
 
     def topology_view(self):
@@ -12351,21 +12250,15 @@ class Manager:
                         "ok" if ok else "bad")
 
     # ---- Diagnosis tab: custom read-only commands + log analysis (never part of an upgrade) ------------------- #
-    def _diag_state_path(self):
-        return site_dir(self.site_name) / "diagnosis.json"
-
     def _diag_commands_saved(self):
-        data = read_json_file(self._diag_state_path()) if self.site_name else None
+        data = nu_repo.get_site_doc(self.site_name, "diagnosis") if self.site_name else None
         text = data.get("commands") if isinstance(data, dict) else ""
         return text if isinstance(text, str) else ""
 
     def _diag_commands_save(self, text):
         try:
-            site_dir(self.site_name).mkdir(parents=True, exist_ok=True)
-            tmp = self._diag_state_path().with_suffix(".json.tmp")
-            tmp.write_text(json.dumps({"commands": text[:20000]}, indent=1), encoding="utf-8")
-            tmp.replace(self._diag_state_path())
-        except OSError:
+            nu_repo.set_site_doc(self.site_name, "diagnosis", {"commands": text[:20000]})
+        except Exception:  # noqa: BLE001
             pass                                          # remembering the text is a convenience only
 
     def diag_view(self):
@@ -13071,7 +12964,7 @@ class Manager:
             raise ApiError(" ".join(problems))
         if key:
             try:
-                cfg["api_key_enc"] = protect_secret(key)
+                cfg["api_key_enc"] = protect_secret(key, "ai-api-key")
             except (Exception, SystemExit) as exc:  # noqa: BLE001
                 raise ApiError(f"Could not encrypt the API key ({type(exc).__name__}).", 500)
         try:
@@ -13789,11 +13682,9 @@ class Manager:
         if not self.site_name:
             return
         try:
-            tmp = site_schedule_path(self.site_name).with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.schedule), encoding="utf-8")
-            tmp.replace(site_schedule_path(self.site_name))
-        except OSError as exc:
-            print(f"Could not save the scheduled upgrades: {exc}", flush=True)
+            nu_repo.save_schedules(self.site_name, self.schedule)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Could not save the scheduled upgrades: {type(exc).__name__}: {exc}", flush=True)
 
     def _need_awake(self):
         """True while an upgrade is running or a scheduled upgrade is waiting."""
@@ -21764,13 +21655,14 @@ def make_handler(manager, allowed_hosts, any_host):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def make_tls_server(address, handler, certfile, keyfile):
+def make_tls_server(address, handler, certfile, keyfile, key_password=None):
     """HTTPS version of ThreadingHTTPServer. The TLS handshake is done in the
-    request's own thread, so a slow or broken client cannot stall the server."""
+    request's own thread, so a slow or broken client cannot stall the server.
+    key_password: passphrase of an encrypted private key (the launcher keeps it in the vault)."""
     import ssl
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(certfile, keyfile)
+    ctx.load_cert_chain(certfile, keyfile, password=key_password)
 
     class TLSServer(ThreadingHTTPServer):
         def get_request(self):
@@ -22397,6 +22289,7 @@ def gui_main(embedded=False, argv=None, access=None, tls=None):
         sys.exit("The 'ping' command was not found. Install it or use: --mode tcp --port 22")
 
     print(f"{APP_NAME} v{APP_VERSION}  |  Developed by {APP_AUTHOR}  |  {APP_REPO_URL}")
+    run_storage_migration()                              # old JSON files -> database + vault (once)
     events = EventLog()
     monitor = Monitor([], events, args.mode, args.port, args.interval, args.timeout,
                       args.duration, args.fail_threshold)
@@ -22425,10 +22318,12 @@ def gui_main(embedded=False, argv=None, access=None, tls=None):
 
     EMAILER.cfg_provider = manager.email_live_config
     legacy = (access or {}).get("email_legacy")          # e-mail settings the launcher's old Notifications tab saved
-    if isinstance(legacy, dict) and legacy.get("host") and not email_settings_path().exists():
+    if isinstance(legacy, dict) and legacy.get("host") and not nu_repo.has_setting("email", "config"):
         try:
             merged = dict(EMAIL_DEFAULTS)
             merged.update({k: legacy[k] for k in EMAIL_DEFAULTS if k in legacy})
+            if is_legacy_secret(merged.get("password_enc")):             # re-encrypt into the vault
+                merged["password_enc"] = protect_secret(unprotect_legacy(merged["password_enc"]), "smtp-password")
             save_email_settings(merged)
             manager.email_cfg = load_email_settings()
             print("E-mail notification settings moved from the launcher to Settings > Notifications.", flush=True)
@@ -22442,7 +22337,8 @@ def gui_main(embedded=False, argv=None, access=None, tls=None):
         handler = apply_access_control(handler, access)
     try:
         if tls:
-            server = make_tls_server((args.host, args.web_port), handler, tls[0], tls[1])
+            server = make_tls_server((args.host, args.web_port), handler, tls[0], tls[1],
+                                     tls[2] if len(tls) > 2 else None)
         else:
             server = ThreadingHTTPServer((args.host, args.web_port), handler)
     except OSError as exc:

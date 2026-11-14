@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+import storage_sandbox  # noqa: F401  (must come before the app: keeps tests away from real data)
 import ios_xe_upgrade_manager as manager
 
 
