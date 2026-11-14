@@ -118,7 +118,7 @@ CHANGELOG = [
         "Add Cisco pre-upgrade readiness checks (install state, stack consistency, redundancy, modules, file systems, packages.conf and ROMMON) to the Readiness Check and Diagnosis Pre & Post Checks.",
         "Replace the separate ignore options with one 'Ignore readiness check blocks' option; every ignored block is logged.",
         "Add in-app help (? next to the user menu) with a User Guide and a step-by-step Upgrade Process page.",
-        "Check SSH host keys: a switch's key is saved on first login and later logins are refused if it changes.",
+        "Check SSH host keys: a switch's key is saved on first login and later logins are refused if it changes; Administrators can forget a replaced switch's key in its device drawer.",
         "Accept firmware images only from the IOS Images folder, and harden storage paths and download headers."]},
     {"version": "2.1.0", "date": "2026-11-09", "features": [
         "Preserve the selected storage folder when installing updates silently."]},
