@@ -3792,6 +3792,15 @@ def probe_device_readiness(host, device_type, username, password, secret, image_
         health = read_health(conn)
         checks.update(health)
 
+        # Cisco's readiness command reference: install state, redundancy, modules, file systems, packages.conf
+        cisco_out = {"version": show_version or ""}
+        for key, command in CISCO_READINESS_COMMANDS:
+            try:
+                cisco_out[key] = conn.send_command(command, read_timeout=tmo('show_cmd'))
+            except Exception:  # noqa: BLE001 - not available on this platform: reported as a note
+                cisco_out[key] = ""
+        checks["cisco"] = cisco_readiness_findings(cisco_out)
+
         try:                                           # interface / VLAN / trunk / port-channel snapshot
             outputs, snap = read_snapshot(conn)
             checks["snapshot"] = snap
@@ -3829,6 +3838,9 @@ def compute_readiness_verdict(checks):
         warnings.append(f"only {checks['mem_free_pct']}% memory free")
     if checks["stack"] and "not Ready" in checks["stack"]:
         warnings.append(checks["stack"])
+    cisco = checks.get("cisco") or {}
+    problems += cisco.get("problems") or []
+    warnings += cisco.get("warnings") or []
     snap = checks.get("snapshot")
     if snap:
         if snap["err_disabled"]:
@@ -3852,8 +3864,208 @@ def compute_readiness_verdict(checks):
              checks["space_detail"] or None,
              f"CPU {checks['cpu_pct']}%" if checks["cpu_pct"] is not None else None,
              f"{checks['mem_free_pct']}% mem free" if checks["mem_free_pct"] is not None else None,
-             checks["stack"], checks.get("snapshot_text") or None]
+             checks["stack"], (cisco.get("summary") or {}).get("Install state"),
+             checks.get("snapshot_text") or None]
     return "ready", "; ".join(p for p in parts if p) or "Looks ready"
+
+
+#------------------------------------------------------------------------------
+# Cisco "Command reference to validate system readiness" (Upgrade Guide for Catalyst 9000, Pre-upgrade Readiness
+# and Validation): the checks the Readiness Check and the Diagnosis Pre & Post Checks both run, read-only.
+# 'show version', 'show boot', 'show switch' and 'dir flash:' are already read elsewhere; these are the rest.
+CISCO_READINESS_COMMANDS = [
+    ("install", "show install summary"),              # install state: nothing activated-but-uncommitted, no abort timer
+    ("redundancy", "show redundancy"),                # stack / HA redundancy: SSO, standby hot
+    ("module", "show module"),                        # module health
+    ("file_systems", "show file systems"),            # file systems present and writable
+    ("packages_conf", "more flash:packages.conf | include pkg"),   # package pointer (install mode)
+]
+_INSTALL_STATE_LABEL = {"I": "inactive", "U": "activated & uncommitted", "C": "activated & committed",
+                        "D": "deactivated & uncommitted"}
+_MODULE_BAD_RE = re.compile(r"(?i)\b(fail\w*|faulty|err-?disabled|pwr\s*down|power\s*denied|offline|not\s*present|"
+                            r"mismatch|unsupported)\b")
+
+
+def _cmd_error(text):
+    """True when a command printed nothing usable ('% Invalid input', '%Error opening ...', empty)."""
+    return (not (text or "").strip()) or bool(re.search(r"(?im)^\s*%\s*(invalid|ambiguous|incomplete|unrecognized|error)",
+                                                       text or ""))
+
+
+def parse_install_summary(text):
+    """'show install summary' -> {'packages': [(type, state, version)], 'abort_timer': text} or None if not available."""
+    if _cmd_error(text):
+        return None
+    rows = re.findall(r"(?m)^\s*(IMG|SMU|APSP|APDP|PKG|ROMMON|FPGA)\s+([ICUD])\s+(\S+)", text)
+    timer = re.search(r"(?im)^\s*Auto\s+abort\s+timer\s*:\s*(.+?)\s*$", text)
+    return {"packages": rows, "abort_timer": timer.group(1) if timer else ""}
+
+
+def parse_member_versions(show_version_output):
+    """The member table of 'show version' -> [(switch, model, sw version, mode)] (one row per stack member)."""
+    return [(int(m.group(1)), m.group(3), m.group(4), m.group(6).upper()) for m in re.finditer(
+        r"(?m)^\s*\*?\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(INSTALL|BUNDLE)\s*$", show_version_output or "")]
+
+
+def parse_redundancy(text):
+    """'show redundancy' -> {'hardware', 'configured', 'operating', 'peer'} or None if not available."""
+    if _cmd_error(text):
+        return None
+
+    def get(pattern):
+        m = re.search(pattern, text, re.I | re.M)
+        return m.group(1).strip() if m else ""
+    peer = get(r"^\s*Peer\s*\(slot:\s*\S+\)\s*state\s*=\s*(.+?)\s*$")
+    if not peer:
+        section = re.split(r"(?i)Peer Processor Information", text, maxsplit=1)
+        if len(section) == 2:
+            m = re.search(r"(?im)^\s*Current Software state\s*=\s*(.+?)\s*$", section[1])
+            peer = m.group(1).strip() if m else ""
+    return {"hardware": get(r"^\s*Hardware Mode\s*=\s*(.+?)\s*$"),
+            "configured": get(r"^\s*Configured Redundancy Mode\s*=\s*(.+?)\s*$"),
+            "operating": get(r"^\s*Operating Redundancy Mode\s*=\s*(.+?)\s*$"), "peer": peer}
+
+
+def parse_file_systems(text):
+    """'show file systems' -> [{'size', 'free', 'type', 'flags', 'prefixes'}] or None if not available."""
+    if _cmd_error(text):
+        return None
+    out = []
+    for m in re.finditer(r"(?m)^\s*\*?\s*(\d+|-)\s+(\d+|-)\s+(\S+)\s+(\S+)\s+(\S.*?)\s*$", text):
+        out.append({"size": int(m.group(1)) if m.group(1).isdigit() else None,
+                    "free": int(m.group(2)) if m.group(2).isdigit() else None,
+                    "type": m.group(3), "flags": m.group(4), "prefixes": m.group(5).split()})
+    return out
+
+
+def parse_packages_conf(text):
+    """'more flash:packages.conf | include pkg' -> [package file names] ([] when missing / empty)."""
+    if _cmd_error(text):
+        return []
+    return re.findall(r"(\S+\.pkg)\b", text)
+
+
+def cisco_readiness_findings(outputs, include_boot=False):
+    """Pure function. outputs: command outputs keyed 'version', 'boot', 'install', 'redundancy', 'module', 'file_systems',
+    'packages_conf' (missing keys are skipped). Returns {'problems', 'warnings', 'notes', 'summary': {label: text}} for
+    the Cisco pre-upgrade readiness checks; 'problems' are things Cisco says to fix before an upgrade starts."""
+    problems, warnings, notes, summary = [], [], [], {}
+    show_version = outputs.get("version") or ""
+    running = parse_version(show_version) if show_version else None
+    mode = parse_run_mode(show_version) if show_version else None
+
+    # ---- stack members: same software version and mode on every member (Cisco: version consistency)
+    members = parse_member_versions(show_version)
+    if members:
+        versions = sorted({v for _s, _m, v, _md in members})
+        modes = sorted({md for _s, _m, _v, md in members})
+        if len(versions) > 1:
+            problems.append("stack members run different software versions: " +
+                            ", ".join(f"switch {s} {v}" for s, _m, v, _md in members))
+        if len(modes) > 1:
+            problems.append("stack members boot in different modes: " +
+                            ", ".join(f"switch {s} {md}" for s, _m, _v, md in members))
+        summary["Stack software"] = (f"{len(members)} member(s), all {versions[0]} {modes[0]}"
+                                     if len(versions) == 1 and len(modes) == 1 else "mixed - see the problems")
+
+    # ---- ROMMON / bootloader (Cisco: check the target release notes for the ROMMON it needs)
+    rom = re.search(r"(?m)^\s*BOOTLDR:\s*(.+?)\s*$", show_version) or re.search(r"(?m)^\s*ROM:\s*(.+?)\s*$", show_version)
+    if rom:
+        summary["ROMMON"] = rom.group(1)
+        notes.append(f"ROMMON / bootloader: {rom.group(1)} - check the target release notes for the ROMMON version it needs")
+
+    # ---- boot variable and manual boot (the Readiness Check reports these itself)
+    if include_boot and outputs.get("boot") is not None and show_version:
+        bs = boot_state(show_version, outputs.get("boot"))
+        if bs.get("boot_ok") is False:
+            warnings.append(f"boot settings are not right for install mode: {bs['detail']}")
+        if bs.get("mode"):
+            summary["Boot"] = f"{bs['mode']} mode, {bs['detail']}"
+
+    # ---- install state: nothing activated-but-uncommitted, no rollback timer running
+    if "install" in outputs:
+        inst = parse_install_summary(outputs.get("install"))
+        if inst is None:
+            if mode == "INSTALL":
+                notes.append("'show install summary' gave no usable output")
+        else:
+            pend = [(t, s, v) for t, s, v in inst["packages"] if s in ("U", "D")]
+            for t, s, v in pend:
+                problems.append(f"an earlier install is not finished: {t} {v} is {_INSTALL_STATE_LABEL[s]} - "
+                                "run 'install commit' (or 'install abort') before a new upgrade")
+            if inst["abort_timer"] and not re.match(r"(?i)inactive|not\s+running|none", inst["abort_timer"]):
+                problems.append(f"the install auto-abort timer is running ({inst['abort_timer']}) - the switch will roll "
+                                "back unless 'install commit' is run")
+            inactive = [v for t, s, v in inst["packages"] if s == "I"]
+            if inactive:
+                notes.append("inactive image(s) on flash (rollback points): " + ", ".join(inactive))
+            active = [v for t, s, v in inst["packages"] if s == "C" and t == "IMG"]
+            summary["Install state"] = ("committed " + ", ".join(active) if active and not pend else
+                                        "NOT committed" if pend else "no install-mode packages listed")
+
+    # ---- redundancy (stacks / HA): SSO with the standby in STANDBY HOT
+    if "redundancy" in outputs:
+        red = parse_redundancy(outputs.get("redundancy"))
+        if red is None:
+            notes.append("'show redundancy' gave no usable output")
+        elif red["hardware"].lower() == "duplex" or (len(members) > 1):
+            oper = red["operating"] or "unknown"
+            peer = red["peer"] or "unknown"
+            if "sso" not in oper.lower():
+                warnings.append(f"redundancy runs in '{oper}', not SSO")
+            if "standby hot" not in peer.lower():
+                warnings.append(f"the standby is not STANDBY HOT (state: {peer})")
+            summary["Redundancy"] = f"{oper}, standby {peer}"
+        else:
+            summary["Redundancy"] = "standalone (no standby)" if red["hardware"] else "not reported"
+
+    # ---- module health
+    if "module" in outputs:
+        text = outputs.get("module") or ""
+        if _cmd_error(text):
+            notes.append("'show module' gave no usable output")
+        else:
+            bad = [ln.strip() for ln in text.splitlines() if re.match(r"^\s*\*?\s*\d+\s", ln) and _MODULE_BAD_RE.search(ln)]
+            if bad:
+                warnings.append("module(s) not healthy: " + "; ".join(" ".join(b.split()) for b in bad[:5]))
+            summary["Modules"] = "problem(s) - see the warnings" if bad else "no faults reported"
+
+    # ---- file systems: flash present and writable
+    if "file_systems" in outputs:
+        fss = parse_file_systems(outputs.get("file_systems"))
+        if fss is None:
+            notes.append("'show file systems' gave no usable output")
+        else:
+            flash = [f for f in fss if any(re.match(r"(?i)^(boot)?flash(-\d+)?:$", p) for p in f["prefixes"])]
+            if not flash:
+                warnings.append("no flash: file system is listed by 'show file systems'")
+            ro = [f["prefixes"][0] for f in flash if "w" not in f["flags"].lower()]
+            if ro:
+                problems.append("flash is not writable: " + ", ".join(ro))
+            main = next((f for f in flash if f["size"] and f["free"] is not None), None)
+            if main:
+                summary["File systems"] = (f"{len(flash)} flash file system(s) writable; {main['prefixes'][0]} "
+                                           f"{fmt_bytes(main['free'])} free of {fmt_bytes(main['size'])}"
+                                           if not ro else "read-only flash - see the problems")
+
+    # ---- package pointer: packages.conf lists the running release (install mode only)
+    if "packages_conf" in outputs and mode in ("INSTALL", "BUNDLE"):     # MIXED is already reported above
+        pkgs = parse_packages_conf(outputs.get("packages_conf"))
+        if mode == "INSTALL":
+            if not pkgs:
+                problems.append("flash:packages.conf is missing or lists no packages - the switch may not boot after a reload")
+                summary["packages.conf"] = "missing / empty"
+            else:
+                rels = sorted({m.group(1) for p in pkgs for m in [re.search(r"\.(\d+\.\d+\.\d+[a-z]?)\.", p)] if m})
+                if len(rels) > 1:
+                    warnings.append("flash:packages.conf lists packages of more than one release: " + ", ".join(rels))
+                elif rels and running and version_key(rels[0]) and version_key(running) \
+                        and version_key(rels[0]) != version_key(running):
+                    warnings.append(f"flash:packages.conf points to {rels[0]} but {running} is running - an install may be pending")
+                summary["packages.conf"] = f"{len(pkgs)} package(s)" + (f", release {rels[0]}" if len(rels) == 1 else "")
+        else:
+            summary["packages.conf"] = "not used (BUNDLE mode)"
+    return {"problems": problems, "warnings": warnings, "notes": notes, "summary": summary}
 
 
 #------------------------------------------------------------------------------
@@ -9406,7 +9618,8 @@ def ai_call(cfg, api_key, system, user, max_tokens=900):
 
 
 # ---- Diagnosis > Pre & Post Checks: the checks the upgrade takes, run BY HAND on switches (also ones upgraded outside this tool) ----
-MANUAL_CHECK_COMMANDS = ([("clock", "show clock"), ("version", "show version"), ("boot", "show boot"), ("install", "show install summary")]
+MANUAL_CHECK_COMMANDS = ([("clock", "show clock"), ("version", "show version"), ("boot", "show boot")]
+                         + list(CISCO_READINESS_COMMANDS)                # install state, redundancy, modules, file systems, packages.conf
                          + list(SNAPSHOT_COMMANDS)
                          + [("cpu", "show processes cpu"), ("memory", "show processes memory"), ("environment", "show environment all")])
 MANUAL_CHECK_KEYS = {cmd: key for key, cmd in MANUAL_CHECK_COMMANDS}
@@ -9520,11 +9733,21 @@ def analyze_manual_check(outputs, phase, pre_outputs=None, expected_version=""):
             warnings.append(f"stack port(s) down: {_names(down)}")
         if phase == "post":
             notes.append("No pre-check was found for this switch, so nothing could be compared - only the current state was checked.")
+    # Cisco's pre-upgrade readiness checks (install state, stack versions, boot, redundancy, modules, file systems,
+    # packages.conf, ROMMON) - the same rules the Readiness Check uses
+    cisco = cisco_readiness_findings(outputs, include_boot=True)
+    problems += cisco["problems"]
+    warnings += cisco["warnings"]
+    notes += cisco["notes"]
+    pre_cisco = cisco_readiness_findings(pre_outputs, include_boot=True) if pre_outputs else None
     unsupported = [cmd for key, cmd in MANUAL_CHECK_COMMANDS if output_unsupported(outputs.get(key))]
     if unsupported:
         notes.append("No usable output (not available on this platform / version, or no data): " + ", ".join(unsupported))
-    cur = _check_metrics(snap, version, cpu, mem)
+    cisco_rows = ("Stack software", "Install state", "Boot", "Redundancy", "Modules", "File systems", "packages.conf", "ROMMON")
+    cur = _check_metrics(snap, version, cpu, mem) + [(n, cisco["summary"][n], None) for n in cisco_rows if n in cisco["summary"]]
     prev = {n: (shown, num) for n, shown, num in _check_metrics(pre, pre_version, pre_cpu, pre_mem)} if pre else {}
+    if pre and pre_cisco:
+        prev.update({n: (s, None) for n, s in pre_cisco["summary"].items()})
     rows = []
     for name, shown, num in cur:
         if phase == "post" and prev:
@@ -11708,12 +11931,15 @@ class Manager:
                 raise ApiError(f"{h} is already upgrading right now.", 409)
 
     def start_upgrade(self, hosts, image_path, backup_first=True, action="full",
-                      started_by=None, skip_image_check=False, ignore_space=False):
+                      started_by=None, skip_image_check=False, ignore_space=False, ignore_readiness=False):
         """action: 'full' (upload+activate+reload, default) | 'distribute' (upload+add to flash
         only, no reload - stage it ahead of time) | 'activate' (activate an image already
         distributed to flash and reload - no image_path needed).
-        The configuration backup (the defined backup commands) always runs first, whatever the caller passes."""
+        The configuration backup (the defined backup commands) always runs first, whatever the caller passes.
+        ignore_readiness ('Ignore readiness check blocks') also ignores the image check and the flash space check."""
         backup_first = True
+        if ignore_readiness:
+            skip_image_check = ignore_space = True
         self._require_site()
         hosts = self._validate_hosts(hosts)
         if not self.monitor.running:
@@ -11730,6 +11956,7 @@ class Manager:
         with self.lock:
             self._poll_all()
             self._check_upgradable(hosts)
+            self._enforce_readiness(hosts, ignore_readiness, started_by)
             run_hosts, queued_hosts = list(hosts), []
             if action in ("full", "activate"):           # these reload the switch: respect the parallel limit
                 free = max(0, self.max_parallel - self._active_reload_count())
@@ -11835,8 +12062,10 @@ class Manager:
 
     # ---- scheduled upgrade --------------------------------------------------- #
     def schedule_upgrade(self, hosts, image_path, run_at, backup_first=True, action="full",
-                         started_by=None, skip_image_check=False, ignore_space=False):
+                         started_by=None, skip_image_check=False, ignore_space=False, ignore_readiness=False):
         backup_first = True                    # the pre-upgrade backup is mandatory
+        if ignore_readiness:                   # 'Ignore readiness check blocks' covers all three blocks
+            skip_image_check = ignore_space = True
         self._require_site()
         hosts = self._validate_hosts(hosts)
         self._creds_map(hosts)          # every device needs a profile now; read again when the run starts
@@ -11853,6 +12082,7 @@ class Manager:
         with self.lock:
             self._poll_all()
             self._check_upgradable(hosts)
+            self._enforce_readiness(hosts, ignore_readiness, started_by)
             if not backup_first:
                 self._require_platform_known(hosts)
             if image:
@@ -13811,7 +14041,7 @@ class Manager:
 
     def _enforce_image_check(self, hosts, image, skip, user):
         """Refuse (HTTP 409) when the chosen image looks wrong for a selected switch, unless
-        the person ticked 'Ignore image check warnings'. Called with self.lock held."""
+        the person ticked 'Ignore readiness check blocks'. Called with self.lock held."""
         name = Path(image).name
         problems = []
         for h in hosts:
@@ -13822,12 +14052,37 @@ class Manager:
         if not problems:
             return
         if skip:
-            self.events.add("-", "", f"Image check warnings ignored by {user or 'local'}: "
+            self.events.add("-", "", f"Image check ignored by {user or 'local'} (Ignore readiness check blocks): "
                             + "; ".join(problems[:3]) + (" ..." if len(problems) > 3 else ""), "warn")
             return
         shown = "; ".join(problems[:4]) + (f"; and {len(problems) - 4} more" if len(problems) > 4 else "")
-        raise ApiError("Image check: " + shown + ". Fix the selection, or tick 'Ignore image check "
-                       "warnings' to continue anyway.", 409)
+        raise ApiError("Image check: " + shown + ". Fix the selection, or tick 'Ignore readiness check "
+                       "blocks' under Firmware Upgrade to continue anyway.", 409)
+
+    def readiness_blocks(self, host):
+        """The blocking findings of this switch's last Readiness Check (Cisco's pre-upgrade checks: an install not
+        committed, stack members on different versions or modes, read-only flash, packages.conf missing ...), or []."""
+        rd = (self.ops.get(host) or {}).get("readiness") or {}
+        if rd.get("state") != "not_ready":
+            return []
+        return list(((rd.get("checks") or {}).get("cisco") or {}).get("problems") or [])
+
+    def _enforce_readiness(self, hosts, override, user):
+        """Refuse (HTTP 409) to start or schedule an upgrade on a switch whose last Readiness Check found a blocking
+        Cisco pre-upgrade problem, unless the person ticked 'Ignore readiness check blocks'. Called with self.lock held."""
+        blocked = [(h, p) for h in hosts for p in self.readiness_blocks(h)]
+        if not blocked:
+            return
+        lines = [f"{self.label(h) or h} ({h}): {p}" for h, p in blocked]
+        if override:
+            for h in dict.fromkeys(h for h, _p in blocked):
+                self.events.add(h, self.label(h), "Readiness check blocks ignored by "
+                                f"{user or 'local'}: " + "; ".join(p for hh, p in blocked if hh == h)[:300], "warn")
+            return
+        shown = "; ".join(lines[:3]) + (f"; and {len(lines) - 3} more" if len(lines) > 3 else "")
+        raise ApiError("The Readiness Check found a problem Cisco says to fix before upgrading: " + shown +
+                       ". Fix it and run the Readiness Check again, or tick 'Ignore readiness check blocks' under "
+                       "Firmware Upgrade to continue anyway.", 409)
 
     def active_upgrades(self):
         with self.lock:
@@ -13980,6 +14235,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .modal-card { background:var(--pn); border:1px solid var(--bd); border-radius:12px; padding:16px 18px; width:100%;
                 max-width:340px; box-shadow:0 14px 50px rgba(0,0,0,.4); }
   .modal-card h2 { font-size:14px; margin:0 0 6px; }
+  /* Help: user guide + upgrade process */
+  #help-modal .help-card { max-width:960px; width:100%; height:min(86vh, 900px); display:flex; flex-direction:column; padding:0; overflow:hidden; }
+  .help-head { display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--bd); }
+  .help-head h2 { margin:0; font-size:15px; flex:1; }
+  .help-tabs { display:flex; gap:4px; padding:8px 16px 0; border-bottom:1px solid var(--bd); }
+  .help-tabs button { border:0; background:none; color:var(--mu); font:inherit; font-size:13px; font-weight:600; padding:8px 12px;
+                      border-bottom:2px solid transparent; cursor:pointer; }
+  .help-tabs button[aria-selected="true"] { color:var(--ac); border-bottom-color:var(--ac); }
+  .help-body { flex:1; overflow-y:auto; padding:14px 22px 22px; font-size:13px; line-height:1.55; }
+  .help-body h3 { font-size:14px; margin:18px 0 6px; } .help-body h3:first-child { margin-top:4px; }
+  .help-body h4 { font-size:13px; margin:14px 0 4px; }
+  .help-body p, .help-body ul, .help-body ol { margin:4px 0 8px; } .help-body li { margin:2px 0; }
+  .help-body code { font-family:Consolas, "Cascadia Mono", monospace; font-size:12px; background:var(--pn2); border:1px solid var(--bd);
+                    border-radius:4px; padding:0 4px; }
+  .help-body pre { font-family:Consolas, "Cascadia Mono", monospace; font-size:12px; background:var(--pn2); border:1px solid var(--bd);
+                   border-radius:6px; padding:8px 10px; margin:4px 0 8px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .help-body .hstep { border:1px solid var(--bd); border-radius:8px; padding:8px 12px; margin:8px 0; }
+  .help-body .hstep h4 { margin-top:2px; }
+  .help-body .hnote { color:var(--mu); font-size:12px; }
+  .help-body table { border-collapse:collapse; width:100%; margin:6px 0 10px; font-size:12px; }
+  .help-body th, .help-body td { border:1px solid var(--bd); padding:4px 8px; text-align:left; vertical-align:top; }
+  .help-body th { background:var(--pn2); }
+  .help-pane[hidden] { display:none; }
 
   /* ---- buttons and inputs ---- */
   .btn { background:var(--pn2); border:1px solid var(--bd); color:var(--tx); border-radius:6px; padding:6px 12px;
@@ -15455,6 +15733,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <span class="notemenu"><button class="ib" id="btn-bell" title="Notifications" aria-haspopup="true" aria-expanded="false" style="position:relative"><span data-i="bell"></span><span class="nbadge" id="bell-count" hidden>0</span></button><div class="note-pop" id="note-pop" role="dialog" aria-label="Notifications" hidden><div class="nh"><span>Notifications</span><span><button type="button" id="note-sound" title="Alert sound">Sound: On</button> <button type="button" id="note-clear">Clear All</button></span></div><div class="nl" id="note-list"></div></div></span>
   <button class="ib" id="btn-settings" title="Settings" aria-label="Settings"><span data-i="gear"></span></button>
   <button class="ib" id="btn-theme" title="Light / dark mode"></button>
+  <button class="ib" id="btn-help" type="button" title="Help" aria-label="Help - user guide" aria-haspopup="dialog"><span data-i="help"></span></button>
   <span class="usermenu"><button type="button" class="userbtn" id="btn-user" aria-haspopup="true" aria-expanded="false" title="Signed-in user"><span data-i="user"></span><span class="uname" id="uname"></span></button><div class="user-pop" id="user-pop" role="dialog" aria-label="Signed-in user" hidden><div class="uh"><b id="uname2"></b><span id="urole2"></span></div><a id="btn-logout" href="/__guard/logout" target="_top">Sign out</a></div></span>
 </header>
 
@@ -15543,8 +15822,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </select>
         <div class="row"><button class="btn" id="btn-readiness" disabled
               title="Read-only pre-upgrade check">Readiness Check</button></div>
-        <label class="chk"><input type="checkbox" id="skip-image-check"><span>Ignore image check warnings</span><span class="tip w" data-tip="Tick only if you are sure: the image does not match the switch model, or it is older than the running version."></span></label>
-        <label class="chk"><input type="checkbox" id="ignore-space"><span>Ignore flash space check</span><span class="tip w" data-tip="Tick only if you are sure: continues even when free flash is below the image size + 1 GB that Cisco asks for. Free some flash first if you can (delete old .bin / .pkg files). If flash really runs out, the install can fail part-way."></span></label>
+        <label class="chk" id="ignore-ready-wrap"><input type="checkbox" id="ignore-ready"><span>Ignore readiness check blocks</span><span class="tip w" id="ignore-ready-tip" data-tip=""></span></label>
         <label for="sched-time">Schedule for (optional)<span class="tip" id="slot-tip" data-tip="A live web console opens at the bottom of this page for every switch, immediately or at its scheduled time. The switch reloads by itself; the table shows the new version once it is back."></span></label>
         <input type="datetime-local" id="sched-time">
         <div class="row">
@@ -15993,6 +16271,251 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </div>
 </div>
+<div id="help-modal" class="modal" hidden>
+  <div class="modal-card help-card" role="dialog" aria-labelledby="help-title" aria-modal="true">
+    <div class="help-head"><h2 id="help-title">NetUpgrade Help</h2>
+      <button type="button" class="btn sm" id="help-close" title="Close (Esc)">Close</button></div>
+    <div class="help-tabs" role="tablist" aria-label="Help topics">
+      <button type="button" role="tab" id="help-tab-guide" data-help="guide" aria-selected="true">User Guide</button>
+      <button type="button" role="tab" id="help-tab-upgrade" data-help="upgrade" aria-selected="false">Upgrade Process</button>
+    </div>
+    <div class="help-body" id="help-body">
+      <div class="help-pane" id="help-pane-guide" role="tabpanel" aria-labelledby="help-tab-guide">
+        <h3>Getting Started</h3>
+        <ol>
+          <li><b>Sign in.</b> The Windows app creates the administrator account the first time it starts. Other accounts (Administrator, Operator, Viewer) are added on its Security tab. Viewers can only look; only Administrators can delete things or change Settings.</li>
+          <li><b>Choose a site.</b> Use the <b>Site</b> menu at the top left to select a site or <i>Create new site</i>. Every site keeps its own devices, credential profiles, backups, reports and logs.</li>
+          <li><b>Add devices.</b> Home &gt; Device List: add one switch <b>Manually</b> (hostname + IP) or upload a list <b>From List</b> (.xlsx with the columns <code>ip</code> and <code>hostname</code>; use <i>Download Template</i>).</li>
+          <li><b>Add a credential profile</b> and assign it to the switches (see below).</li>
+          <li>Press <b>Start Monitoring</b> (top right). Upgrades only run while monitoring is on; the Devices table then shows each switch as Up or Down.</li>
+        </ol>
+
+        <h3>Home</h3>
+        <h4>Device List</h4>
+        <p>Add switches manually or from an Excel list. Remove them with <i>Delete Selected</i> above the Devices table (backups already taken are kept).</p>
+        <h4>Credential Profiles</h4>
+        <ul>
+          <li>Enter the username, password and optional enable secret, choose SSH or Telnet and the port, then <b>Save Profile</b>. Upgrades need SSH (the image is copied with SCP).</li>
+          <li>Select switches in the Devices table and press <b>Test Credentials</b> to try the login without saving anything.</li>
+          <li>Pick a profile in the list, select switches and press <b>Assign To Selected</b>. The ✕ button removes the assigned profile from the selected switches; the trash button deletes the profile.</li>
+          <li>Passwords are kept in an encrypted vault (AES-256-GCM, key protected by Windows Credential Manager) and are never shown again.</li>
+        </ul>
+        <h4>Configuration Backup</h4>
+        <p>Select switches and press <b>Run Backup</b>. Each backup saves <code>show running-config</code>, <code>show vlan</code>, <code>show version</code>, <code>show boot</code>, <code>show inventory</code> and any additional commands you list, in one file per switch (Storage &gt; Switch Backups).</p>
+        <h4>Firmware Upgrade</h4>
+        <ul>
+          <li><b>Select image to install</b>: images are uploaded in Storage &gt; IOS-XE Images.</li>
+          <li><b>Action</b>: <i>Full upgrade</i> (copy, install, activate, commit and reload in one go), <i>Distribute only</i> (copy and add the image, no reload) or <i>Activate only</i> (activate an image distributed earlier, reload, then commit).</li>
+          <li><b>Readiness Check</b>: a read-only check of version, boot settings, flash space on every stack member, CPU, memory, stack, install state, redundancy, modules, file systems and <code>packages.conf</code> (Cisco's pre-upgrade checks). Results appear in the device's Checks tab.</li>
+          <li><b>Ignore readiness check blocks</b>: the one option that lets an upgrade continue past everything that would stop it - the <i>image check</i> (image does not match the switch model, or is older than the running version), the <i>flash space check</i> (free flash below the image size + 1 GB) and the <i>Readiness Check blocks</i> Cisco says to fix before upgrading (an install not committed, stack members on different versions or modes, read-only flash, missing <code>packages.conf</code>). It applies to the next Start Now / Schedule only, and every ignored block is written to the events. Readiness Check <i>warnings</i> (CPU, memory, stack, ports, boot settings, tight flash) never stop an upgrade.</li>
+          <li><b>Start Now</b> or pick a time and press <b>Schedule</b>. <b>Cancel</b> removes a scheduled upgrade. Settings (gear icon) decide how many switches upgrade at the same time and whether the queue stops when one fails.</li>
+          <li>A live console for each switch opens at the bottom of the page and shows every step and command.</li>
+        </ul>
+        <h4>Reports</h4>
+        <p>Download an Excel or PDF report of the site's upgrades: summary, current status of every switch and the run history.</p>
+        <h4>Devices Table And Device Details</h4>
+        <ul>
+          <li>Filter with <i>All / Up / Down</i>, the search box and the Upgrade, Readiness and Platform menus. <i>Columns</i> chooses which columns are shown. <i>Refresh Version</i> reads the software version of the selected switches.</li>
+          <li>Click a switch to open its details: <i>Overview</i>, <i>Checks</i> (credential test, readiness check, pre- and post-upgrade checks), <i>Backups</i>, <i>Commands</i>, <i>Events</i> and <i>Console</i> (an SSH console that uses the switch's credential profile).</li>
+        </ul>
+
+        <h3>Diagram</h3>
+        <p>Tick switches and press <b>Discover</b> to read their CDP and/or LLDP neighbours and draw the topology. Drag switches to arrange them, <i>Reset Layout</i>, <i>Fit</i>, or <i>Export PNG</i>.</p>
+
+        <h3>Diagnosis</h3>
+        <ul>
+          <li><b>Run Commands</b>: run read-only show commands on the ticked switches and get the outputs and an Excel or PDF report. Commands can be saved as tasks. Optional AI suggestions never run anything by themselves.</li>
+          <li><b>Log Analysis</b>: reads the switch logs and lists findings that matter for an upgrade (optionally with an AI second opinion).</li>
+          <li><b>Pre &amp; Post Checks</b>: take a pre-check before a change and a post-check after it, also for switches upgraded outside NetUpgrade. The post-check compares both and flags anything worse. Both include Cisco's pre-upgrade readiness checks.</li>
+        </ul>
+
+        <h3>Troubleshoot</h3>
+        <p>The <b>Command time test</b> runs each upgrade step on one switch and measures how long it takes, so you can set safe timeouts and save them as a <i>command duration profile</i> (applied under Settings &gt; Command Outputs).</p>
+
+        <h3>Storage</h3>
+        <ul>
+          <li><b>IOS-XE Images</b>: choose the .bin file, paste the 32-character MD5 from Cisco's download page and press <b>Upload And Verify</b>. A file that does not match is rejected. <i>Verify</i> re-checks a saved image; the trash button deletes an image that no upgrade is using.</li>
+          <li><b>Site files</b>: browse the selected site's Switch Backups, Upgrade Records, Diagnosis, Reports and Runs. Click a folder to open it or a file to view it. Tick files or folders and use <b>Download Selected</b> (one ZIP) or <b>Delete Selected</b>. <i>Compare Backups</i> shows the differences between two backups of a switch.</li>
+          <li><b>Sites</b>: the menu next to each site renames, exports (ZIP without credentials) or deletes it; <i>Import Site</i> creates a site from an export.</li>
+        </ul>
+
+        <h3>Top Bar</h3>
+        <ul>
+          <li><b>Bell</b>: notifications (upgrades started, completed, failed, missed schedules). E-mail copies are set up in Settings &gt; Notifications.</li>
+          <li><b>Gear</b>: Settings - upgrade rollout, command timeouts, notifications, AI Analytics and About.</li>
+          <li><b>Sun / moon</b>: light or dark mode. <b>?</b>: this help. <b>User</b>: signed-in account and Sign out.</li>
+        </ul>
+
+        <h3>Where Data Is Kept</h3>
+        <p>Settings, sites, devices, profiles, schedules and history are in a database in <code>%LOCALAPPDATA%\NetUpgrade</code>; passwords and keys are in its encrypted vault and can only be read by the same Windows user on the same PC. Backups, reports, logs and images are files in the storage folder chosen during installation.</p>
+      </div>
+
+      <div class="help-pane" id="help-pane-upgrade" role="tabpanel" aria-labelledby="help-tab-upgrade" hidden>
+        <h3>How A Full Upgrade Runs</h3>
+        <p>NetUpgrade follows Cisco's install-mode upgrade procedure for Catalyst 9200 / 9300 switches. Every command and its output is shown in the switch's live console and saved in Storage &gt; Runs. All commands below are sent by NetUpgrade over SSH; <code>&lt;image&gt;</code> is the selected .bin file and <code>&lt;md5&gt;</code> its Cisco MD5.</p>
+
+        <div class="hstep"><h4>Before You Start: Readiness Check (Recommended)</h4>
+          <p>Read-only; nothing on the switch is changed.</p>
+<pre>show version
+show boot
+show switch
+dir flash:            (and dir flash-2:, flash-3: ... on every stack member)
+show processes cpu
+show processes memory
+show install summary
+show redundancy
+show module
+show file systems
+more flash:packages.conf | include pkg
+show ip interface brief
+show interfaces status
+show vlan brief
+show interfaces trunk
+show etherchannel summary
+show switch stack-ports
+show switch stack-ports summary
+show switch stack-ports detail
+show stack-power</pre>
+          <p class="hnote">Blocks the upgrade (until fixed, or ignored with <i>Ignore readiness check blocks</i> under Firmware Upgrade): an install activated but not committed or an auto-abort timer running, stack members on different versions or modes, read-only flash, <code>packages.conf</code> missing in install mode.</p>
+        </div>
+
+        <div class="hstep"><h4>1. Checks When You Press Start Now</h4>
+          <p>In NetUpgrade, no commands: monitoring must be on, every switch needs an SSH credential profile, the image must match the switch model and Readiness Check blocks must be fixed (both unless <i>Ignore readiness check blocks</i> is ticked), and the Cisco MD5 saved with the image is checked again. Only the set number of switches upgrade at the same time; the rest wait in a queue.</p>
+        </div>
+
+        <div class="hstep"><h4>2. Configuration Backup (Always First)</h4>
+<pre>show running-config
+show vlan
+show version
+show boot
+show inventory
+(+ the additional commands under Configuration Backup)</pre>
+          <p class="hnote">If the backup fails, the upgrade of that switch does not start.</p>
+        </div>
+
+        <div class="hstep"><h4>3. Connect And Identify</h4>
+<pre>show version          (platform, running version, INSTALL or BUNDLE mode)
+show boot             (boot variable, manual boot)</pre>
+          <p class="hnote">If the switch already runs the version in the image name, it is skipped: nothing is copied, installed or reloaded.</p>
+        </div>
+
+        <div class="hstep"><h4>4. Pre-Upgrade Snapshot</h4>
+<pre>show ip interface brief
+show interfaces status
+show vlan brief
+show interfaces trunk
+show etherchannel summary
+show switch
+show switch stack-ports
+show switch stack-ports summary
+show switch stack-ports detail
+show stack-power
+show processes cpu
+show processes memory</pre>
+          <p class="hnote">Saved so the post-check can compare ports, VLANs, trunks, port-channels and the stack after the reload.</p>
+        </div>
+
+        <div class="hstep"><h4>5. Remove Inactive Packages (Free Flash)</h4>
+<pre>install remove inactive
+  [y/n] → y</pre>
+          <p class="hnote">Catalyst 9300 on 16.5.1a / 16.6.1 uses <code>request platform software package clean switch all</code> instead.</p>
+        </div>
+
+        <div class="hstep"><h4>6. Flash Space Check</h4>
+<pre>show switch
+dir flash:
+dir flash-2:  (one per stack member)</pre>
+          <p class="hnote">Needs the image size + 1 GB free (Cisco recommends + 1.5 GB) on the tightest member; otherwise the upgrade stops unless <i>Ignore readiness check blocks</i> was ticked.</p>
+        </div>
+
+        <div class="hstep"><h4>7. Copy The Image (SCP)</h4>
+<pre>show running-config | include ip scp server enable
+configure terminal
+ ip scp server enable          (only if it was not on)
+end
+(SCP copy of &lt;image&gt; to flash:&lt;image&gt;)</pre>
+          <p class="hnote">Skipped when the file is already on flash.</p>
+        </div>
+
+        <div class="hstep"><h4>8. Verify The Image On The Switch</h4>
+<pre>verify /md5 flash:&lt;image&gt; &lt;md5&gt;</pre>
+          <p class="hnote">A mismatch stops the upgrade of that switch.</p>
+        </div>
+
+        <div class="hstep"><h4>9. Boot Variable (Only When It Is Not Already Right)</h4>
+<pre>configure terminal
+ no boot system
+ boot system flash:packages.conf
+ no boot manual
+end
+write memory
+show boot                       (confirms it)</pre>
+          <p class="hnote">A switch in BUNDLE mode is converted to INSTALL mode: <code>install add file flash:&lt;image&gt;</code> runs first (it creates <code>packages.conf</code>), <code>dir flash:packages.conf</code> confirms it, then the boot variable is set and <code>install activate</code> follows.</p>
+        </div>
+
+        <div class="hstep"><h4>10. Install, Activate And Commit</h4>
+<pre>write memory
+install add file flash:&lt;image&gt; activate commit
+  [y/n] → y   (every prompt is answered)</pre>
+          <p class="hnote">The switch reloads. Catalyst 9300 on 16.5.1a / 16.6.1: <code>request platform software package install switch all file flash:&lt;image&gt; auto-copy</code>.</p>
+        </div>
+
+        <div class="hstep"><h4>11. Wait For The Reload</h4>
+          <p>From this PC (no switch commands): ping until the switch stops answering, ping until it answers again (stacks boot slowly), then retry the SSH login until it works.</p>
+<pre>show version          (confirms the new version)</pre>
+          <p class="hnote">The waiting times are set under Settings &gt; Command Outputs &gt; Reload And Recovery.</p>
+        </div>
+
+        <div class="hstep"><h4>12. Commit (Activate Only Runs)</h4>
+<pre>install commit
+show install summary  (nothing may stay "U - Activated &amp; Uncommitted")</pre>
+          <p class="hnote">A Full upgrade already committed in step 10. Without a commit the switch rolls back when its auto-abort timer ends.</p>
+        </div>
+
+        <div class="hstep"><h4>13. Post-Upgrade Check</h4>
+          <p>Waits 90 seconds for ports and port-channels to come up, then:</p>
+<pre>show version
+show processes cpu
+show processes memory
+show switch
+show ip interface brief
+show interfaces status
+show vlan brief
+show interfaces trunk
+show etherchannel summary
+show switch stack-ports
+show switch stack-ports summary
+show switch stack-ports detail
+show stack-power</pre>
+          <p class="hnote">Compared with the pre-upgrade snapshot; retried up to 3 times (60 s apart) while something still differs. The result is shown in the Devices table and the device's Checks tab.</p>
+        </div>
+
+        <div class="hstep"><h4>14. Clean Up</h4>
+<pre>configure terminal
+ no ip scp server enable       (only if step 7 turned it on)
+end
+write memory
+show running-config | include ip scp server enable</pre>
+        </div>
+
+        <h3>Distribute Only And Activate Only</h3>
+        <table>
+          <tr><th>Action</th><th>Steps</th><th>Reload</th></tr>
+          <tr><td>Distribute only</td><td>1-3 and 5-8 (no snapshot), then <code>write memory</code> and <code>install add file flash:&lt;image&gt;</code> (adds the image, no activation)</td><td>No</td></tr>
+          <tr><td>Activate only</td><td>1-4, 9, then <code>install activate</code>, steps 11-14 (including <code>install commit</code>)</td><td>Yes</td></tr>
+        </table>
+
+        <h3>If Something Goes Wrong</h3>
+        <ul>
+          <li>The live console and Storage &gt; Runs show every command and its output.</li>
+          <li>If the install command times out without a reload, check <code>show install summary</code> and <code>show install log</code> on the switch.</li>
+          <li>"Super package already added": run <code>install remove inactive</code> on the switch, then try again.</li>
+          <li>Activated but not committed: run <code>install commit</code> on the switch (or <code>install abort</code> to go back).</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
 <div id="prof-modal" class="modal" hidden>
   <div class="modal-card" role="dialog" aria-labelledby="prof-modal-title">
     <h2 id="prof-modal-title">Create New Profile</h2>
@@ -16062,6 +16585,7 @@ const IC = {
   sun: I('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
   moon: I('<path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/>'),
   menu: I('<path d="M4 6h16M4 12h16M4 18h16"/>'),
+  help: I('<circle cx="12" cy="12" r="9"/><path d="M9.6 9.3a2.5 2.5 0 0 1 4.8.9c0 1.7-2.4 2.1-2.4 3.6"/><path d="M12 17h.01"/>'),
   dn: I('<path d="m6 9 6 6 6-6"/>'),
   up: I('<path d="m6 15 6-6 6 6"/>'),
   cross: I('<path d="M6 6l12 12M18 6 6 18"/>'),
@@ -16723,6 +17247,23 @@ function render(d) {
   drawerSync();
 }
 
+function readinessBlocks(h) {
+  const r = h && h.readiness;
+  return r && r.state === "not_ready" && r.checks && r.checks.cisco ? (r.checks.cisco.problems || []) : [];
+}
+// The one option that lets an upgrade continue past everything that would stop it before or during the run
+const IGNORE_READY_TIP = "Tick only if you are sure. The upgrade then continues even when:\n" +
+  "- the image does not match the switch model, or is older than the running version (image check);\n" +
+  "- free flash is below the image size + 1 GB that Cisco asks for (flash space check) - if flash really runs out, the install can fail part-way;\n" +
+  "- the last Readiness Check found a problem Cisco says to fix before upgrading (an install not committed, stack members on different versions or modes, read-only flash, packages.conf missing).\n\n" +
+  "Readiness check warnings (CPU, memory, stack, ports, boot settings, tight flash) never stop an upgrade.\n" +
+  "Applies to the next Start Now / Schedule only; every ignored block is written to the events.";
+function readinessOverrideNote() {
+  if (!$("ignore-ready").checked) return "";
+  const b = (last ? last.hosts : []).filter(h => selected.has(h.host) && readinessBlocks(h).length).map(h => h.host);
+  return "\n\nReadiness check blocks will be IGNORED (image check, flash space" +
+    (b.length ? ", and the Readiness Check blocks of: " + b.join(", ") : " and Readiness Check blocks") + ").";
+}
 function updateButtons() {
   const n = selected.size;
   const rows = last ? last.hosts.filter(h => selected.has(h.host)) : [];
@@ -16742,6 +17283,13 @@ function updateButtons() {
   $("btn-prof-unassign").title = n === 0 ? "Select devices first"
     : nAssigned === 0 ? "No profile assigned" : "Remove assigned profile (" + nAssigned + ")";
   $("btn-readiness").disabled = n === 0 || anyActive;
+  // 'Ignore readiness check blocks': its tip also lists what the last Readiness Check of the selected switches found
+  const blocked = rows.filter(h => readinessBlocks(h).length);
+  tipSet($("ignore-ready-tip"), (blocked.length
+    ? "Readiness Check blocks on the selected switches:\n" +
+      blocked.slice(0, 5).map(h => h.host + ": " + readinessBlocks(h).join("; ")).join("\n") +
+      (blocked.length > 5 ? "\n... and " + (blocked.length - 5) + " more" : "") + "\n\n"
+    : "") + IGNORE_READY_TIP, "w");
   $("btn-delete-devices").disabled = n === 0 || anyBusy;
   $("btn-delete-devices").title = anyBusy
     ? "Selected devices are busy"
@@ -16997,11 +17545,14 @@ $("btn-upgrade").addEventListener("click", async () => {
     ? "\n\nOnly " + ROLLOUT.max_parallel + " switch(es) run at a time; the other " + (selected.size - ROLLOUT.max_parallel) +
       " wait in a queue" + (ROLLOUT.stop_on_failure ? " and are not started if one fails." : ".") : "";
   if (!confirm("Start the " + ACTION_LABEL[action] + " now on " + selected.size + " switch(es)?\n\n" + list +
-               reloadNote + qNote + stagedWarning(action, image) + (backupFirst ? "\n\nEach switch's configuration will be backed up first." : ""))) return;
+               reloadNote + qNote + stagedWarning(action, image) + readinessOverrideNote() +
+               (backupFirst ? "\n\nEach switch's configuration will be backed up first." : ""))) return;
   try {
-    const skipCheck = $("skip-image-check").checked; $("skip-image-check").checked = false;   // applies to this one action only
-    const ignoreSpace = $("ignore-space").checked; $("ignore-space").checked = false;
-    const r = await post("/api/upgrade", Object.assign({hosts: [...selected], image_path: image || null, backup_first: backupFirst, skip_image_check: skipCheck, ignore_space: ignoreSpace, action}, c));
+    // 'Ignore readiness check blocks' covers the image check, the flash space check and the Readiness Check blocks;
+    // it applies to this one action only
+    const ignoreReady = $("ignore-ready").checked; $("ignore-ready").checked = false;
+    const skipCheck = ignoreReady, ignoreSpace = ignoreReady;
+    const r = await post("/api/upgrade", Object.assign({hosts: [...selected], image_path: image || null, backup_first: backupFirst, skip_image_check: skipCheck, ignore_space: ignoreSpace, ignore_readiness: ignoreReady, action}, c));
     sayIn(4, "ok", r.message); refresh();
   } catch (e) { sayIn(4, "err", e.message); }
 });
@@ -17018,12 +17569,12 @@ $("btn-schedule").addEventListener("click", async () => {
   const backupFirst = true;                 // the configuration backup always runs first - there is no option to skip it
   const list = [...selected].join(", ");
   if (!confirm("Schedule the " + ACTION_LABEL[action] + " for " + new Date(when).toLocaleString() + " on " +
-               selected.size + " switch(es)?\n\n" + list + stagedWarning(action, image) +
+               selected.size + " switch(es)?\n\n" + list + stagedWarning(action, image) + readinessOverrideNote() +
                (backupFirst ? "\n\nEach switch's configuration will be backed up first." : ""))) return;
   try {
-    const skipCheck = $("skip-image-check").checked; $("skip-image-check").checked = false;
-    const ignoreSpace = $("ignore-space").checked; $("ignore-space").checked = false;
-    const r = await post("/api/schedule", Object.assign({hosts: [...selected], image_path: image || null, run_at: runAt, backup_first: backupFirst, skip_image_check: skipCheck, ignore_space: ignoreSpace, action}, c));
+    const ignoreReady = $("ignore-ready").checked; $("ignore-ready").checked = false;
+    const skipCheck = ignoreReady, ignoreSpace = ignoreReady;     // one option covers all three blocks
+    const r = await post("/api/schedule", Object.assign({hosts: [...selected], image_path: image || null, run_at: runAt, backup_first: backupFirst, skip_image_check: skipCheck, ignore_space: ignoreSpace, ignore_readiness: ignoreReady, action}, c));
     sayIn(4, "ok", r.message); refresh();
   } catch (e) { sayIn(4, "err", e.message); }
 });
@@ -17558,6 +18109,23 @@ function applyTheme(mode) {
   try { saved = localStorage.getItem("theme"); } catch (e) {}
   applyTheme(saved);
 })();
+// ---- Help: user guide + detailed upgrade process (? icon next to the user menu) ----
+function helpTab(name) {
+  document.querySelectorAll("#help-modal [data-help]").forEach(b => b.setAttribute("aria-selected", String(b.dataset.help === name)));
+  $("help-pane-guide").hidden = name !== "guide";
+  $("help-pane-upgrade").hidden = name !== "upgrade";
+  $("help-body").scrollTop = 0;
+}
+function helpClose() {
+  if ($("help-modal").hidden) return false;
+  $("help-modal").hidden = true; $("btn-help").focus(); return true;
+}
+$("btn-help").addEventListener("click", () => { $("help-modal").hidden = false; $("help-close").focus(); });
+$("help-close").addEventListener("click", helpClose);
+$("help-modal").addEventListener("click", e => { if (e.target === $("help-modal")) helpClose(); });
+$("help-modal").addEventListener("keydown", e => { if (e.key === "Escape") { e.stopPropagation(); helpClose(); } });
+document.querySelectorAll("#help-modal [data-help]").forEach(b => b.addEventListener("click", () => helpTab(b.dataset.help)));
+
 $("btn-theme").addEventListener("click", () => {
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   const current = document.documentElement.getAttribute("data-theme") || (dark ? "dark" : "light");
@@ -20606,11 +21174,15 @@ function drChecks(h, d) {
 
   const rm = READY_PILL[r.state];
   const boot = ck.boot ? (ck.boot.mode || "?") + (ck.boot.detail ? " \u2014 " + ck.boot.detail : "") : ck.boot_error;
+  const cs = (ck.cisco && ck.cisco.summary) || {};       // Cisco's readiness command reference (install, redundancy, ...)
+  const cNotes = ((ck.cisco && ck.cisco.notes) || []).map(esc).join("<br>");
   out += drSec("Readiness Check", rm ? pill(rm[0], rm[1]) : pill("NOT RUN", "PENDING"),
     drKV([["Result", r.detail], ["Checked at", r.time], ["Version", ck.version], ["Model", ck.model], ["Boot", boot],
           ["Flash space", ck.space_detail], ["CPU", ck.cpu_pct != null ? ck.cpu_pct + "% (1-minute average)" : null],
           ["Memory", ck.mem_free_pct != null ? ck.mem_free_pct + "% free" : null], ["Stack", ck.stack],
-          ["Interfaces / VLANs", ck.snapshot_text]]) || empty);
+          ["Stack software", cs["Stack software"]], ["Install state", cs["Install state"]], ["Redundancy", cs["Redundancy"]],
+          ["Modules", cs["Modules"]], ["File systems", cs["File systems"]], ["packages.conf", cs["packages.conf"]],
+          ["ROMMON", cs["ROMMON"]], ["Interfaces / VLANs", ck.snapshot_text], ["Notes", cNotes, true]]) || empty);
 
   out += drSec("Pre-Upgrade Snapshot", "", d && d.pre_snapshot
     ? drKV([["Taken at", d.pre_snapshot.time], ["Network state", d.pre_snapshot.summary]]) +
@@ -21608,13 +22180,13 @@ def make_handler(manager, allowed_hosts, any_host):
                     result = manager.start_upgrade(body.get("hosts"), body.get("image_path"),
                                                    True, body.get("action") or "full",
                                                    self._who(), bool(body.get("skip_image_check")),
-                                                   bool(body.get("ignore_space")))
+                                                   bool(body.get("ignore_space")), bool(body.get("ignore_readiness")))
                 elif path == "/api/schedule":
                     result = manager.schedule_upgrade(body.get("hosts"), body.get("image_path"), body.get("run_at"),
                                                       True,
                                                       body.get("action") or "full",
                                                       self._who(), bool(body.get("skip_image_check")),
-                                                      bool(body.get("ignore_space")))
+                                                      bool(body.get("ignore_space")), bool(body.get("ignore_readiness")))
                 elif path == "/api/schedule/cancel":
                     result = manager.cancel_schedule(body.get("hosts"))
                 elif path == "/api/settings":
