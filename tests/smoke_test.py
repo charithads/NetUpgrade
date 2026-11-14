@@ -4,10 +4,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+import storage_sandbox  # noqa: E402,F401  (keeps the smoke test away from real data)
 
 
 def const(path, name):
-    m = re.search(rf'^{name}\s*=\s*["\']?([\w.]+)', (ROOT / path).read_text(encoding="utf-8"), re.M)
+    m = re.search(rf'^{name}\s*=\s*["\']?([\w.-]+)', (ROOT / path).read_text(encoding="utf-8"), re.M)
     assert m, f"{name} not found in {path}"
     return m.group(1)
 

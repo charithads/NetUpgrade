@@ -79,13 +79,17 @@ import tkinter.font as tkfont
 from tkinter import ttk, messagebox
 
 from update_service import download_verified_installer, pick_installer_asset, pick_update_release
+from netupgrade_app import storage as nu_storage
+from netupgrade_app.storage import migrate as nu_migrate
+from netupgrade_app.storage import repositories as nu_repo
+from netupgrade_app.storage.winsec import restrict_to_current_user, secure_delete
 
 import psutil
 import pystray
 from PIL import Image, ImageTk
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.1.0"   # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
+APP_VERSION = "2.2.0"   # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
 UI_FONT_SIZE = 8               # window size follows the font: 9 = the old, larger window; 8 = compact
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"
@@ -110,12 +114,12 @@ if os.path.isdir(_LEGACY_DATA_DIR) and not os.path.exists(DATA_DIR):
     except OSError:
         DATA_DIR = _LEGACY_DATA_DIR  # Keep existing settings usable if migration is blocked.
 os.makedirs(DATA_DIR, exist_ok=True)
-SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")      # used by older versions; migrated into the database
 AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
 TLS_DIR = os.path.join(DATA_DIR, "tls")
 CERT_FILE = os.path.join(TLS_DIR, "cert.pem")
-KEY_FILE = os.path.join(TLS_DIR, "key.pem")
-CERT_META = os.path.join(TLS_DIR, "cert.json")
+KEY_FILE = os.path.join(TLS_DIR, "key.pem")                  # encrypted; its passphrase is kept in the vault
+CERT_META = os.path.join(TLS_DIR, "cert.json")              # used by older versions; migrated into the database
 
 # With --noconsole sys.stdout/stderr are None; send prints/tracebacks to a log.
 _log = open(os.path.join(DATA_DIR, "app.log"), "a", buffering=1, encoding="utf-8")
@@ -133,10 +137,16 @@ except Exception:
 
 # --- Settings --------------------------------------------------------------
 def load_settings():
+    """The launcher's settings and dashboard accounts, from the NetUpgrade database
+    (settings.json / cert.json of older versions are imported once, then removed)."""
     try:
-        with open(SETTINGS_FILE, encoding="utf-8") as f:
-            data = json.load(f)
+        nu_migrate.migrate_launcher(SETTINGS_FILE, CERT_META, log=print)
     except Exception:
+        traceback.print_exc()
+    try:
+        data = nu_repo.load_launcher_settings() or {}
+    except Exception:
+        traceback.print_exc()
         data = {}
     # drop the old single-password settings (replaced by user accounts)
     for k in ("require_password", "pw_salt", "pw_hash"):
@@ -152,8 +162,7 @@ def load_settings():
 
 def save_settings():
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(settings, f)
+        nu_repo.save_launcher_settings(settings)
     except Exception:
         traceback.print_exc()
 
@@ -231,26 +240,76 @@ def local_ipv4s():
     return sorted(ips)
 
 
+TLS_PASSPHRASE_KEY = "tls_key_passphrase"        # app_settings('launcher', ...) -> vault reference
+
+
+def _tls_passphrase(create):
+    """The private key's passphrase from the vault (a new random one when create=True), or None."""
+    ref = nu_repo.get_setting("launcher", TLS_PASSPHRASE_KEY, "")
+    if ref:
+        try:
+            return nu_storage.reveal(ref).encode("utf-8")
+        except Exception:
+            traceback.print_exc()                    # vault key lost: a new certificate is made below
+    if not create:
+        return None
+    import secrets
+    phrase = secrets.token_urlsafe(48)
+    nu_repo.set_setting("launcher", TLS_PASSPHRASE_KEY, nu_storage.protect(phrase, "tls-key-passphrase"))
+    return phrase.encode("utf-8")
+
+
+def _write_key_encrypted(key, passphrase):
+    """Write the private key PEM encrypted with the passphrase (AES-256, PKCS#8); the old file is wiped first."""
+    from cryptography.hazmat.primitives import serialization
+    data = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                             serialization.BestAvailableEncryption(passphrase))
+    tmp = KEY_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    if os.path.exists(KEY_FILE):
+        secure_delete(KEY_FILE)
+    os.replace(tmp, KEY_FILE)
+    restrict_to_current_user(KEY_FILE)
+
+
+def _load_key(passphrase):
+    from cryptography.hazmat.primitives import serialization
+    with open(KEY_FILE, "rb") as f:
+        return serialization.load_pem_private_key(f.read(), passphrase)
+
+
 def ensure_certificate():
-    """Return (cert_path, key_path) of a self-signed certificate that covers this
+    """Return (cert_path, key_path, key_passphrase) of a self-signed certificate that covers this
     PC's current IP addresses. A new one is made only when an address is missing,
     the host name changed or it is about to expire (so browsers are not asked
-    to re-accept it all the time). Raises ImportError if 'cryptography' is absent."""
+    to re-accept it all the time). The private key is stored encrypted; its passphrase lives in the
+    NetUpgrade vault. Raises ImportError if 'cryptography' is absent."""
     os.makedirs(TLS_DIR, exist_ok=True)
     ips = local_ipv4s()
     host = socket.gethostname()
     try:
-        with open(CERT_META, encoding="utf-8") as f:
-            meta = json.load(f)
+        meta = nu_repo.get_setting("launcher", "tls_meta", {}) or {}
     except Exception:
         meta = {}
     if (os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE) and set(ips) <= set(meta.get("ips", []))
             and meta.get("host") == host and meta.get("expires", 0) > time.time() + 30 * 86400):
-        return CERT_FILE, KEY_FILE
+        passphrase = _tls_passphrase(create=False)
+        try:
+            if passphrase:
+                _load_key(passphrase)                # still opens with the vault's passphrase
+                return CERT_FILE, KEY_FILE, passphrase
+            key = _load_key(None)                    # an unencrypted key from an older version: encrypt it now
+            passphrase = _tls_passphrase(create=True)
+            _write_key_encrypted(key, passphrase)
+            audit_event("HTTPS private key encrypted (passphrase kept in the NetUpgrade vault)")
+            return CERT_FILE, KEY_FILE, passphrase
+        except Exception:
+            traceback.print_exc()                    # unusable key: make a new certificate below
 
     import datetime
     from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
@@ -274,15 +333,14 @@ def ensure_certificate():
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
             .sign(key, hashes.SHA256()))
-    with open(KEY_FILE, "wb") as f:
-        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
-                                  serialization.NoEncryption()))
+    from cryptography.hazmat.primitives import serialization
+    passphrase = _tls_passphrase(create=True)
+    _write_key_encrypted(key, passphrase)
     with open(CERT_FILE, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
-    with open(CERT_META, "w", encoding="utf-8") as f:
-        json.dump({"ips": ips, "host": host, "expires": time.time() + days * 86400}, f)
+    nu_repo.set_setting("launcher", "tls_meta", {"ips": ips, "host": host, "expires": time.time() + days * 86400})
     audit_event(f"HTTPS certificate created for {', '.join(ips)}")
-    return CERT_FILE, KEY_FILE
+    return CERT_FILE, KEY_FILE, passphrase
 
 
 # --- Network interfaces ----------------------------------------------------
