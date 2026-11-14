@@ -96,6 +96,38 @@ class HostKeyPolicyTests(unittest.TestCase):
             self.assertEqual(manager.known_hosts_path(), self.path)
 
 
+class ForgetHostKeyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = str(Path(self.temp.name) / manager.KNOWN_HOSTS_FILENAME)
+        policy = manager.TrustOnFirstUsePolicy(self.path)
+        self.key = _rsa()
+        for host in ("10.0.0.1", "[10.0.0.1]:2222", "10.0.0.11", "[10.0.0.12]:22"):
+            policy.missing_host_key(paramiko.SSHClient(), host, self.key if host == "10.0.0.1" else _rsa())
+
+    def test_entries_list_the_host_on_every_port_only(self):
+        entries = manager.known_host_entries(self.path, "10.0.0.1")
+        self.assertEqual(sorted(e["host"] for e in entries), ["10.0.0.1", "[10.0.0.1]:2222"])
+        self.assertIn(manager.host_key_fingerprint(self.key), [e["fingerprint"] for e in entries])
+        self.assertEqual(manager.known_host_entries(self.path, "10.0.0.99"), [])
+
+    def test_forget_removes_only_that_host_then_the_next_key_is_trusted(self):
+        self.assertEqual(manager.forget_host_key(self.path, "10.0.0.1"), 2)
+        left = manager.load_known_host_keys(self.path)
+        self.assertIsNone(left.lookup("10.0.0.1"))
+        self.assertIsNotNone(left.lookup("10.0.0.11"))        # a longer address with the same prefix stays
+        self.assertIsNotNone(left.lookup("[10.0.0.12]:22"))
+        manager.TrustOnFirstUsePolicy(self.path).missing_host_key(paramiko.SSHClient(), "10.0.0.1", _rsa())
+        self.assertEqual(manager.forget_host_key(self.path, "10.0.0.1"), 1)
+        self.assertEqual(manager.forget_host_key(self.path, "10.0.0.1"), 0)
+
+    def test_only_administrators_can_forget_a_host_key(self):
+        self.assertTrue(manager.role_allows(manager.ROLE_ADMIN, "POST", "/api/host-key/forget")[0])
+        self.assertFalse(manager.role_allows(manager.ROLE_OPERATOR, "POST", "/api/host-key/forget")[0])
+        self.assertFalse(manager.role_allows(manager.ROLE_VIEWER, "POST", "/api/host-key/forget")[0])
+
+
 class HostKeyConnectionTests(unittest.TestCase):
     """End to end through the real ConnectHandler wrapper (netmiko + paramiko) against a local SSH server."""
 
