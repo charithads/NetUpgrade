@@ -1,4 +1,5 @@
 """Tests for the database, the secret vault and the one-time JSON migration."""
+import base64
 import json
 import sqlite3
 import tempfile
@@ -64,11 +65,15 @@ class VaultTests(StorageTestCase):
         self.assertEqual(storage.reveal(fresh), "fresh")
 
     def test_worker_handoff_is_sealed(self):
-        sealed = storage.seal_for_worker("pw")
+        secret = "Sw1tch-handoff-P@ss-0451"            # long enough never to appear in ciphertext by chance
+        sealed = storage.seal_for_worker(secret)
         if winsec.IS_WINDOWS:
             self.assertTrue(sealed.startswith("dpapi-job:"))
-            self.assertNotIn("pw", sealed[len("dpapi-job:"):])
-        self.assertEqual(storage.open_from_worker(sealed), "pw")
+            blob = base64.b64decode(sealed[len("dpapi-job:"):])
+            self.assertNotIn(secret, sealed)
+            self.assertNotIn(secret.encode("utf-8"), blob)
+            self.assertNotIn(secret.encode("utf-16-le"), blob)
+        self.assertEqual(storage.open_from_worker(sealed), secret)
         self.assertEqual(storage.open_from_worker("legacy-plain"), "legacy-plain")
 
 
