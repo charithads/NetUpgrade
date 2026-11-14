@@ -2976,6 +2976,53 @@ def host_key_error(exc):
     return None
 
 
+def _host_key_line_matches(line, host):
+    """True when a known_hosts line is for `host` on any port ('10.0.0.1' or '[10.0.0.1]:2222')."""
+    fields = line.split()
+    if len(fields) < 3 or line.lstrip().startswith("#"):
+        return False
+    specs = fields[0].split(",")
+    return any(s == host or (s.startswith("[" + host + "]:") and s[len(host) + 3:].isdigit()) for s in specs)
+
+
+def known_host_entries(path, host):
+    """[{'host', 'type', 'fingerprint'}] saved for `host` (any port), for the device drawer."""
+    host = str(host or "")
+    out = []
+    if not host or not path or not os.path.isfile(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not _host_key_line_matches(line, host):
+                    continue
+                entry = paramiko.hostkeys.HostKeyEntry.from_line(line)
+                if entry is not None and entry.key is not None:
+                    out.append({"host": entry.hostnames[0], "type": entry.key.get_name(),
+                                "fingerprint": host_key_fingerprint(entry.key)})
+    except (OSError, paramiko.SSHException, ValueError):
+        pass
+    return out
+
+
+def forget_host_key(path, host):
+    """Remove every saved key of `host` (any port), so its next login is trusted again. Returns how many."""
+    host = str(host or "")
+    if not host or not path or not os.path.isfile(path):
+        return 0
+    with _KNOWN_HOSTS_LOCK:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        keep = [line for line in lines if not _host_key_line_matches(line, host)]
+        removed = len(lines) - len(keep)
+        if removed:
+            tmp = path + "." + secrets.token_hex(6) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.writelines(keep)
+            os.replace(tmp, path)
+    return removed
+
+
 def _netmiko_open(*args, **kwargs):
     """netmiko session whose SSH host key is checked against the site's saved keys (trust on first use)."""
     if str(kwargs.get("device_type") or "").endswith("_telnet"):
@@ -4455,8 +4502,10 @@ def run_postcheck(device, creds, expected_version, pre):
                 session.enable()
             result, outputs, _snap = evaluate_postcheck(session, expected_version, pre)
         except Exception as exc:  # noqa: BLE001
-            result = {'state': 'failed', 'checks': {},
-                      'detail': 'Post-check could not log in or read the switch ({})'.format(type(exc).__name__)}
+            mismatch = host_key_error(exc)
+            result = {'state': 'failed', 'checks': {}, 'host_key_mismatch': mismatch is not None,
+                      'detail': 'Post-check login refused: {}'.format(mismatch) if mismatch else
+                                'Post-check could not log in or read the switch ({})'.format(type(exc).__name__)}
         finally:
             if session is not None:
                 try:
@@ -4464,7 +4513,7 @@ def run_postcheck(device, creds, expected_version, pre):
                 except Exception:
                     pass
         log(device, 'Post-check result: {} - {}'.format(result['state'].upper(), result['detail']))
-        if result['state'] == 'passed' or attempt == POSTCHECK_RETRIES:
+        if result['state'] == 'passed' or attempt == POSTCHECK_RETRIES or result.pop('host_key_mismatch', False):
             break
         log(device, 'Post-check found differences - checking again in {} s ({}/{}) ...'.format(
             POSTCHECK_RETRY_WAIT, attempt + 1, POSTCHECK_RETRIES))
@@ -5003,6 +5052,10 @@ def wait_for_reboot(device, creds, old_version):
                 except Exception as exc:  # noqa: BLE001
                     log(device, 'WARNING: could not read "show boot" after the reload: {}'.format(type(exc).__name__))
             break
+        except SSHHostKeyMismatch as exc:              # another device answered: retrying cannot help
+            msg = 'Switch is back but its SSH host key changed - login refused. {}'.format(exc)
+            log(device, msg)
+            return 'attention', msg, None
         except Exception as exc:                       # SSH/AAA are often not ready right after boot
             last_error = type(exc).__name__
             time.sleep(REBOOT_SSH_RETRY)
@@ -5117,6 +5170,10 @@ def watch_reload_timed(ip, username, password, secret, limits, emit=None, should
                     emit("{}# {}\n{}".format(ip, command, res["extra"][command].rstrip()))
                 except Exception:  # noqa: BLE001
                     pass
+            return res
+        except SSHHostKeyMismatch as exc:              # another device answered: retrying cannot help
+            res["error"] = "SSH login refused: {}".format(exc)
+            emit(res["error"])
             return res
         except Exception as exc:  # noqa: BLE001 - SSH/AAA are often not ready right after boot
             last_error = type(exc).__name__
@@ -7043,7 +7100,8 @@ ROLE_LABELS = {ROLE_ADMIN: "Administrator", ROLE_OPERATOR: "Operator", ROLE_VIEW
 OPERATOR_DENIED_POSTS = ("/api/monitor/stop", "/api/settings", "/api/notifications/email", "/api/ai/settings", "/api/ai/test",
                          "/api/notifications/email/test", "/api/timeout-profiles/save",
                          "/api/timeout-profiles/delete", "/api/timeout-profiles/apply",
-                         "/api/site/delete", "/api/site/rename", "/api/storage/delete", "/api/images/delete")
+                         "/api/site/delete", "/api/site/rename", "/api/storage/delete", "/api/images/delete",
+                         "/api/host-key/forget")
 VIEWER_PAGES = ("/", "/index.html", "/favicon.ico")
 VIEWER_GETS = ("/api/status", "/api/console", "/api/me", "/api/device",
                "/api/upgrade-report.xlsx", "/api/upgrade-report.pdf", "/api/upgrade-report/print")
@@ -13460,6 +13518,23 @@ class Manager:
             raise ApiError("That console session no longer exists - click Connect.", 404)
         return s
 
+    def host_key_forget(self, host, who=None):
+        """Forget the saved SSH host key of one switch (replaced switch / regenerated key): its next login
+        is trusted again and saves the key it offers then."""
+        host = str(host or "")
+        with self.lock:
+            _device_dir, runs_dir = self._device_dirs(host)
+            path = os.path.join(str(runs_dir), KNOWN_HOSTS_FILENAME)
+            self.term_close_host(host)              # an open console must not keep using the old trust
+        try:
+            removed = forget_host_key(path, host)
+        except OSError as exc:
+            raise ApiError(f"Could not update the saved SSH host keys ({type(exc).__name__}).", 500)
+        if not removed:
+            return {"message": f"No SSH host key is saved for {host}."}
+        self.events.add(host, self.label(host), f"SSH host key forgotten by {who or 'local'} - the next login trusts the key it offers", "warn")
+        return {"message": f"Forgot the SSH host key of {host}. The next login saves the key the switch offers then."}
+
     def term_open(self, host, user):
         host = str(host or "")
         self._require_site()
@@ -13599,6 +13674,7 @@ class Manager:
             "checklist": checklist, "missing": missing, "warnings": warnings,
             "backups": {"folder": device_dir.name, "runs": backups}, "check_files": run_files,
             "commands": read_command_log(runs_dir, host), "events": events, "history": history,
+            "host_keys": known_host_entries(os.path.join(str(runs_dir), KNOWN_HOSTS_FILENAME), host),
         }
 
     @staticmethod
@@ -21011,6 +21087,19 @@ function drKV(rows, showEmpty) {
   }
   return out.length ? '<table class="dr-kv">' + out.join("") + "</table>" : "";
 }
+function drHostKeys(h, d) {
+  const keys = d.host_keys || [];
+  if (!keys.length) return "Not saved yet - the next SSH login saves the key the switch offers";
+  return keys.map(k => esc(k.type) + ' <code>' + esc(k.fingerprint) + "</code>").join("<br>") +
+    (ME.role === "administrator" ? ' <button type="button" class="btn sm" data-hostkey="forget" title="Forget this key (replaced switch or regenerated SSH key): the next login trusts the key it offers">Forget key</button>' : "");
+}
+async function drForgetHostKey() {
+  const host = DR.host;
+  if (!host || !confirm("Forget the saved SSH host key of " + host + "?\n\nOnly do this when the switch was replaced or its SSH key was regenerated. " +
+      "The next login trusts whatever key is offered, so make sure you are on the right network.")) return;
+  try { const r = await post("/api/host-key/forget", {host}); say("ok", r.message); drFetch(true); }
+  catch (e) { say("err", e.message); }
+}
 function drSec(title, right, inner) {
   return '<div class="dr-sec"><h5>' + esc(title) + '<span class="sp"></span>' + (right || "") + "</h5>" + inner + "</div>";
 }
@@ -21132,7 +21221,8 @@ function drOverview(h, d) {
     ["Hostname", h.label || f.hostname], ["Management IP", h.host], ["Model", h.platform],
     ["Serial number", f.serial], ["Hardware version", f.hardware_version], ["Software version", h.version],
     ["Boot mode", h.boot && h.boot.mode ? h.boot.mode + (h.boot.detail ? " \u2014 " + h.boot.detail : "") : null],
-    ["Credential profile", h.profile], ["Uptime (at last backup)", f.uptime], ["Last reload reason", f.last_reload],
+    ["Credential profile", h.profile], ["SSH host key", d ? drHostKeys(h, d) : null, true],
+    ["Uptime (at last backup)", f.uptime], ["Last reload reason", f.last_reload],
     ["Running image", f.image_file],
     ["Availability", h.availability != null ? h.availability.toFixed(1) + "% (" + h.successes + " of " + h.checks + " pings)" : null],
     ["Last checked", m.last_checked], ["Last status change", h.last_change]];
@@ -21379,7 +21469,7 @@ $("rows").addEventListener("click", e => {
   openDrawer(a.dataset.detail);
 });
 $("drawer").addEventListener("click", e => {
-  const a = e.target.closest("[data-tab],[data-goto],[data-src],[data-view],[data-console],[data-fold]");
+  const a = e.target.closest("[data-tab],[data-goto],[data-src],[data-view],[data-console],[data-fold],[data-hostkey]");
   if (!a) return;
   if (a.tagName === "A") e.preventDefault();
   if (a.dataset.fold) {
@@ -21391,6 +21481,7 @@ $("drawer").addEventListener("click", e => {
   else if (a.dataset.src !== undefined) { DR.src = a.dataset.src; drRender(); }
   else if (a.dataset.view) drView(a.dataset.view, a.dataset.name);
   else if (a.dataset.console !== undefined) drConsole();
+  else if (a.dataset.hostkey) drForgetHostKey();
 });
 
 // ---- Console tab: an interactive SSH session to the switch. The SSH connection is held by this program
@@ -22169,6 +22260,8 @@ def make_handler(manager, allowed_hosts, any_host):
                     result = manager.unassign_profile(body.get("hosts"))
                 elif path == "/api/term/open":
                     result = manager.term_open(body.get("host"), self._who())
+                elif path == "/api/host-key/forget":
+                    result = manager.host_key_forget(body.get("host"), self._who())
                 elif path == "/api/term/send":
                     result = manager.term_send(body.get("host"), body.get("sid"), body.get("line"), body.get("raw"),
                                                bool(body.get("secret")), self._who())
