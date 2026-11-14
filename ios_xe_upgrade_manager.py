@@ -59,6 +59,7 @@ Security notes
 
 # ---- Standard library ----
 import argparse
+import base64
 import collections
 import difflib
 import functools
@@ -2884,6 +2885,112 @@ def set_host_protocol(host, protocol, port=None):
         HOST_PORT.pop(str(host), None)
 
 
+# --------------------------------------------------------------------------- #
+# SSH host keys: trust on first use, kept per site. The first SSH login to a switch saves the host key it
+# offers in <site>/Runs/ssh_known_hosts (OpenSSH known_hosts format, next to the command logs, so the GUI and
+# every upgrade worker use the same file). Every later login must offer that same key: a different key - or a
+# different key type - is refused (SSHHostKeyMismatch), because it means another device, or someone in the
+# middle, answered on that address. A switch that was replaced or had its SSH key regenerated is trusted again
+# by removing its line from that file (or deleting the file in Storage > Runs to forget every switch of the site).
+# --------------------------------------------------------------------------- #
+KNOWN_HOSTS_FILENAME = "ssh_known_hosts"
+_KNOWN_HOSTS_LOCK = threading.Lock()
+
+
+class SSHHostKeyMismatch(paramiko.SSHException):
+    """The switch offered a different SSH host key from the one saved for it, so the login was refused."""
+
+
+def known_hosts_path():
+    """The active site's saved SSH host keys file (the folder the command log uses), or None."""
+    base = COMMAND_LOG_DIR or (os.path.dirname(LOG_FILE) if LOG_FILE else None)
+    if not base:
+        try:
+            base = common_storage_root()
+        except Exception:  # noqa: BLE001 - no storage: keys are still checked within this process
+            return None
+    return os.path.join(str(base), KNOWN_HOSTS_FILENAME)
+
+
+def host_key_fingerprint(key):
+    """OpenSSH-style SHA256 fingerprint of a paramiko key."""
+    return "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode("ascii").rstrip("=")
+
+
+def host_key_mismatch_message(hostname, expected, offered, path):
+    return (f"SSH host key of {hostname} has changed: saved {expected.get_name()} {host_key_fingerprint(expected)}, "
+            f"the switch now offers {offered.get_name()} {host_key_fingerprint(offered)}. The login was refused - "
+            f"this may be a different device or a man-in-the-middle. If the switch was replaced or its SSH key was "
+            f"regenerated, remove its line from {path or KNOWN_HOSTS_FILENAME} and connect again.")
+
+
+def load_known_host_keys(path):
+    keys = paramiko.HostKeys()
+    if path and os.path.isfile(path):
+        keys.load(path)                    # unreadable -> OSError: fail closed rather than trust anything
+    return keys
+
+
+class TrustOnFirstUsePolicy(paramiko.MissingHostKeyPolicy):
+    """paramiko policy for a key not yet saved for this host: save it (first use), unless the file - re-read now,
+    since another process may have learned it meanwhile - holds a different key for the host."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def missing_host_key(self, client, hostname, key):
+        with _KNOWN_HOSTS_LOCK:
+            known = load_known_host_keys(self.path).lookup(hostname)
+            if known:
+                saved = known.get(key.get_name())
+                if saved is not None and saved.asbytes() == key.asbytes():
+                    client.get_host_keys().add(hostname, key.get_name(), key)
+                    return
+                expected = saved if saved is not None else next(iter(known.values()))
+                raise SSHHostKeyMismatch(host_key_mismatch_message(hostname, expected, key, self.path))
+            if self.path:
+                try:
+                    os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                    with open(self.path, "a", encoding="utf-8") as fh:
+                        fh.write(paramiko.hostkeys.HostKeyEntry([hostname], key).to_line())
+                except OSError:
+                    pass                   # cannot save: the key is trusted for this login only
+        client.get_host_keys().add(hostname, key.get_name(), key)
+
+
+def host_key_error(exc):
+    """The SSHHostKeyMismatch behind an exception (netmiko re-raises paramiko's errors as its own), or None."""
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, SSHHostKeyMismatch):
+            return exc
+        if isinstance(exc, paramiko.BadHostKeyException):
+            return SSHHostKeyMismatch(host_key_mismatch_message(exc.hostname, exc.expected_key, exc.key,
+                                                                known_hosts_path()))
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def _netmiko_open(*args, **kwargs):
+    """netmiko session whose SSH host key is checked against the site's saved keys (trust on first use)."""
+    if str(kwargs.get("device_type") or "").endswith("_telnet"):
+        return _netmiko_connect(*args, **kwargs)
+    path = known_hosts_path()
+    kwargs.update(system_host_keys=False, alt_host_keys=bool(path), alt_key_file=path or "", auto_connect=False)
+    conn = _netmiko_connect(*args, **kwargs)
+    conn.key_policy = TrustOnFirstUsePolicy(path)
+    try:
+        conn._open()
+    except Exception:
+        try:
+            conn.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    return conn
+
+
 def ConnectHandler(*args, **kwargs):  # noqa: N802 - same name on purpose: every call site records its commands
     host = kwargs.get("host") or kwargs.get("ip") or ""
     if HOST_PROTOCOL.get(str(host)) == "telnet":                       # cisco_xe -> cisco_xe_telnet, port 23
@@ -2897,9 +3004,13 @@ def ConnectHandler(*args, **kwargs):  # noqa: N802 - same name on purpose: every
     kwargs["conn_timeout"] = kwargs["auth_timeout"] = kwargs["banner_timeout"] = tmo("ssh_connect")
     started = time.time()
     try:
-        conn = _netmiko_connect(*args, **kwargs)
+        conn = _netmiko_open(*args, **kwargs)
     except Exception as exc:  # noqa: BLE001
-        record_command(host, "(connect and log in)", False, time.time() - started, type(exc).__name__)
+        mismatch = host_key_error(exc)
+        record_command(host, "(connect and log in)", False, time.time() - started,
+                       type(mismatch or exc).__name__)
+        if mismatch is not None:
+            raise mismatch from exc
         raise
     record_command(host, "(connect and log in)", True, time.time() - started)
     return RecordedSession(conn, host)
@@ -5670,6 +5781,40 @@ def safe_upload_filename(name):
     return name
 
 
+def confine_path(base, *parts):
+    """The real path of base/parts (symlinks resolved), guaranteed to be base itself or inside it.
+    Raises ValueError for anything that would end up elsewhere ('..', an absolute part, a symlink out)."""
+    real_base = os.path.realpath(str(base))
+    real = os.path.realpath(os.path.join(real_base, *[str(p) for p in parts]))
+    if real != real_base and not real.startswith(real_base.rstrip("\\/") + os.sep):
+        raise ValueError("path is outside its folder")
+    return Path(real)
+
+
+def header_safe(value):
+    """An HTTP header value with CR, LF and every other control character removed (no response splitting)."""
+    value = re.sub(r"[\x00-\x1f\x7f]", "", str(value))
+    return value.replace("\r", "").replace("\n", "")
+
+
+def content_disposition(filename):
+    """Content-Disposition for a download: an ASCII fallback name plus the exact name, percent-encoded."""
+    filename = header_safe(filename) or "download"
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "download"
+    return header_safe(f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename, safe='')}")
+
+
+def image_store_path(name):
+    """The IOS Images folder's file for a plain .bin filename, or None when `name` is not one."""
+    name = safe_upload_filename(name)
+    if not name.lower().endswith(".bin"):
+        return None
+    try:
+        return confine_path(images_dir(), name)
+    except (ValueError, OSError):
+        return None
+
+
 def read_multipart_file(rfile, content_length, content_type, max_bytes, dest_path_fn=None):
     """Parse a multipart/form-data body containing exactly one file field, streamed rather
     than buffered whole, so a large (hundreds of MB) upload doesn't have to fit in memory.
@@ -5780,7 +5925,10 @@ def storage_root(site):
         raise ApiError("Choose a site.")
     if name not in list_site_profiles():
         raise ApiError("That site does not exist.", 404)
-    return name, site_dir(name)
+    try:
+        return name, confine_path(sites_root(), name)
+    except (ValueError, OSError):
+        raise ApiError("That site does not exist.", 404)
 
 
 def storage_resolve(root, rel):
@@ -5794,9 +5942,7 @@ def storage_resolve(root, rel):
     if parts and parts[0] not in STORAGE_FOLDERS:      # devices.json etc. are not browsable
         raise ApiError("Invalid path.")
     try:
-        real_root = root.resolve()
-        real = root.joinpath(*parts).resolve()
-        real.relative_to(real_root)
+        real = confine_path(root, *parts)
     except (ValueError, OSError):
         raise ApiError("Invalid path.")
     return real, "/".join(parts)
@@ -6042,10 +6188,9 @@ def _storage_record_folder(site, rel):
     parts = rel.split("/") if rel else []
     if len(parts) not in (2, 3) or parts[0] != SITE_UPGRADE_SUBDIR:
         raise ApiError("Open a switch's folder under Upgrade Records to compare its pre-/post-checks.")
-    dev = root.joinpath(*parts[:2]).resolve()
     try:
-        dev.relative_to(root.resolve())
-    except ValueError:
+        dev = confine_path(root, *parts[:2])
+    except (ValueError, OSError):
         raise ApiError("Invalid path.")
     if not dev.is_dir():
         raise ApiError("Folder not found.", 404)
@@ -6064,11 +6209,11 @@ def _record_text(dev, rid):
     if not m:
         raise ApiError("Pick two records to compare.")
     stamp, kind = m.group(1), m.group(2)
-    path = Path(dev) / stamp / f"{kind}_{stamp}.txt"
     try:
+        path = confine_path(dev, stamp, f"{kind}_{stamp}.txt")
         with open(path, "rb") as fh:
             text = fh.read(BACKUP_COMPARE_MAX_FILE).decode("utf-8", "replace")
-    except OSError:
+    except (OSError, ValueError):
         raise ApiError("One of the records was not found.", 404)
     return {"id": f"{stamp}/{kind}", "time": f"{_stamp_to_time(stamp)} \u00b7 {RECORD_KIND_LABELS[kind]}"}, record_sections(text)
 
@@ -7686,8 +7831,11 @@ class TerminalSession(object):
                 if not self._telnet_login(chan, username, password):
                     return
             else:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                client = self.client = paramiko.SSHClient()     # set now so _finish() closes a refused login too
+                keys_path = known_hosts_path()       # same saved host keys as every other login (trust on first use)
+                if keys_path and os.path.isfile(keys_path):
+                    client.load_host_keys(keys_path)
+                client.set_missing_host_key_policy(TrustOnFirstUsePolicy(keys_path))
                 client.connect(self.host, port=self.port, username=username, password=password, look_for_keys=False,
                                allow_agent=False, timeout=15, auth_timeout=20, banner_timeout=20)
                 self.client = client
@@ -7695,6 +7843,10 @@ class TerminalSession(object):
                 chan.settimeout(0.5)
         except paramiko.AuthenticationException:
             self._finish("Login failed: wrong username or password in the credential profile.")
+            return
+        except paramiko.SSHException as exc:
+            mismatch = host_key_error(exc)
+            self._finish(str(mismatch) if mismatch else f"Could not connect: {type(exc).__name__}: {exc}"[:300])
             return
         except Exception as exc:  # noqa: BLE001
             self._finish(f"Could not connect: {type(exc).__name__}: {exc}"[:300])
@@ -10335,15 +10487,17 @@ class Manager:
         if not isinstance(path, str) or not path.strip():
             raise ApiError("Choose an IOS-XE image.")
         raw = path.strip().strip('"').strip("'")
-        # A bare filename (normal case: picked from the dropdown) resolves against the
-        # managed IOS Images folder; a path containing a separator is used as-is, so the
-        # API still accepts a full path from another tool if ever called directly.
-        p = Path(raw)
-        p = (images_dir() / raw) if p.name == raw else Path(os.path.expanduser(raw))
-        if p.suffix.lower() != ".bin":
+        # Only images in the managed IOS Images folder can be used. The dropdown sends a bare filename; a full
+        # path (what a saved schedule holds) is accepted only when it points into that same folder.
+        name = os.path.basename(raw.replace("\\", "/"))
+        if not name.lower().endswith(".bin"):
             raise ApiError("The OS image must be a .bin file.")
-        if not p.is_file():
-            raise ApiError(f"Image not found: {p.name} - upload it first.")
+        if name != raw and os.path.normcase(os.path.realpath(os.path.dirname(raw))) != \
+                os.path.normcase(os.path.realpath(str(images_dir()))):
+            raise ApiError("The OS image must be in the IOS Images folder - upload it in Storage > IOS-XE images.")
+        p = image_store_path(name)
+        if p is None or not p.is_file():
+            raise ApiError(f"Image not found: {name} - upload it first.")
         size = p.stat().st_size
         if size == 0:
             raise ApiError("The image file is empty.")
@@ -10636,8 +10790,8 @@ class Manager:
         """Delete an IOS image (and its checksum files) from the shared IOS Images folder,
         unless an upgrade is running, queued or scheduled with it."""
         name = safe_upload_filename(str(name or ""))
-        image = images_dir() / name
-        if not name.lower().endswith(".bin") or not image.is_file():
+        image = image_store_path(name)
+        if image is None or not image.is_file():
             raise ApiError("That image is not in the IOS Images folder.", 404)
         with self.lock:
             self._poll_all()
@@ -21179,12 +21333,10 @@ def make_handler(manager, allowed_hosts, any_host):
         def _send_stream(self, fobj, size, filename, ctype="application/octet-stream"):
             """Send an open file as a download, in chunks (backups can be large, and a
             folder ZIP is built on disk rather than in memory)."""
-            ascii_name = re.sub(r"[^A-Za-z0-9._-]", "_", filename) or "download"
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(size))
-            self.send_header("Content-Disposition",
-                             f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}")
+            self.send_header("Content-Disposition", content_disposition(filename))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
@@ -21288,15 +21440,15 @@ def make_handler(manager, allowed_hosts, any_host):
                     self._json(200, manager.diag_tasks_view())
                 elif path == "/api/diag/report":
                     data, ctype, fname = manager.diag_report(qv("format"), qv("hosts"))
-                    self._send(200, data, ctype, {"Content-Disposition": f'attachment; filename="{fname}"'})
+                    self._send(200, data, ctype, {"Content-Disposition": content_disposition(fname)})
                 elif path == "/api/diag/check":
                     self._json(200, manager.diag_check_output(qv("host"), qv("phase")))
                 elif path == "/api/diag/checks/report":
                     data, ctype, fname = manager.diag_checks_report(qv("hosts"))
-                    self._send(200, data, ctype, {"Content-Disposition": f'attachment; filename="{fname}"'})
+                    self._send(200, data, ctype, {"Content-Disposition": content_disposition(fname)})
                 elif path == "/api/diag/commands/report":
                     data, ctype, fname = manager.diag_commands_report(qv("hosts"), qv("format") or "xlsx", qv("request"))
-                    self._send(200, data, ctype, {"Content-Disposition": f'attachment; filename="{fname}"'})
+                    self._send(200, data, ctype, {"Content-Disposition": content_disposition(fname)})
                 elif path == "/api/ai/settings":
                     self._json(200, manager.ai_settings_view())
                 elif path == "/api/topology":
@@ -21483,8 +21635,8 @@ def make_handler(manager, allowed_hosts, any_host):
                     result = manager.command_test_poll(body.get("job"), body.get("offset"))
                 elif path == "/api/images/verify":
                     name = safe_upload_filename(str(body.get("name") or ""))
-                    image = images_dir() / name
-                    if not name.lower().endswith(".bin") or not image.is_file():
+                    image = image_store_path(name)
+                    if image is None or not image.is_file():
                         raise ApiError("That image is not in the IOS Images folder.", 404)
                     try:
                         verify_image_checksum_sidecar(image)
@@ -22017,7 +22169,7 @@ setInterval(async function(){
 
     def safe_next(url):
         if url.startswith("/") and not url.startswith("//") and "\\" not in url \
-                and not url.startswith("/__guard"):
+                and not url.startswith("/__guard") and not re.search(r"[\x00-\x1f\x7f]", url):
             return url
         return "/"
 
@@ -22039,7 +22191,7 @@ setInterval(async function(){
 
         def _redirect(self, location, extra=()):
             self.send_response(303)
-            self.send_header("Location", location)
+            self.send_header("Location", header_safe(location))
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
