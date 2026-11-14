@@ -114,7 +114,12 @@ CHANGELOG = [
     {"version": "2.2.0", "date": "2026-11-15", "features": [
         "Store settings, sites, devices, schedules and run history in a local database instead of JSON files; existing data moves over automatically on first start.",
         "Keep device passwords, enable secrets, the SMTP password and the AI key in an encrypted vault (AES-256-GCM) whose key is protected by Windows Credential Manager.",
-        "Encrypt the HTTPS private key and seal the login handed to background upgrade workers."]},
+        "Encrypt the HTTPS private key and seal the login handed to background upgrade workers.",
+        "Add Cisco pre-upgrade readiness checks (install state, stack consistency, redundancy, modules, file systems, packages.conf and ROMMON) to the Readiness Check and Diagnosis Pre & Post Checks.",
+        "Replace the separate ignore options with one 'Ignore readiness check blocks' option; every ignored block is logged.",
+        "Add in-app help (? next to the user menu) with a User Guide and a step-by-step Upgrade Process page.",
+        "Check SSH host keys: a switch's key is saved on first login and later logins are refused if it changes.",
+        "Accept firmware images only from the IOS Images folder, and harden storage paths and download headers."]},
     {"version": "2.1.0", "date": "2026-11-09", "features": [
         "Preserve the selected storage folder when installing updates silently."]},
     {"version": "2.0.0", "date": "2026-11-09", "features": [
