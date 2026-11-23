@@ -99,9 +99,12 @@ Switch#   Role    Mac Address     Priority Version  State
 """
 
 
-def backup_file(folder, commands):
+def backup_file(folder, commands, stamp="20261123_090000"):
     text = manager.command_sections_text("Configuration backup - core-sw", commands)
-    (Path(folder) / f"{manager.BACKUP_FILE_PREFIX}_20261123_090000.txt").write_text(text, encoding="utf-8")
+    (Path(folder) / f"{manager.BACKUP_FILE_PREFIX}_{stamp}.txt").write_text(text, encoding="utf-8")
+
+
+OLD_STAMP = "20200101_000000"           # a backup taken long before any refresh written by these tests
 
 
 class StackMemberTests(unittest.TestCase):
@@ -163,6 +166,65 @@ class StackMemberTests(unittest.TestCase):
         self.assertEqual(len(f["members"]), 1)
         self.assertEqual(f["members"][0]["serial"], "FCW2233L0AA")
         self.assertEqual(f["serial"], "FCW2233L0AA")
+
+
+class RefreshVersionTests(unittest.TestCase):
+    """Refresh Version keeps what it read; the drawer uses it when it is newer than the last backup."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.backups = Path(self.temp.name) / "backups"
+        self.runs = Path(self.temp.name) / "runs"
+        self.backups.mkdir()
+        manager._FACTS_CACHE.clear()
+
+    def save_refresh(self, sections):
+        class Owner(object):
+            def label(self, host):
+                return "core-sw"
+        manager.Manager._save_refresh_facts(Owner(), self.runs, "10.0.0.1", sections)
+        return manager.refresh_facts_path(self.runs, "10.0.0.1")
+
+    def set_age(self, path, seconds_ago):
+        import os
+        import time
+        t = time.time() - seconds_ago
+        os.utime(path, (t, t))
+
+    def test_refresh_newer_than_the_backup_is_shown(self):
+        old = SHOW_VERSION.replace("FCW2233L0BB", "OLDSERIAL01")      # switch 1 was replaced since the backup
+        backup_file(self.backups, [("show version", old), ("show inventory", SHOW_INVENTORY.replace("FCW2233L0BB", "OLDSERIAL01"))],
+                    OLD_STAMP)
+        path = self.save_refresh([("show version", SHOW_VERSION), ("show switch", SHOW_SWITCH), ("show inventory", SHOW_INVENTORY)])
+        f = manager.read_device_facts(self.backups, path)
+        self.assertEqual(f["read_from"]["kind"], "refresh")
+        members = {m["switch"]: m for m in f["members"]}
+        self.assertEqual(members[1]["serial"], "FCW2233L0BB")
+        self.assertEqual(members[1]["role"], "Standby")
+
+    def test_backup_newer_than_the_refresh_is_shown(self):
+        path = self.save_refresh([("show version", SHOW_VERSION.replace("FCW2233L0BB", "OLDSERIAL01"))])
+        self.set_age(path, 30 * 365 * 86400)                      # long before the backup's stamp
+        backup_file(self.backups, [("show version", SHOW_VERSION), ("show inventory", SHOW_INVENTORY)])
+        f = manager.read_device_facts(self.backups, path)
+        self.assertEqual(f["read_from"]["kind"], "backup")
+        self.assertEqual({m["switch"]: m["serial"] for m in f["members"]}[1], "FCW2233L0BB")
+
+    def test_a_command_missing_from_the_refresh_comes_from_the_backup(self):
+        backup_file(self.backups, [("show version", SHOW_VERSION), ("show inventory", SHOW_INVENTORY)], OLD_STAMP)
+        path = self.save_refresh([("show version", SHOW_VERSION)])   # show inventory failed during the refresh
+        f = manager.read_device_facts(self.backups, path)
+        self.assertEqual(f["read_from"]["kind"], "refresh")
+        members = {m["switch"]: m for m in f["members"]}
+        self.assertEqual(members[2]["parts"][0], "Power Supply A: PWR-C1-715WAC (SN DCB2233P2AA)")
+
+    def test_refresh_alone_works_without_any_backup(self):
+        path = self.save_refresh([("show version", SHOW_VERSION), ("show inventory", SHOW_INVENTORY)])
+        f = manager.read_device_facts(self.temp.name + "/no-such-folder", path)
+        self.assertEqual(len(f["members"]), 3)
+        self.assertEqual(f["serial"], "FCW2233L0AA")
+        self.assertEqual(manager.read_device_facts(self.temp.name + "/no-such-folder", None), {})
 
 
 if __name__ == "__main__":
