@@ -34,9 +34,10 @@ class SelectionTests(unittest.TestCase):
 
     def test_defaults_select_every_command_once(self):
         values = manager.clean_settings({})
-        self.assertEqual(len(values["check_commands"]), 22)
-        self.assertEqual(len(set(values["check_commands"])), 22)
+        self.assertEqual(len(values["check_commands"]), 23)
+        self.assertEqual(len(set(values["check_commands"])), 23)
         self.assertIn("show mac address-table dynamic", values["check_commands"])
+        self.assertIn("show authentication sessions", values["check_commands"])
         self.assertEqual(values["backup_commands"],
                          ["show running-config", "show vlan", "show version", "show boot", "show inventory"])
 
@@ -74,7 +75,7 @@ class SelectionTests(unittest.TestCase):
         manager.apply_command_selection(sel(check_commands=["show clock", "show module", "show switch"]))
         self.assertEqual(manager.selected_check_commands(), ["show clock", "show version", "show module", "show switch"])
         manager.apply_command_selection({})
-        self.assertEqual(len(manager.selected_check_commands()), 22)
+        self.assertEqual(len(manager.selected_check_commands()), 23)
 
 
 class NoDuplicateTests(unittest.TestCase):

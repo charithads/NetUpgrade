@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v2.3.2 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v2.3.3 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -104,13 +104,18 @@ from netupgrade_app.storage import repositories as nu_repo
 from netupgrade_app.storage.legacy import is_legacy_secret, unprotect_legacy
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.3.2"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "2.3.3"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
+    {"version": "2.3.3", "date": "2026-11-24", "features": [
+        "Pre & post checks also check 802.1X / MAB authentication (show authentication sessions): the result shows how "
+        "many sessions are authenticated and lists the ports that are not, and warns about any device that was "
+        "authenticated before the upgrade but is not afterwards.",
+        "Sessions whose status carries a flag letter (for example 'Auth D') are counted as authenticated."]},
     {"version": "2.3.2", "date": "2026-11-23", "features": [
         "Pre & post checks also read the MAC addresses learnt on each access port (show mac address-table dynamic) and "
         "warn about any device that is not learnt again, or is learnt on another port, after the upgrade."]},
@@ -4145,6 +4150,7 @@ SNAPSHOT_COMMANDS = [
     ("stack_ports_detail", "show switch stack-ports detail"),     # per stack port counters / errors (not on every platform - then it is skipped)
     ("stack_power", "show stack-power"),               # power-stack status (not on every platform - then it is skipped)
     ("mac_table", "show mac address-table dynamic"),   # MACs learnt per port: the same devices must be back afterwards
+    ("auth_sessions", "show authentication sessions"), # 802.1X / MAB: every device must authenticate again afterwards
 ]
 POSTCHECK_SETTLE = 90         # seconds to let ports/port-channels come up after the reload
 POSTCHECK_RETRIES = 3         # extra tries when something still differs from before the upgrade
@@ -4242,16 +4248,19 @@ def parse_snapshot(outputs):
     stack_power = parse_stack_power(outputs.get("stack_power", ""))
     stack_summary = parse_stack_ports_summary(outputs.get("stack_ports_summary", "")) if len(members) > 1 else {}
     macs = parse_mac_table(outputs.get("mac_table", ""), trunks)
+    auth = parse_auth_sessions(outputs.get("auth_sessions", ""))
     return {"ip_up": sorted(ip_up), "connected": sorted(connected), "err_disabled": sorted(err_disabled),
             "vlans": sorted(vlans, key=int), "trunks": sorted(trunks), "po": po,
             "stack_members": members, "stack_ports": stack_ports, "stack_power": stack_power,
             "stack_ports_summary": stack_summary, "macs": macs or {},
+            "auth": [{k: r[k] for k in ("port", "mac", "method", "status", "ok")} for r in (auth or [])],
             "ok": {"ip_int_brief": ip_rows, "int_status": st_rows > 0,
                    "vlan_brief": bool(vlans),
                    "int_trunk": tr_rows > 0 or "Port" in outputs.get("int_trunk", ""),
                    "etherchannel": "channel-groups" in ec_text or bool(po),
                    "stack_members": bool(members), "stack_ports": bool(stack_ports), "stack_power": bool(stack_power),
-                   "stack_ports_summary": bool(stack_summary), "mac_table": macs is not None}}
+                   "stack_ports_summary": bool(stack_summary), "mac_table": macs is not None,
+                   "auth_sessions": auth is not None}}
 
 
 def summarize_snapshot(snap):
@@ -4273,6 +4282,9 @@ def summarize_snapshot(snap):
     if (snap.get("ok") or {}).get("mac_table"):
         macs = snap.get("macs") or {}
         parts.append(f"{sum(len(v) for v in macs.values())} MAC address(es) learnt on {len(macs)} access port(s)")
+    auth = auth_status_text(snap)
+    if auth:
+        parts.append(auth)
     power = snap.get("stack_power") or {}
     if power:
         parts.append("stack-power: " + ", ".join(f"{n} {v['topology']} ({v['sw']} switch(es), {v['ps']} PSU)"
@@ -4283,6 +4295,51 @@ def summarize_snapshot(snap):
 def _names(items, limit=6):
     items = list(items)
     return ", ".join(items[:limit]) + (f" (+{len(items) - limit} more)" if len(items) > limit else "")
+
+
+def _auth_name(r):
+    return f"{r['port']} {r['mac']} ({r['method']}, {r['status']})"
+
+
+def auth_status_text(snap, limit=10):
+    """'802.1X/MAB: 118 of 120 session(s) authenticated; not authenticated: Gi1/0/5 ... (dot1x, Unauth), ...' or None
+    when the snapshot has no authentication data (command off / not supported)."""
+    if not (snap.get("ok") or {}).get("auth_sessions"):
+        return None
+    rows = snap.get("auth") or []
+    if not rows:
+        return "802.1X/MAB: no authentication sessions"
+    bad = [r for r in rows if not r["ok"]]
+    methods = collections.Counter(r["method"] for r in rows if r["ok"])
+    text = (f"802.1X/MAB: {len(rows) - len(bad)} of {len(rows)} session(s) authenticated"
+            + (" (" + ", ".join(f"{n} {m}" for m, n in sorted(methods.items())) + ")" if methods else ""))
+    if bad:
+        text += "; not authenticated: " + _names((_auth_name(r) for r in sorted(bad, key=lambda r: r["port"])), limit)
+    return text
+
+
+def compare_auth_sessions(pre, post, limit=8):
+    """Devices (by MAC) that were authenticated before the upgrade and are not now, or have no session any more,
+    and sessions that fail now but did not fail before. [] = nothing worse than before."""
+    before_ok = {r["mac"]: r for r in pre or [] if r["ok"]}
+    before_bad = {r["mac"] for r in pre or [] if not r["ok"]}
+    now = {}
+    for r in post or []:                                 # a device with several sessions counts as authenticated if any is
+        if r["mac"] not in now or (r["ok"] and not now[r["mac"]]["ok"]):
+            now[r["mac"]] = r
+    failed = [now[m] for m in sorted(before_ok) if m in now and not now[m]["ok"]]
+    gone = [before_ok[m] for m in sorted(before_ok) if m not in now]
+    new_bad = [r for m, r in sorted(now.items()) if not r["ok"] and m not in before_ok and m not in before_bad]
+    issues = []
+    if failed:
+        issues.append(f"{len(failed)} device(s) authenticated before the upgrade are NOT authenticated now: "
+                      + _names((_auth_name(r) for r in failed), limit))
+    if gone:
+        issues.append(f"{len(gone)} device(s) authenticated before the upgrade have no authentication session now: "
+                      + _names((f"{r['port']} {r['mac']}" for r in gone), limit))
+    if new_bad:
+        issues.append(f"{len(new_bad)} new session(s) not authenticated: " + _names((_auth_name(r) for r in new_bad), limit))
+    return issues
 
 
 def compare_mac_tables(pre_macs, post_macs, limit=8):
@@ -4371,6 +4428,8 @@ def compare_snapshots(pre, post):
                 issues.append(f"{name} has {now['bundled']} bundled member(s), had {was['bundled']}")
     if both("mac_table"):                                # the same devices learnt on the same access ports
         issues += compare_mac_tables(pre.get("macs"), post.get("macs"))
+    if both("auth_sessions"):                            # 802.1X / MAB: every device authenticated again
+        issues += compare_auth_sessions(pre.get("auth"), post.get("auth"))
     return issues
 
 
@@ -4497,6 +4556,10 @@ def evaluate_postcheck(conn, expected_version, pre):
                  stack_note or health["stack"], f"CPU {health['cpu_pct']}%" if health["cpu_pct"] is not None else None,
                  "same as before the upgrade" if pre else "no pre-upgrade snapshot to compare"]
         state, detail = "passed", "; ".join(x for x in parts if x)
+    auth = auth_status_text(snap)
+    checks["auth"] = auth
+    if auth and auth not in detail:                    # a warning lists only the changes: add the full authentication state
+        detail += "; " + auth
     return {"state": state, "detail": detail, "checks": checks}, outputs, snap
 
 
@@ -5761,7 +5824,9 @@ CHECK_COMMAND_GROUPS = [
              "depends on it."},
     {"group": "Interfaces, VLANs & port-channels", "commands": [c for k, c in SNAPSHOT_COMMANDS if k in _SNAP_INTERFACE_KEYS]},
     {"group": "MAC address table", "commands": [c for k, c in SNAPSHOT_COMMANDS if k == "mac_table"]},
-    {"group": "Stack", "commands": [c for k, c in SNAPSHOT_COMMANDS if k not in _SNAP_INTERFACE_KEYS and k != "mac_table"]},
+    {"group": "802.1X / MAB authentication", "commands": [c for k, c in SNAPSHOT_COMMANDS if k == "auth_sessions"]},
+    {"group": "Stack", "commands": [c for k, c in SNAPSHOT_COMMANDS
+                                    if k not in _SNAP_INTERFACE_KEYS and k not in ("mac_table", "auth_sessions")]},
     {"group": "Health", "commands": ["show processes cpu", "show processes memory", "show environment all"]},
 ]
 BACKUP_COMMAND_GROUPS = [
@@ -5781,7 +5846,7 @@ SETTINGS_ITEMS += [
 ]
 # Commands added after the Check & Backup Commands page first shipped (2.3.0): a list saved before then did not offer
 # them, so they are switched on in it. 'commands_catalog' (saved with the settings) records what a saved list offered.
-COMMANDS_ADDED_AFTER_2_3 = ("show mac address-table dynamic",)
+COMMANDS_ADDED_AFTER_2_3 = ("show mac address-table dynamic", "show authentication sessions")
 SETTINGS_ITEMS.append({"key": "commands_catalog", "group": "_hidden", "section": "", "label": "Commands offered",
                        "help": "", "type": "catalog", "min": 0, "max": 0,
                        "default": sorted({c for i in SETTINGS_ITEMS if i["type"] == "commands" for c in i["default"]})})
@@ -9035,7 +9100,10 @@ def parse_auth_sessions(text):
     for line in text.splitlines():
         m = _AUTH_ROW_RE.match(line)
         if m:
-            status = " ".join(m.group(5).split())
+            words = m.group(5).split()
+            while len(words) > 1 and re.fullmatch(r"[A-Z*#]{1,2}", words[-1]):     # the 'Fg' column (D, *, ...)
+                words.pop()
+            status = " ".join(words)
             rows.append({"port": m.group(1), "mac": m.group(2).lower(), "method": m.group(3).lower(), "domain": m.group(4).upper(),
                          "status": status, "ok": status.lower() in _AUTH_OK_STATES})
     return rows
@@ -9999,8 +10067,8 @@ CHECK_PHASES = ("pre", "post")
 CHECK_STATE_LABEL = {"passed": "PASSED", "warning": "WARNING", "failed": "FAILED", "ready": "PRE-CHECK OK", "attention": "PRE-CHECK NOTES"}
 CHECK_FILE_RE = re.compile(r"^(pre|post)check_(\d{8}_\d{6})\.txt$")
 _METRIC_LOWER_BAD = {"Ports connected", "Interfaces up/up", "VLANs", "Trunks", "Port-channels up", "Stack members Ready", "Power stacks",
-                     "MAC addresses (access ports)"}
-_METRIC_HIGHER_BAD = {"Err-disabled ports", "Stack ports down"}
+                     "MAC addresses (access ports)", "Authenticated sessions"}
+_METRIC_HIGHER_BAD = {"Err-disabled ports", "Stack ports down", "Not authenticated sessions"}
 _METRIC_TOLERANCE = {"CPU 1-min %": 20, "Memory free %": 20}          # percent points that still count as normal movement
 
 
@@ -10054,6 +10122,11 @@ def _check_metrics(snap, version, cpu, mem):
     if (snap.get("ok") or {}).get("mac_table"):
         n = sum(len(v) for v in (snap.get("macs") or {}).values())
         rows.append(("MAC addresses (access ports)", str(n), n))
+    if (snap.get("ok") or {}).get("auth_sessions"):
+        sessions = snap.get("auth") or []
+        good = sum(1 for r in sessions if r["ok"])
+        rows.append(("Authenticated sessions", str(good), good))
+        rows.append(("Not authenticated sessions", str(len(sessions) - good), len(sessions) - good))
     rows.append(("CPU 1-min %", "" if cpu is None else str(cpu), cpu))
     rows.append(("Memory free %", "" if mem is None else str(mem), mem))
     return rows
