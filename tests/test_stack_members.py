@@ -99,9 +99,12 @@ Switch#   Role    Mac Address     Priority Version  State
 """
 
 
-def backup_file(folder, commands):
+def backup_file(folder, commands, stamp="20261123_090000"):
     text = manager.command_sections_text("Configuration backup - core-sw", commands)
-    (Path(folder) / f"{manager.BACKUP_FILE_PREFIX}_20261123_090000.txt").write_text(text, encoding="utf-8")
+    (Path(folder) / f"{manager.BACKUP_FILE_PREFIX}_{stamp}.txt").write_text(text, encoding="utf-8")
+
+
+OLD_STAMP = "20200101_000000"           # a backup taken long before any refresh written by these tests
 
 
 class StackMemberTests(unittest.TestCase):
@@ -191,7 +194,8 @@ class RefreshVersionTests(unittest.TestCase):
 
     def test_refresh_newer_than_the_backup_is_shown(self):
         old = SHOW_VERSION.replace("FCW2233L0BB", "OLDSERIAL01")      # switch 1 was replaced since the backup
-        backup_file(self.backups, [("show version", old), ("show inventory", SHOW_INVENTORY.replace("FCW2233L0BB", "OLDSERIAL01"))])
+        backup_file(self.backups, [("show version", old), ("show inventory", SHOW_INVENTORY.replace("FCW2233L0BB", "OLDSERIAL01"))],
+                    OLD_STAMP)
         path = self.save_refresh([("show version", SHOW_VERSION), ("show switch", SHOW_SWITCH), ("show inventory", SHOW_INVENTORY)])
         f = manager.read_device_facts(self.backups, path)
         self.assertEqual(f["read_from"]["kind"], "refresh")
@@ -201,14 +205,14 @@ class RefreshVersionTests(unittest.TestCase):
 
     def test_backup_newer_than_the_refresh_is_shown(self):
         path = self.save_refresh([("show version", SHOW_VERSION.replace("FCW2233L0BB", "OLDSERIAL01"))])
-        self.set_age(path, 3 * 365 * 86400)                       # long before the backup's stamp
+        self.set_age(path, 30 * 365 * 86400)                      # long before the backup's stamp
         backup_file(self.backups, [("show version", SHOW_VERSION), ("show inventory", SHOW_INVENTORY)])
         f = manager.read_device_facts(self.backups, path)
         self.assertEqual(f["read_from"]["kind"], "backup")
         self.assertEqual({m["switch"]: m["serial"] for m in f["members"]}[1], "FCW2233L0BB")
 
     def test_a_command_missing_from_the_refresh_comes_from_the_backup(self):
-        backup_file(self.backups, [("show version", SHOW_VERSION), ("show inventory", SHOW_INVENTORY)])
+        backup_file(self.backups, [("show version", SHOW_VERSION), ("show inventory", SHOW_INVENTORY)], OLD_STAMP)
         path = self.save_refresh([("show version", SHOW_VERSION)])   # show inventory failed during the refresh
         f = manager.read_device_facts(self.backups, path)
         self.assertEqual(f["read_from"]["kind"], "refresh")
