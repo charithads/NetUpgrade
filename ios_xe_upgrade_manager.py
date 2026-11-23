@@ -4141,6 +4141,7 @@ SNAPSHOT_COMMANDS = [
     ("stack_ports_summary", "show switch stack-ports summary"),   # link health of every stack port (neighbor, cable, link changes)
     ("stack_ports_detail", "show switch stack-ports detail"),     # per stack port counters / errors (not on every platform - then it is skipped)
     ("stack_power", "show stack-power"),               # power-stack status (not on every platform - then it is skipped)
+    ("mac_table", "show mac address-table dynamic"),   # MACs learnt per port: the same devices must be back afterwards
 ]
 POSTCHECK_SETTLE = 90         # seconds to let ports/port-channels come up after the reload
 POSTCHECK_RETRIES = 3         # extra tries when something still differs from before the upgrade
@@ -4175,6 +4176,27 @@ def parse_stack_ports_summary(text):
         return out
     for m in re.finditer(r"(?m)^[ \t]*(\d+/\d+)[ \t]+(\S+)[ \t]+(\S+)[ \t]+\S.*$", text):
         out[m.group(1)] = {"status": m.group(2), "neighbor": m.group(3)}
+    return out
+
+
+_MAC_ROW_RE = re.compile(r"(?im)^\s*\*?\s*(\d+|All)\s+([0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4})\s+(\S+)\s+(?:\S+\s+)*?(\S+)\s*$")
+_MAC_SKIP_PORTS = ("cpu", "router", "drop", "sup")
+
+
+def parse_mac_table(text, skip_ports=()):
+    """{port: {mac: vlan}} of the DYNAMIC entries of 'show mac address-table dynamic' - the devices each port has
+    learnt. Ports in skip_ports (trunks), port-channels and internal entries (CPU ...) are left out: what matters is
+    the device behind each access port. None when the output is not a MAC table."""
+    if not text or "Invalid input" in text or not re.search(r"(?i)mac\s+address", text):
+        return None
+    skip = {p.lower() for p in skip_ports}
+    out = {}
+    for m in _MAC_ROW_RE.finditer(text):
+        vlan, mac, kind, port = m.group(1), m.group(2).lower(), m.group(3), m.group(4)
+        low = port.lower()
+        if "dynamic" not in kind.lower() or low in skip or low.startswith("po") or low.startswith(_MAC_SKIP_PORTS):
+            continue
+        out.setdefault(port, {})[mac] = vlan
     return out
 
 
@@ -4216,16 +4238,17 @@ def parse_snapshot(outputs):
     stack_ports = parse_stack_ports(outputs.get("stack_ports", "")) if len(members) > 1 else {}
     stack_power = parse_stack_power(outputs.get("stack_power", ""))
     stack_summary = parse_stack_ports_summary(outputs.get("stack_ports_summary", "")) if len(members) > 1 else {}
+    macs = parse_mac_table(outputs.get("mac_table", ""), trunks)
     return {"ip_up": sorted(ip_up), "connected": sorted(connected), "err_disabled": sorted(err_disabled),
             "vlans": sorted(vlans, key=int), "trunks": sorted(trunks), "po": po,
             "stack_members": members, "stack_ports": stack_ports, "stack_power": stack_power,
-            "stack_ports_summary": stack_summary,
+            "stack_ports_summary": stack_summary, "macs": macs or {},
             "ok": {"ip_int_brief": ip_rows, "int_status": st_rows > 0,
                    "vlan_brief": bool(vlans),
                    "int_trunk": tr_rows > 0 or "Port" in outputs.get("int_trunk", ""),
                    "etherchannel": "channel-groups" in ec_text or bool(po),
                    "stack_members": bool(members), "stack_ports": bool(stack_ports), "stack_power": bool(stack_power),
-                   "stack_ports_summary": bool(stack_summary)}}
+                   "stack_ports_summary": bool(stack_summary), "mac_table": macs is not None}}
 
 
 def summarize_snapshot(snap):
@@ -4244,6 +4267,9 @@ def summarize_snapshot(snap):
         if ports:
             down = sum(1 for p in ports.values() for x in p if x.lower() == "down")
             parts.append(f"{down} stack port(s) down" if down else "stack ports OK")
+    if (snap.get("ok") or {}).get("mac_table"):
+        macs = snap.get("macs") or {}
+        parts.append(f"{sum(len(v) for v in macs.values())} MAC address(es) learnt on {len(macs)} access port(s)")
     power = snap.get("stack_power") or {}
     if power:
         parts.append("stack-power: " + ", ".join(f"{n} {v['topology']} ({v['sw']} switch(es), {v['ps']} PSU)"
@@ -4254,6 +4280,26 @@ def summarize_snapshot(snap):
 def _names(items, limit=6):
     items = list(items)
     return ", ".join(items[:limit]) + (f" (+{len(items) - limit} more)" if len(items) > limit else "")
+
+
+def compare_mac_tables(pre_macs, post_macs, limit=8):
+    """Issues for MAC addresses learnt on an access port before the upgrade that are missing now, or now learnt
+    on a different port. [] = every device is back on its port."""
+    now_at = {mac: port for port, macs in (post_macs or {}).items() for mac in macs}
+    missing, moved = [], []
+    for port in sorted(pre_macs or {}):
+        gone = sorted(mac for mac in pre_macs[port] if mac not in now_at)
+        if gone:
+            missing.append(f"{port} ({len(gone)}: {', '.join(gone[:3])}{', ...' if len(gone) > 3 else ''})")
+        moved += [f"{mac} {port} -> {now_at[mac]}" for mac in sorted(pre_macs[port])
+                  if mac in now_at and now_at[mac] != port]
+    issues = []
+    if missing:
+        total = sum(1 for port in pre_macs for mac in pre_macs[port] if mac not in now_at)
+        issues.append(f"{total} MAC address(es) learnt before the upgrade are not learnt again: {_names(missing, limit)}")
+    if moved:
+        issues.append(f"{len(moved)} MAC address(es) now learnt on another port: {_names(moved, limit)}")
+    return issues
 
 
 def compare_snapshots(pre, post):
@@ -4320,6 +4366,8 @@ def compare_snapshots(pre, post):
                 issues.append(f"{name} is down ({now['flags']})")
             elif now["bundled"] < was["bundled"]:
                 issues.append(f"{name} has {now['bundled']} bundled member(s), had {was['bundled']}")
+    if both("mac_table"):                                # the same devices learnt on the same access ports
+        issues += compare_mac_tables(pre.get("macs"), post.get("macs"))
     return issues
 
 
@@ -5709,7 +5757,8 @@ CHECK_COMMAND_GROUPS = [
      "warn": "Turning off a Cisco readiness command also turns off the readiness check (block or warning) that "
              "depends on it."},
     {"group": "Interfaces, VLANs & port-channels", "commands": [c for k, c in SNAPSHOT_COMMANDS if k in _SNAP_INTERFACE_KEYS]},
-    {"group": "Stack", "commands": [c for k, c in SNAPSHOT_COMMANDS if k not in _SNAP_INTERFACE_KEYS]},
+    {"group": "MAC address table", "commands": [c for k, c in SNAPSHOT_COMMANDS if k == "mac_table"]},
+    {"group": "Stack", "commands": [c for k, c in SNAPSHOT_COMMANDS if k not in _SNAP_INTERFACE_KEYS and k != "mac_table"]},
     {"group": "Health", "commands": ["show processes cpu", "show processes memory", "show environment all"]},
 ]
 BACKUP_COMMAND_GROUPS = [
@@ -5727,6 +5776,12 @@ SETTINGS_ITEMS += [
      "type": "commands", "choices": BACKUP_COMMAND_GROUPS, "locked": ["show running-config"], "min": MIN_SELECTED_COMMANDS,
      "default": [c for g in BACKUP_COMMAND_GROUPS for c in g["commands"]]},
 ]
+# Commands added after the Check & Backup Commands page first shipped (2.3.0): a list saved before then did not offer
+# them, so they are switched on in it. 'commands_catalog' (saved with the settings) records what a saved list offered.
+COMMANDS_ADDED_AFTER_2_3 = ("show mac address-table dynamic",)
+SETTINGS_ITEMS.append({"key": "commands_catalog", "group": "_hidden", "section": "", "label": "Commands offered",
+                       "help": "", "type": "catalog", "min": 0, "max": 0,
+                       "default": sorted({c for i in SETTINGS_ITEMS if i["type"] == "commands" for c in i["default"]})})
 CHECK_SELECTION = None                 # commands the pre-/post-checks may run (None = every one, the default)
 BACKUP_SELECTION = None                # built-in commands the backup runs (None = every one)
 
@@ -5791,6 +5846,9 @@ class OnceSession(object):
         return self._seen[key]
 
 
+SETTINGS_DEFAULT_CATALOG = next(i["default"] for i in SETTINGS_ITEMS if i["type"] == "catalog")
+
+
 def settings_defaults():
     return {i["key"]: i["default"] for i in SETTINGS_ITEMS}
 
@@ -5805,13 +5863,22 @@ def clean_settings(data, strict=False):
     (a damaged or old file) a bad or missing value silently becomes its default."""
     data = data if isinstance(data, dict) else {}
     out = {}
+    offered = data.get("commands_catalog")                  # commands a saved list could have picked from
+    if not isinstance(offered, list):
+        offered = None if not any(k in data for k in ("check_commands", "backup_commands")) else \
+            [c for c in SETTINGS_DEFAULT_CATALOG if c not in COMMANDS_ADDED_AFTER_2_3]
     for item in SETTINGS_ITEMS:
         key, default = item["key"], item["default"]
         if key not in data:
             out[key] = list(default) if isinstance(default, list) else default
             continue
         value = data[key]
+        if item["type"] == "catalog":
+            out[key] = list(default)                          # always what this version offers
+            continue
         if item["type"] == "commands":
+            if offered is not None and not strict and isinstance(value, list):    # new commands start switched on
+                value = value + [c for c in item["default"] if c not in offered]
             out[key] = clean_command_selection(item, value, strict)
             continue
         if item["type"] == "bool":
@@ -9928,7 +9995,8 @@ def selected_check_commands():
 CHECK_PHASES = ("pre", "post")
 CHECK_STATE_LABEL = {"passed": "PASSED", "warning": "WARNING", "failed": "FAILED", "ready": "PRE-CHECK OK", "attention": "PRE-CHECK NOTES"}
 CHECK_FILE_RE = re.compile(r"^(pre|post)check_(\d{8}_\d{6})\.txt$")
-_METRIC_LOWER_BAD = {"Ports connected", "Interfaces up/up", "VLANs", "Trunks", "Port-channels up", "Stack members Ready", "Power stacks"}
+_METRIC_LOWER_BAD = {"Ports connected", "Interfaces up/up", "VLANs", "Trunks", "Port-channels up", "Stack members Ready", "Power stacks",
+                     "MAC addresses (access ports)"}
 _METRIC_HIGHER_BAD = {"Err-disabled ports", "Stack ports down"}
 _METRIC_TOLERANCE = {"CPU 1-min %": 20, "Memory free %": 20}          # percent points that still count as normal movement
 
@@ -9980,6 +10048,9 @@ def _check_metrics(snap, version, cpu, mem):
     pw = snap.get("stack_power") or {}
     if pw:
         rows.append(("Power stacks", str(len(pw)), len(pw)))
+    if (snap.get("ok") or {}).get("mac_table"):
+        n = sum(len(v) for v in (snap.get("macs") or {}).values())
+        rows.append(("MAC addresses (access ports)", str(n), n))
     rows.append(("CPU 1-min %", "" if cpu is None else str(cpu), cpu))
     rows.append(("Memory free %", "" if mem is None else str(mem), mem))
     return rows
@@ -12549,7 +12620,7 @@ class Manager:
                    "secret": nu_storage.seal_for_worker(secret or ""),
                    "status_path": job["status_path"], "log_path": job["log_path"],
                    "timeouts": dict(TIMEOUTS),
-                   "commands": {k: list(self.settings[k]) for k in ("check_commands", "backup_commands")}}
+                   "commands": {k: list(self.settings[k]) for k in ("check_commands", "backup_commands", "commands_catalog")}}
         if record_dir is not None:
             payload["record_dir"] = str(record_dir)
         _rec = self.profiles.get(self.assign.get(host)) or {}
@@ -19453,6 +19524,7 @@ $("set-save").addEventListener("click", async () => {
   if (!SET.data || !SET_CAN_EDIT) return;
   for (const i of SET.data.items) {
     if (i.type === "bool") continue;
+    if (i.type === "catalog") continue;
     if (i.type === "commands") {
       if (csPicked(i).length < i.min) { SET.tab = i.group; renderSettings(); setSay("err", "Select at least " + i.min + " " + i.label.toLowerCase() + "."); return; }
       continue;
