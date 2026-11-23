@@ -23,6 +23,26 @@ settings.json
 *.log
 *.bak
 
+# Application data created when running from source - switch configurations, inventories and images
+# must never be committed. (The storage folder defaults to "NetUpgrade" next to the program.)
+/NetUpgrade/
+/IOS Images/
+/Switch Configuration Backups/
+.storage-migrated-v1
+*.bin
+*.bin.md5
+*.bin.sha256
+*.bin.sha512
+*.xlsx
+
+# Application database, secret vault and migration copies (normally in %LOCALAPPDATA%\NetUpgrade)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+legacy-json-backup/
+pre-migration-safety-copy-*/
+
 # Local test dependencies
 .deps/
 .pip-temp/
