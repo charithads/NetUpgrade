@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v2.2.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v2.3.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -104,24 +104,26 @@ from netupgrade_app.storage import repositories as nu_repo
 from netupgrade_app.storage.legacy import is_legacy_secret, unprotect_legacy
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.2.0"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "2.3.0"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
-    {"version": "2.2.0", "date": "2026-11-15", "features": [
-        "Store settings, sites, devices, schedules and run history in a local database instead of JSON files; existing data moves over automatically on first start.",
-        "Keep device passwords, enable secrets, the SMTP password and the AI key in an encrypted vault (AES-256-GCM) whose key is protected by Windows Credential Manager.",
-        "Encrypt the HTTPS private key and seal the login handed to background upgrade workers.",
+    {"version": "2.3.0", "date": "2026-11-23", "features": [
         "Add Cisco pre-upgrade readiness checks (install state, stack consistency, redundancy, modules, file systems, packages.conf and ROMMON) to the Readiness Check and Diagnosis Pre & Post Checks.",
         "Replace the separate ignore options with one 'Ignore readiness check blocks' option; every ignored block is logged.",
         "Add in-app help (? next to the user menu) with a User Guide and a step-by-step Upgrade Process page.",
+        "Choose the pre & post check and backup commands in Settings > Check & Backup Commands (at least 3 each); "
+        "every command now runs only once per check or backup.",
         "Check SSH host keys: a switch's key is saved on first login and later logins are refused if it changes; Administrators can forget a replaced switch's key in its device drawer.",
         "Accept firmware images only from the IOS Images folder, and harden storage paths and download headers.",
-        "Choose the pre & post check and backup commands in Settings > Check & Backup Commands (at least 3 each); "
-        "every command now runs only once per check or backup."]},
+        "Show only stable releases in this version history."]},
+    {"version": "2.2.0", "date": "2026-11-15", "features": [
+        "Store settings, sites, devices, schedules and run history in a local database instead of JSON files; existing data moves over automatically on first start.",
+        "Keep device passwords, enable secrets, the SMTP password and the AI key in an encrypted vault (AES-256-GCM) whose key is protected by Windows Credential Manager.",
+        "Encrypt the HTTPS private key and seal the login handed to background upgrade workers."]},
     {"version": "2.1.0", "date": "2026-11-09", "features": [
         "Preserve the selected storage folder when installing updates silently."]},
     {"version": "2.0.0", "date": "2026-11-09", "features": [
