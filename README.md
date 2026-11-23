@@ -4,7 +4,7 @@ NetUpgrade is a Windows desktop application for upgrading Cisco switches in para
 
 ![NetUpgrade dashboard](docs/images/netupgrade-dashboard.png)
 
-The current application version is **2.2.0**. Upgrade workflows are designed for Cisco Catalyst 9200/9300 switches and IOS-XE INSTALL mode.
+The current application version is **2.3.0**. Upgrade workflows are designed for Cisco Catalyst 9200/9300 switches and IOS-XE INSTALL mode.
 
 ## Features
 
