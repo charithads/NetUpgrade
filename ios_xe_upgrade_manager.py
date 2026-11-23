@@ -119,7 +119,9 @@ CHANGELOG = [
         "Replace the separate ignore options with one 'Ignore readiness check blocks' option; every ignored block is logged.",
         "Add in-app help (? next to the user menu) with a User Guide and a step-by-step Upgrade Process page.",
         "Check SSH host keys: a switch's key is saved on first login and later logins are refused if it changes; Administrators can forget a replaced switch's key in its device drawer.",
-        "Accept firmware images only from the IOS Images folder, and harden storage paths and download headers."]},
+        "Accept firmware images only from the IOS Images folder, and harden storage paths and download headers.",
+        "Choose the pre & post check and backup commands in Settings > Check & Backup Commands (at least 3 each); "
+        "every command now runs only once per check or backup."]},
     {"version": "2.1.0", "date": "2026-11-09", "features": [
         "Preserve the selected storage folder when installing updates silently."]},
     {"version": "2.0.0", "date": "2026-11-09", "features": [
@@ -3814,6 +3816,7 @@ def probe_device_readiness(host, device_type, username, password, secret, image_
                 transcript.append((cmd, out))
             return out
         conn.send_command = _recording_send
+        conn = OnceSession(conn)                       # one run per command: flash, health and snapshot share 'show switch'
         show_version = None
         try:
             show_version = conn.send_command("show version", read_timeout=tmo('show_cmd'))
@@ -3842,6 +3845,8 @@ def probe_device_readiness(host, device_type, username, password, secret, image_
         # Cisco's readiness command reference: install state, redundancy, modules, file systems, packages.conf
         cisco_out = {"version": show_version or ""}
         for key, command in CISCO_READINESS_COMMANDS:
+            if not check_command_on(command):
+                continue                               # turned off in Settings: that readiness rule is skipped
             try:
                 cisco_out[key] = conn.send_command(command, read_timeout=tmo('show_cmd'))
             except Exception:  # noqa: BLE001 - not available on this platform: reported as a note
@@ -4315,6 +4320,8 @@ def read_snapshot(conn):
     """Run the snapshot commands on an open session -> (raw outputs, parsed snapshot)."""
     outputs = {}
     for key, cmd in SNAPSHOT_COMMANDS:
+        if not check_command_on(cmd):
+            continue                                   # turned off in Settings > Check & Backup Commands
         try:
             outputs[key] = conn.send_command(cmd, read_timeout=tmo('snapshot_cmd'))
         except Exception as exc:  # noqa: BLE001 - one failing show command must not stop the others
@@ -4326,6 +4333,8 @@ def read_snapshot(conn):
 def snapshot_text(outputs, heading):
     parts = [heading, "=" * len(heading), ""]
     for key, cmd in SNAPSHOT_COMMANDS:
+        if key not in outputs:
+            continue
         parts += [f"#### {cmd}", outputs.get(key) or f"(no output{': ' + outputs[key + '_error'] if key + '_error' in outputs else ''})", ""]
     return "\n".join(parts)
 
@@ -4356,6 +4365,8 @@ def read_health(conn):
     """CPU (1-min average), free memory and stack state - shared by the pre- and post-check."""
     out = {"cpu_pct": None, "mem_free_pct": None, "stack": None}
     try:
+        if not check_command_on("show processes cpu"):
+            raise LookupError("turned off")
         cpu_out = conn.send_command("show processes cpu", read_timeout=tmo('health_cmd'))
         m = re.search(r"five seconds:\s*\d+%.*?one minute:\s*(\d+)%", cpu_out, re.S)
         if m:
@@ -4363,6 +4374,8 @@ def read_health(conn):
     except Exception:  # noqa: BLE001 - nice-to-have, never fatal
         pass
     try:
+        if not check_command_on("show processes memory"):
+            raise LookupError("turned off")
         mem_out = conn.send_command("show processes memory", read_timeout=tmo('health_cmd'))
         m = re.search(r"Processor Pool Total:\s*(\d+)\s*Used:\s*(\d+)\s*Free:\s*(\d+)", mem_out)
         if m:
@@ -4372,6 +4385,8 @@ def read_health(conn):
     except Exception:  # noqa: BLE001
         pass
     try:
+        if not check_command_on("show switch"):
+            raise LookupError("turned off")
         sw_out = conn.send_command("show switch", read_timeout=tmo('health_cmd'))
         states = re.findall(r"^\*?\s*\d+\s+\S+\s+\S+\s+\S+\s+(\S+)\s*$", sw_out, re.M)
         if states:
@@ -4385,6 +4400,7 @@ def read_health(conn):
 
 def evaluate_postcheck(conn, expected_version, pre):
     """One post-upgrade check on an open session. Returns (result dict, raw outputs, issues)."""
+    conn = OnceSession(conn)                           # 'show switch' is both a health and a snapshot command
     version = get_version(conn)
     health = read_health(conn)
     outputs, snap = read_snapshot(conn)
@@ -4461,6 +4477,7 @@ def take_pre_snapshot(session, device):
     global PRE_SNAPSHOT
     report('prechecking', 'Taking the pre-upgrade snapshot (interfaces, VLANs, trunks, port-channels) ...')
     log(device, 'Pre-check: reading the network state before the upgrade ...')
+    session = OnceSession(session)                     # 'show switch' is both a snapshot and a health command
     try:
         outputs, snap = read_snapshot(session)
     except Exception as exc:  # noqa: BLE001 - a failed snapshot must not block the upgrade
@@ -5240,6 +5257,7 @@ def job_main(job_path):
     LOG_FILE = job.get('log_path')
     RECORD_DIR = job.get('record_dir') or None
     apply_timeouts(job.get('timeouts'))             # the waits chosen on the dashboard's Settings page
+    apply_command_selection(job.get('commands'))    # the pre-/post-check commands chosen there
     device = {'ipaddr': job['ip'], 'type': 'cisco-xe', 'name': job.get('name') or job['ip']}
     STATUS = StatusFile(job['status_path'])
     STATUS.update(state='running', phase='starting', message='Starting ...')
@@ -5611,6 +5629,12 @@ SETTINGS_GROUPS = [
               "upgrade that is already running keeps the values it started with. Choose a Command duration profile "
               "below and press Apply to use it. Profiles are created in the Troubleshoot tab, where the "
               "Command time test can measure a switch to build one."},
+    {"id": "commands", "title": "Check & Backup Commands",
+     "intro": "Choose which read-only show commands are run. The pre & post check list is used by the upgrade's "
+              "pre-check and post-check, the Readiness Check and Diagnosis > Pre & Post Checks; the backup list by "
+              "Home > Configuration Backup. At least 3 commands must stay selected in each list. Commands marked "
+              "'Always run' cannot be turned off because a result depends on them. Each command runs only once per "
+              "check or backup, even when two parts of a check need it."},
     {"id": "notifications", "title": "Notifications",
      "intro": "E-mail copies of the notifications shown under the bell icon. Off until you switch it on. Gmail: "
               "smtp.gmail.com, port 587 (STARTTLS) and an App password (2-Step Verification > App passwords) - "
@@ -5669,6 +5693,97 @@ SETTINGS_ITEMS = [
 ]
 
 
+# ---- Settings > Check & Backup Commands: which read-only commands the pre-/post-checks and the backups run ----
+MIN_SELECTED_COMMANDS = 3
+_SNAP_INTERFACE_KEYS = ("ip_int_brief", "int_status", "vlan_brief", "int_trunk", "etherchannel")
+CHECK_COMMAND_GROUPS = [
+    {"group": "Software & boot", "commands": ["show version", "show boot", "show clock"]},
+    {"group": "Cisco readiness", "commands": [c for _k, c in CISCO_READINESS_COMMANDS],
+     "warn": "Turning off a Cisco readiness command also turns off the readiness check (block or warning) that "
+             "depends on it."},
+    {"group": "Interfaces, VLANs & port-channels", "commands": [c for k, c in SNAPSHOT_COMMANDS if k in _SNAP_INTERFACE_KEYS]},
+    {"group": "Stack", "commands": [c for k, c in SNAPSHOT_COMMANDS if k not in _SNAP_INTERFACE_KEYS]},
+    {"group": "Health", "commands": ["show processes cpu", "show processes memory", "show environment all"]},
+]
+BACKUP_COMMAND_GROUPS = [
+    {"group": "Backup commands", "commands": ["show running-config"] + [c for c, _suffix in EXTRA_COMMANDS]},
+]
+SETTINGS_ITEMS += [
+    {"key": "check_commands", "group": "commands", "section": "", "label": "Pre & Post Check Commands",
+     "help": "Used by the upgrade's pre-check and post-check, the Readiness Check and Diagnosis > Pre & Post Checks. "
+             "The post-check runs the same commands as the pre-check, so the two can be compared.",
+     "type": "commands", "choices": CHECK_COMMAND_GROUPS, "locked": ["show version"], "min": MIN_SELECTED_COMMANDS,
+     "default": [c for g in CHECK_COMMAND_GROUPS for c in g["commands"]]},
+    {"key": "backup_commands", "group": "commands", "section": "", "label": "Backup Commands",
+     "help": "Used by Home > Configuration Backup. Additional commands typed on the Home tab run after these; one "
+             "that is already in this list is not run a second time.",
+     "type": "commands", "choices": BACKUP_COMMAND_GROUPS, "locked": ["show running-config"], "min": MIN_SELECTED_COMMANDS,
+     "default": [c for g in BACKUP_COMMAND_GROUPS for c in g["commands"]]},
+]
+CHECK_SELECTION = None                 # commands the pre-/post-checks may run (None = every one, the default)
+BACKUP_SELECTION = None                # built-in commands the backup runs (None = every one)
+
+
+def command_key(command):
+    """A command as compared for duplicates: case and spacing do not matter."""
+    return " ".join(str(command or "").split()).lower()
+
+
+def clean_command_selection(item, value, strict=False):
+    """A list of commands picked on the Settings page -> the valid list, in the page's order, locked ones included.
+    strict=True raises ApiError for anything wrong; otherwise a bad value becomes the default."""
+    allowed = [c for g in item["choices"] for c in g["commands"]]
+    if not isinstance(value, list) or not all(isinstance(c, str) for c in value):
+        if strict:
+            raise ApiError(f"{item['label']} must be a list of commands.")
+        return list(item["default"])
+    wanted = {command_key(c) for c in value}
+    unknown = wanted - {command_key(c) for c in allowed}
+    if unknown and strict:
+        raise ApiError(f"Unknown command in {item['label']}: {sorted(unknown)[0][:60]}")
+    picked = [c for c in allowed if command_key(c) in wanted or c in item["locked"]]
+    if len(picked) < item["min"]:
+        if strict:
+            raise ApiError(f"Select at least {item['min']} {item['label'].lower()}.")
+        return list(item["default"])
+    return picked
+
+
+def apply_command_selection(values):
+    """Use the saved command choices (the dashboard after a Save, an upgrade worker from its job file)."""
+    global CHECK_SELECTION, BACKUP_SELECTION
+    values = clean_settings(values)
+    CHECK_SELECTION = {command_key(c) for c in values["check_commands"]}
+    BACKUP_SELECTION = {command_key(c) for c in values["backup_commands"]}
+
+
+def check_command_on(command):
+    return CHECK_SELECTION is None or command_key(command) in CHECK_SELECTION
+
+
+def backup_command_on(command):
+    return BACKUP_SELECTION is None or command_key(command) in BACKUP_SELECTION
+
+
+class OnceSession(object):
+    """Wraps a switch session for ONE check: a command already run in it gives its first output again instead of
+    being sent to the switch a second time ('show switch' is read by the flash check, the health check and the
+    snapshot)."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._seen = {}
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def send_command(self, command, *args, **kwargs):
+        key = command_key(command)
+        if key not in self._seen:
+            self._seen[key] = self._conn.send_command(command, *args, **kwargs)
+        return self._seen[key]
+
+
 def settings_defaults():
     return {i["key"]: i["default"] for i in SETTINGS_ITEMS}
 
@@ -5686,9 +5801,12 @@ def clean_settings(data, strict=False):
     for item in SETTINGS_ITEMS:
         key, default = item["key"], item["default"]
         if key not in data:
-            out[key] = default
+            out[key] = list(default) if isinstance(default, list) else default
             continue
         value = data[key]
+        if item["type"] == "commands":
+            out[key] = clean_command_selection(item, value, strict)
+            continue
         if item["type"] == "bool":
             if not isinstance(value, bool):
                 if strict:
@@ -7501,10 +7619,13 @@ def do_backup(host, device_type, username, password, secret, device_dir, run_sta
         "password": password, "secret": secret or "",
         "conn_timeout": 20, "auth_timeout": 20, "banner_timeout": 20,
     }
-    warnings, commands_run, sections = [], [], []
+    warnings, commands_run, sections, ran = [], [], [], set()
     device_dir = Path(device_dir)
 
     def run_command(command, timeout=None):
+        if command_key(command) in ran:
+            return None                                # already in this backup: never run twice
+        ran.add(command_key(command))
         try:
             output = conn.send_command(command, read_timeout=timeout or tmo("backup_cmd"))
             if not output or "Invalid input" in output[:200]:
@@ -7530,6 +7651,8 @@ def do_backup(host, device_type, username, password, secret, device_dir, run_sta
 
         version, model, sv_out, sb_out = None, None, None, None
         for command, suffix in EXTRA_COMMANDS:
+            if not backup_command_on(command):
+                continue                               # turned off in Settings > Check & Backup Commands
             output = run_command(command)
             if suffix == "show_version" and output:
                 version, model, sv_out = parse_version(output), parse_model(output), output
@@ -9681,6 +9804,16 @@ MANUAL_CHECK_COMMANDS = ([("clock", "show clock"), ("version", "show version"), 
                          + list(SNAPSHOT_COMMANDS)
                          + [("cpu", "show processes cpu"), ("memory", "show processes memory"), ("environment", "show environment all")])
 MANUAL_CHECK_KEYS = {cmd: key for key, cmd in MANUAL_CHECK_COMMANDS}
+
+
+def selected_check_commands():
+    """The Diagnosis Pre & Post Checks commands chosen in Settings, each once, in the usual order."""
+    seen, out = set(), []
+    for _key, cmd in MANUAL_CHECK_COMMANDS:
+        if check_command_on(cmd) and command_key(cmd) not in seen:
+            seen.add(command_key(cmd))
+            out.append(cmd)
+    return out
 CHECK_PHASES = ("pre", "post")
 CHECK_STATE_LABEL = {"passed": "PASSED", "warning": "WARNING", "failed": "FAILED", "ready": "PRE-CHECK OK", "attention": "PRE-CHECK NOTES"}
 CHECK_FILE_RE = re.compile(r"^(pre|post)check_(\d{8}_\d{6})\.txt$")
@@ -9798,7 +9931,7 @@ def analyze_manual_check(outputs, phase, pre_outputs=None, expected_version=""):
     warnings += cisco["warnings"]
     notes += cisco["notes"]
     pre_cisco = cisco_readiness_findings(pre_outputs, include_boot=True) if pre_outputs else None
-    unsupported = [cmd for key, cmd in MANUAL_CHECK_COMMANDS if output_unsupported(outputs.get(key))]
+    unsupported = [cmd for key, cmd in MANUAL_CHECK_COMMANDS if key in outputs and output_unsupported(outputs.get(key))]
     if unsupported:
         notes.append("No usable output (not available on this platform / version, or no data): " + ", ".join(unsupported))
     cisco_rows = ("Stack software", "Install state", "Boot", "Redundancy", "Modules", "File systems", "packages.conf", "ROMMON")
@@ -10805,6 +10938,7 @@ class Manager:
         self.max_parallel = st["max_parallel"]
         self.stop_on_failure = st["stop_on_failure"]
         apply_timeouts(st)                  # in-process commands (backup, readiness, ...) use these at once
+        apply_command_selection(st)         # Settings > Check & Backup Commands
 
     def settings_view(self):
         return {"values": dict(self.settings), "defaults": settings_defaults(), "groups": SETTINGS_GROUPS,
@@ -11612,7 +11746,11 @@ class Manager:
         if not isinstance(text, str):
             raise ApiError("Additional commands must be text.")
         lines = [ln.strip() for ln in text.splitlines()]
-        commands = [ln for ln in lines if ln]
+        commands, seen = [], set()
+        for ln in lines:                               # each command once (case and spacing do not matter)
+            if ln and command_key(ln) not in seen:
+                seen.add(command_key(ln))
+                commands.append(ln)
         if len(commands) > cls.MAX_CUSTOM_COMMANDS:
             raise ApiError(f"Enter at most {cls.MAX_CUSTOM_COMMANDS} additional commands.")
         for c in commands:
@@ -12273,7 +12411,8 @@ class Manager:
                    "username": username, "password": nu_storage.seal_for_worker(password),
                    "secret": nu_storage.seal_for_worker(secret or ""),
                    "status_path": job["status_path"], "log_path": job["log_path"],
-                   "timeouts": dict(TIMEOUTS)}
+                   "timeouts": dict(TIMEOUTS),
+                   "commands": {k: list(self.settings[k]) for k in ("check_commands", "backup_commands")}}
         if record_dir is not None:
             payload["record_dir"] = str(record_dir)
         _rec = self.profiles.get(self.assign.get(host)) or {}
@@ -12732,7 +12871,7 @@ class Manager:
             cmd_summary = self.diag_cmd_summary if site else None
         return {"site": site, "devices": devices, "runs": runs, "results": results,
                 "checks": checks, "cmd_hosts": cmd_hosts, "cmd_summary": cmd_summary,
-                "check_commands": [c for _k, c in MANUAL_CHECK_COMMANDS],
+                "check_commands": selected_check_commands(),
                 "commands": self._diag_commands_saved() if site else "",
                 "lookbacks": list(DIAG_LOOKBACK_HOURS), "log_commands": list(DIAG_LOG_COMMANDS),
                 "allowed_words": list(DIAG_COMMAND_WORDS), "max_commands": DIAG_MAX_COMMANDS,
@@ -13112,7 +13251,7 @@ class Manager:
         label = self.label(host) if host in self.info else host
         state, detail, rel = "failed", "", ""
         try:
-            got = self._diag_collect(host, username, password, secret, [c for _k, c in MANUAL_CHECK_COMMANDS])
+            got = self._diag_collect(host, username, password, secret, selected_check_commands())
             if all(e for _c, _o, e in got):
                 raise RuntimeError("No command could be run on the switch")
             self._diag_set_running(site, "checks", host, "Checking ...")
@@ -14951,6 +15090,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .ab-cur { font-size:11px; font-weight:600; padding:1px 8px; border-radius:4px; background:var(--sel); color:var(--ac); }
   .ab-ver ul { margin:4px 0 0; padding-left:20px; font-size:13px; line-height:1.55; }
   .set-sec { margin:20px 0 2px; font-size:11px; color:var(--mu); font-weight:600; }
+  .cs-card { border:1px solid var(--bd); border-radius:8px; padding:12px 16px; margin:12px 0; }
+  .cs-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .cs-head b { font-size:14px; } .cs-head .sp { flex:1; }
+  .cs-cnt { font-size:12px; padding:2px 8px; border-radius:10px; background:rgba(46,160,67,.18); color:var(--gr); }
+  .cs-cnt.low { background:rgba(248,81,73,.15); color:var(--rd); }
+  .cs-note { font-size:12px; color:var(--mu); margin:4px 0 0; }
+  .cs-gh { font-size:11px; color:var(--mu); font-weight:600; text-transform:uppercase; letter-spacing:.04em; margin:12px 0 6px; }
+  .cs-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(240px, 1fr)); gap:6px 14px; }
+  .cs-cmd { display:flex; align-items:center; gap:8px; margin:0; font-weight:400; padding:5px 8px; border:1px solid var(--bd); border-radius:6px; cursor:pointer; }
+  .cs-cmd code { font-size:12.5px; background:none; padding:0; overflow-wrap:anywhere; }
+  .cs-cmd.lock { opacity:.8; cursor:default; } .cs-cmd small { margin-left:auto; color:var(--mu); font-size:10.5px; white-space:nowrap; }
+  .cs-warn { margin:8px 0 0; padding:6px 10px; border-left:3px solid var(--am); background:rgba(210,153,34,.08); font-size:12px; border-radius:4px; }
   .set-row { display:flex; gap:24px; align-items:center; justify-content:space-between; padding:11px 0; border-top:1px solid var(--bd); }
   .set-sec + .set-row { margin-top:4px; }
   .set-info { flex:1; min-width:0; }
@@ -15878,7 +16029,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <div class="body">
         <label for="custom-commands" style="margin-top:0">Additional commands (optional)</label>
         <textarea id="custom-commands" placeholder="show ip interface brief&#10;show logging"></textarea>
-        <div class="row"><button class="btn p" id="btn-backup" disabled>Run Backup</button><span class="tip" data-tip="Saves show running-config, show vlan, show version, show boot, show inventory and the additional commands (all outputs in ONE file per switch), then shows the current software version in the table. Additional commands: one per line."></span></div>
+        <div class="row"><button class="btn p" id="btn-backup" disabled>Run Backup</button><span class="tip" data-tip="Saves the backup commands chosen in Settings > Check &amp; Backup Commands (show running-config, show vlan, show version, show boot, show inventory by default) and the additional commands (all outputs in ONE file per switch), then shows the current software version in the table. Additional commands: one per line; a command that is already in the backup runs only once."></span></div>
         <div class="hint" id="backup-status">No backup run yet.</div>
         <div class="hint" id="backup-commands-log" style="max-height:110px; overflow-y:auto; display:none;"></div>
         <div class="msg" id="msg-3" role="status" aria-live="polite"></div>
@@ -16418,7 +16569,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <h3>Top Bar</h3>
         <ul>
           <li><b>Bell</b>: notifications (upgrades started, completed, failed, missed schedules). E-mail copies are set up in Settings &gt; Notifications.</li>
-          <li><b>Gear</b>: Settings - upgrade rollout, command timeouts, notifications, AI Analytics and About.</li>
+          <li><b>Gear</b>: Settings - upgrade rollout, command timeouts, the check &amp; backup commands, notifications, AI Analytics and About.</li>
           <li><b>Sun / moon</b>: light or dark mode. <b>?</b>: this help. <b>User</b>: signed-in account and Sign out.</li>
         </ul>
 
@@ -18996,8 +19147,43 @@ function setMinutes(item, v) {
   const m = v / 60;
   return "\u2248 " + (Number.isInteger(m) ? m : m.toFixed(1)) + " min";
 }
+function setSame(a, b) { return Array.isArray(a) || Array.isArray(b) ? JSON.stringify(a) === JSON.stringify(b) : a === b; }
 function setDirtyKeys() {
-  return SET.data ? SET.data.items.filter(i => SET.draft[i.key] !== SET.data.values[i.key]).map(i => i.key) : [];
+  return SET.data ? SET.data.items.filter(i => !setSame(SET.draft[i.key], SET.data.values[i.key])).map(i => i.key) : [];
+}
+// ---- Settings > Check & Backup Commands: one card per list, a tick box per command, at least item.min ticked ----
+function csAll(item) { return item.choices.flatMap(g => g.commands); }
+function csPicked(item) {
+  const sel = new Set(SET.draft[item.key] || []);
+  return csAll(item).filter(c => sel.has(c) || item.locked.includes(c));
+}
+function csRender() {
+  const root = $("cs-root"); if (!root || !SET.data) return;
+  const dis = SET_CAN_EDIT ? "" : " disabled";
+  root.innerHTML = SET.data.items.filter(i => i.type === "commands").map(item => {
+    const picked = new Set(csPicked(item)), all = csAll(item), low = picked.size < item.min, k = esc(item.key);
+    const groups = item.choices.map(g => {
+      const off = g.warn && g.commands.some(c => !picked.has(c));
+      return '<div class="cs-gh">' + esc(g.group) + '</div><div class="cs-grid">' + g.commands.map(c => {
+        const lk = item.locked.includes(c);
+        return '<label class="cs-cmd' + (lk ? " lock" : "") + '" title="' + esc(lk ? "Always run: a result depends on it" : c) + '"><input type="checkbox" data-cs="' + k +
+          '" value="' + esc(c) + '"' + (picked.has(c) ? " checked" : "") + (lk ? " disabled" : dis) + "><code>" + esc(c) + "</code>" +
+          (lk ? "<small>Always run</small>" : "") + "</label>";
+      }).join("") + "</div>" + (off ? '<div class="cs-warn">' + esc(g.warn) + "</div>" : "");
+    }).join("");
+    return '<div class="cs-card" data-row="' + k + '"><div class="cs-head"><b>' + esc(item.label) + '</b><span class="cs-cnt' + (low ? " low" : "") + '">' +
+      picked.size + " of " + all.length + ' selected</span><span class="sp"></span>' +
+      '<button type="button" class="btn sm" data-csset="all" data-csitem="' + k + '"' + dis + ">Select All</button>" +
+      '<button type="button" class="btn sm" data-csset="min" data-csitem="' + k + '"' + dis + ">Clear To Minimum</button></div>" +
+      '<div class="cs-note">' + esc(item.help) + "</div>" + groups +
+      (low ? '<div class="msg err" style="margin-top:8px">Select at least ' + item.min + " commands.</div>" : "") + "</div>";
+  }).join("");
+  setUpdateDirty();
+}
+function csSet(item, list) {
+  const keep = new Set(list.concat(item.locked));
+  SET.draft[item.key] = csAll(item).filter(c => keep.has(c));          // always in the page's order
+  csRender();
 }
 function setUpdateDirty() {
   const n = setDirtyKeys().length;
@@ -19029,23 +19215,24 @@ function renderSettings() {
   if (!SET.data) return;
   if (!SET.data.groups.some(g => g.id === SET.tab)) SET.tab = SET.data.groups[0].id;
   $("set-nav").innerHTML = SET.data.groups.map(g => '<button type="button" role="tab" data-stab="' + esc(g.id) + '" class="' +
-    (g.id === SET.tab ? "on" : "") + '" aria-selected="' + (g.id === SET.tab) + '">' + esc(scase(g.title)) + "</button>").join("");
+    (g.id === SET.tab ? "on" : "") + '" aria-selected="' + (g.id === SET.tab) + '">' + esc(g.title) + "</button>").join("");
   const g = SET.data.groups.find(x => x.id === SET.tab);
-  $("set-title").textContent = scase(g.title);
+  $("set-title").textContent = g.title;
   $("set-own").innerHTML = "";
   $("set-note").hidden = SET_CAN_EDIT;
   let rows = "", sec = null;
-  for (const item of SET.data.items.filter(i => i.group === g.id)) {
+  for (const item of SET.data.items.filter(i => i.group === g.id && i.type !== "commands")) {
     const secName = item.section || (g.id === "rollout" ? "Batch rollout" : "");
     if (secName && secName !== sec) { rows += '<div class="set-sec">' + esc(scase(secName)) + "</div>"; }
     sec = secName;
     rows += setRow(item);
   }
   const html = '<div class="set-intro">' + esc(g.intro) + "</div>" +
-    (g.id === "notifications" ? '<div id="nt-root"></div>' : g.id === "ai" ? '<div id="ai-root"></div>' : g.id === "about" ? '<div id="ab-root"></div>' :
+    (g.id === "commands" ? '<div id="cs-root"></div>' : g.id === "notifications" ? '<div id="nt-root"></div>' : g.id === "ai" ? '<div id="ai-root"></div>' : g.id === "about" ? '<div id="ab-root"></div>' :
      '<div class="nt-form">' + (g.id === "timeouts" ? '<div id="tp-root"></div>' : "") + rows + "</div>");
   $("set-body").innerHTML = html;
   if (g.id === "timeouts") tpRender();
+  if (g.id === "commands") csRender();
   if (g.id === "notifications") { ntRender(); if (!NT.data && !NT.loading) { NT.loading = true; ntLoad().finally(() => { NT.loading = false; }); } }
   if (g.id === "ai") { aiRender(); if (!AIS.data && !AIS.loading) aiLoad(); }
   if (g.id === "about") aboutRender();
@@ -19084,24 +19271,46 @@ $("set-body").addEventListener("input", e => {
   setRowRefresh(k);
 });
 $("set-body").addEventListener("change", e => {
+  const cs = e.target.dataset.cs;
+  if (cs) {
+    const item = SET.data.items.find(i => i.key === cs); if (!item) return;
+    const now = new Set(csPicked(item));
+    if (e.target.checked) now.add(e.target.value); else now.delete(e.target.value);
+    csSet(item, [...now]); return;
+  }
   const k = e.target.dataset.sk;
   if (!k || e.target.type !== "checkbox") return;
   SET.draft[k] = e.target.checked; setRowRefresh(k);
 });
 $("set-body").addEventListener("click", e => {
+  const cb = e.target.closest("[data-csset]");
+  if (cb && SET_CAN_EDIT) {
+    const item = SET.data.items.find(i => i.key === cb.dataset.csitem); if (!item) return;
+    if (cb.dataset.csset === "all") csSet(item, csAll(item));
+    else {                                                              // the locked commands, then the first ones in the list
+      const list = item.locked.slice();
+      for (const c of csAll(item)) if (list.length < item.min && !list.includes(c)) list.push(c);
+      csSet(item, list);
+    }
+    return;
+  }
   const b = e.target.closest("[data-sdef]");
   if (!b || !SET_CAN_EDIT) return;
   SET.draft[b.dataset.sdef] = SET.data.defaults[b.dataset.sdef]; renderSettings();
 });
 $("set-reset").addEventListener("click", () => {
   if (!SET.data) return;
-  for (const i of SET.data.items) if (i.group === SET.tab) SET.draft[i.key] = SET.data.defaults[i.key];
+  for (const i of SET.data.items) if (i.group === SET.tab) SET.draft[i.key] = Array.isArray(SET.data.defaults[i.key]) ? SET.data.defaults[i.key].slice() : SET.data.defaults[i.key];
   renderSettings();
 });
 $("set-save").addEventListener("click", async () => {
   if (!SET.data || !SET_CAN_EDIT) return;
   for (const i of SET.data.items) {
     if (i.type === "bool") continue;
+    if (i.type === "commands") {
+      if (csPicked(i).length < i.min) { SET.tab = i.group; renderSettings(); setSay("err", "Select at least " + i.min + " " + i.label.toLowerCase() + "."); return; }
+      continue;
+    }
     const v = SET.draft[i.key];
     if (!Number.isInteger(v) || v < i.min || v > i.max) {
       setSay("err", i.label + " must be a whole number from " + i.min + " to " + i.max + "."); return;
