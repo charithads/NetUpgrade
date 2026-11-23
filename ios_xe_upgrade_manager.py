@@ -119,7 +119,8 @@ CHANGELOG = [
         "every command now runs only once per check or backup.",
         "Check SSH host keys: a switch's key is saved on first login and later logins are refused if it changes; Administrators can forget a replaced switch's key in its device drawer.",
         "Accept firmware images only from the IOS Images folder, and harden storage paths and download headers.",
-        "Show only stable releases in this version history."]},
+        "Show only stable releases in this version history.",
+        "Show every member of a stack in the device drawer (model, serial number, hardware and software version, uptime, MAC address, power supplies and modules), not only the active switch."]},
     {"version": "2.2.0", "date": "2026-11-15", "features": [
         "Store settings, sites, devices, schedules and run history in a local database instead of JSON files; existing data moves over automatically on first start.",
         "Keep device passwords, enable secrets, the SMTP password and the AI key in an encrypted vault (AES-256-GCM) whose key is protected by Windows Credential Manager.",
@@ -7962,8 +7963,74 @@ def parse_show_version_facts(text):
         members.append({"switch": int(m.group(2)), "active": bool(m.group(1)), "ports": int(m.group(3)),
                         "model": m.group(4), "version": m.group(5), "mode": m.group(7)})
     if members:
+        sections = parse_stack_sections(text)
+        table = re.search(r"(?m)^\s*Switch\s+Ports\s+Model\b", text)
+        own = _show_version_fields(text[:table.start()] if table else "")     # the active switch's own values
+        own.pop("uptime", None)                         # the active switch's uptime is the '<host> uptime is' line
+        for mem in members:
+            extra = own if mem["active"] else sections.get(mem["switch"], {})
+            for k, v in extra.items():
+                mem.setdefault(k, v)
+            if mem["active"] and facts.get("uptime"):
+                mem.setdefault("uptime", facts["uptime"])
         facts["members"] = members
     return facts
+
+
+_SHOW_VERSION_FIELDS = {"system serial number": "serial", "version id": "hardware_version", "model number": "model_number",
+                        "base ethernet mac address": "mac", "switch uptime": "uptime"}
+_STACK_SECTION_RE = re.compile(r"(?m)^\s*Switch\s+0*(\d+)\s*\r?\n\s*-{3,}\s*$")
+
+
+def _show_version_fields(block):
+    """The 'Name : value' lines of one switch in 'show version' -> {serial, hardware_version, model_number, mac, uptime}."""
+    out = {}
+    for m in re.finditer(r"(?m)^\s*([A-Za-z][A-Za-z /-]*?)\s*:\s*(\S.*?)\s*$", block or ""):
+        key = _SHOW_VERSION_FIELDS.get(m.group(1).strip().lower())
+        if key and key not in out:
+            out[key] = m.group(2)
+    return out
+
+
+def parse_stack_sections(text):
+    """{member number: fields} from the 'Switch 02 / ---------' blocks a stack's 'show version' lists after the member
+    table (one block per member that is not the active switch)."""
+    out = {}
+    marks = list(_STACK_SECTION_RE.finditer(text or ""))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out[int(m.group(1))] = _show_version_fields(text[m.end():end])
+    return out
+
+
+def stack_member_details(members, inventory, roles=None):
+    """The stack members from 'show version' completed with 'show inventory' (model, serial number, hardware version,
+    power supplies and modules of each member) and, when known, 'show switch' (role and state). New dicts."""
+    by_switch, out = {}, []
+    for item in inventory or []:
+        m = re.fullmatch(r"(?i)switch\s*0*(\d+)", item["name"].strip())
+        if m:
+            by_switch.setdefault(int(m.group(1)), item)
+    roles = {int(r["switch"]): r for r in (roles or []) if str(r.get("switch", "")).isdigit()}
+    for mem in members or []:
+        mem, n = dict(mem), mem["switch"]
+        entry = by_switch.get(n)
+        if entry:
+            mem["serial"] = entry["serial"] or mem.get("serial")
+            mem["hardware_version"] = entry["vid"] or mem.get("hardware_version")
+            mem["pid"] = entry["pid"] or None
+        part_re = re.compile(r"(?i)^switch\s*0*%d(?!\d)\s*[-:]?\s*(.+)$" % n)
+        parts = []
+        for item in inventory or []:
+            pm = part_re.match(item["name"].strip())
+            if pm and item["pid"]:
+                parts.append(f"{pm.group(1)}: {item['pid']}" + (f" (SN {item['serial']})" if item["serial"] else ""))
+        mem["parts"] = parts[:12]
+        role = roles.get(n)
+        if role:
+            mem["role"], mem["state"] = role.get("role"), role.get("state")
+        out.append(mem)
+    return out
 
 
 def parse_inventory_facts(text):
@@ -7983,7 +8050,8 @@ def read_device_facts(device_dir):
         all_names = [n for n in os.listdir(device_dir) if STAMP_RE.search(n)]
     except OSError:
         return facts
-    for prefix, command in (("show_version", "show version"), ("show_inventory", "show inventory")):
+    for prefix, command in (("show_version", "show version"), ("show_inventory", "show inventory"),
+                            ("show_switch", "show switch")):
         cands = [(STAMP_RE.search(n).group(1), n) for n in all_names
                  if n.startswith(BACKUP_FILE_PREFIX + "_")]
         if not cands:
@@ -8002,7 +8070,8 @@ def read_device_facts(device_dir):
                 continue
             text = split_command_sections(text).get(command, "")
             parsed = (parse_show_version_facts(text) if prefix == "show_version"
-                      else {"inventory": parse_inventory_facts(text)})
+                      else {"inventory": parse_inventory_facts(text)} if prefix == "show_inventory"
+                      else {"switch_roles": parse_show_switch(text) or []} if text else {})
             parsed["_time"] = _stamp_to_time(stamp)
             if len(_FACTS_CACHE) > 400:
                 _FACTS_CACHE.clear()
@@ -8013,8 +8082,14 @@ def read_device_facts(device_dir):
             else:
                 facts[k] = v
     inv = facts.get("inventory") or []
+    members = facts.get("members") or []
+    if members:                                        # every stack member, not only the active one
+        facts["members"] = stack_member_details(members, inv, facts.pop("switch_roles", None))
+    facts.pop("switch_roles", None)
     if inv:
-        pick = next((i for i in inv if re.fullmatch(r"(?i)switch\s*1|chassis|1", i["name"].strip())), inv[0])
+        active = next((m for m in facts.get("members", []) if m.get("active")), None)
+        pick = next((i for i in inv if active and re.fullmatch(r"(?i)switch\s*0*%d" % active["switch"], i["name"].strip())), None) \
+            or next((i for i in inv if re.fullmatch(r"(?i)switch\s*1|chassis|1", i["name"].strip())), inv[0])
         facts.setdefault("serial", pick["serial"])
         facts["hardware_version"] = pick["vid"] or None
         facts["inventory"] = inv[:12]
@@ -13796,6 +13871,12 @@ class Manager:
 
         pre = None
         status = latest_upgrade_status(runs_dir, host)
+        snap_roles = ((status or {}).get("pre_snapshot") or {}).get("stack_members") if isinstance(status, dict) else None
+        if isinstance(snap_roles, dict):                # 'show switch' of the last upgrade: role / state of each member
+            for mem in facts.get("members") or []:
+                r = snap_roles.get(str(mem.get("switch")))
+                if isinstance(r, dict) and not mem.get("role"):
+                    mem["role"], mem["state"] = r.get("role"), r.get("state")
         if status and isinstance(status.get("pre_snapshot"), dict):
             try:
                 pre = {"summary": summarize_snapshot(status["pre_snapshot"]), "time": _stamp_to_time(status["_stamp"])}
@@ -14706,6 +14787,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dr-kv td { padding:5px 0; border-top:0; border-bottom:1px solid var(--bd); vertical-align:top; white-space:normal; }
   .dr-kv td:first-child { color:var(--mu); width:40%; padding-right:10px; }
   .dr-kv td:last-child { text-align:right; overflow-wrap:anywhere; }
+  .dr-mem + .dr-mem { margin-top:12px; }
+  .dr-mem h6 { margin:4px 0 2px; font-size:13px; display:flex; align-items:center; gap:8px; }
+  .dr-mem h6 small { font-weight:400; color:var(--mu); }
   .dr-note { font-size:12px; color:var(--mu); margin-top:6px; }
   .dr-empty { color:var(--mu); font-size:13px; padding:6px 0; }
   .dr-banner { border-radius:8px; padding:8px 11px; font-weight:600; font-size:13px; margin-bottom:4px; }
@@ -21311,6 +21395,22 @@ async function drForgetHostKey() {
   try { const r = await post("/api/host-key/forget", {host}); say("ok", r.message); drFetch(true); }
   catch (e) { say("err", e.message); }
 }
+// Every member of a stack, each with its own model, serial number, hardware / software version, uptime, MAC address and
+// power supplies / modules (from the newest backup's show version + show inventory; role and state from show switch).
+function drStack(f) {
+  const ms = (f.members || []).slice().sort((a, b) => a.switch - b.switch);
+  const body = ms.map(s => {
+    const role = s.role || (s.active ? "Active" : "Member");
+    return '<div class="dr-mem"><h6>Switch ' + esc(s.switch) + " <small>" + esc(role) + (s.state ? " \u00B7 " + esc(s.state) : "") + "</small></h6>" +
+      drKV([["Model", s.pid || s.model_number || s.model], ["Serial number", s.serial], ["Hardware version", s.hardware_version],
+            ["Software version", s.version], ["Boot mode", s.mode], ["Ports", s.ports != null ? String(s.ports) : null],
+            ["Uptime (at last backup)", s.uptime], ["MAC address", s.mac],
+            ["Power supplies & modules", (s.parts || []).length ? s.parts.map(esc).join("<br>") : null, true]], true) + "</div>";
+  }).join("");
+  return drFold("stack", "Stack Members (" + ms.length + ")", "", body +
+    '<div class="dr-note">Read from the newest backup' + (f.read_from_backup ? " (" + esc(f.read_from_backup) + ")" : "") +
+    ". Run a backup to refresh them.</div>", true);
+}
 function drSec(title, right, inner) {
   return '<div class="dr-sec"><h5>' + esc(title) + '<span class="sp"></span>' + (right || "") + "</h5>" + inner + "</div>";
 }
@@ -21428,21 +21528,22 @@ function drOverview(h, d) {
 
   // device information
   const m = d ? d.monitor : {};
+  const stack = (f.members || []).length > 1, act = stack ? " (active switch)" : "";
   const rows = [
     ["Hostname", h.label || f.hostname], ["Management IP", h.host], ["Model", h.platform],
-    ["Serial number", f.serial], ["Hardware version", f.hardware_version], ["Software version", h.version],
+    ["Stack", stack ? f.members.length + " switches - each one is listed under Stack Members" : null],
+    ["Serial number" + act, f.serial], ["Hardware version" + act, f.hardware_version], ["Software version", h.version],
     ["Boot mode", h.boot && h.boot.mode ? h.boot.mode + (h.boot.detail ? " \u2014 " + h.boot.detail : "") : null],
     ["Credential profile", h.profile], ["SSH host key", d ? drHostKeys(h, d) : null, true],
-    ["Uptime (at last backup)", f.uptime], ["Last reload reason", f.last_reload],
+    ["Uptime (at last backup)" + act, f.uptime], ["Last reload reason", f.last_reload],
     ["Running image", f.image_file],
     ["Availability", h.availability != null ? h.availability.toFixed(1) + "% (" + h.successes + " of " + h.checks + " pings)" : null],
     ["Last checked", m.last_checked], ["Last status change", h.last_change]];
-  for (const s of (f.members || []))
-    rows.push(["Stack member " + s.switch + (s.active ? " (active)" : ""), s.model + " \u00B7 " + s.version + " \u00B7 " + s.mode]);
-  out += drFold("devinfo", "Device information", "", drKV(rows, true) +
+  out += drFold("devinfo", "Device information", "", drKV(rows.filter(r => r[0] !== "Stack" || r[1]), true) +
     (d && !f.serial ? '<div class="dr-note">Serial number, hardware version and uptime are read from the newest saved ' +
       "<i>show version</i> / <i>show inventory</i> backup. Run a backup to fill them in.</div>" :
      d && f.read_from_backup ? '<div class="dr-note">Read from the backup of ' + esc(f.read_from_backup) + ".</div>" : ""), false);
+  if (stack) out += drStack(f);
 
   // upgrade progress
   const pct = drProgress(h);
