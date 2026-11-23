@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v2.3.0 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v2.3.1 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -104,13 +104,17 @@ from netupgrade_app.storage import repositories as nu_repo
 from netupgrade_app.storage.legacy import is_legacy_secret, unprotect_legacy
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.3.0"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "2.3.1"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
+    {"version": "2.3.1", "date": "2026-11-23", "features": [
+        "Refresh Version also updates the device drawer: serial numbers, hardware versions, uptime, MAC addresses, "
+        "power supplies and modules of every stack member are read at the same time (show switch and show inventory "
+        "are run too), and the drawer shows whichever is newer - the last Refresh Version or the last backup."]},
     {"version": "2.3.0", "date": "2026-11-23", "features": [
         "Add Cisco pre-upgrade readiness checks (install state, stack consistency, redundancy, modules, file systems, packages.conf and ROMMON) to the Readiness Check and Diagnosis Pre & Post Checks.",
         "Replace the separate ignore options with one 'Ignore readiness check blocks' option; every ignored block is logged.",
@@ -8041,46 +8045,76 @@ def parse_inventory_facts(text):
     return out
 
 
-def read_device_facts(device_dir):
-    """Serial number, hardware version, uptime, stack members ... read from the newest saved
-    'show version' / 'show inventory' output of this device - from the newest one-file backup
-    (config_backup_<stamp>.txt) ({} if never backed up)."""
-    facts = {}
+REFRESH_FILE_PREFIX = "version_check_"
+
+
+def refresh_facts_path(runs_dir, host):
+    """Where Refresh Version keeps the newest 'show version' / 'show switch' / 'show inventory' of one switch."""
+    return Path(runs_dir) / (REFRESH_FILE_PREFIX + safe_name(host) + ".txt")
+
+
+def _facts_sources(device_dir, refresh_path=None):
+    """[(stamp, path, kind)], newest first: the newest one-file backup ('backup') and the last Refresh Version
+    output ('refresh')."""
+    out = []
     try:
-        all_names = [n for n in os.listdir(device_dir) if STAMP_RE.search(n)]
+        names = [n for n in os.listdir(device_dir) if n.startswith(BACKUP_FILE_PREFIX + "_") and STAMP_RE.search(n)]
     except OSError:
-        return facts
-    for prefix, command in (("show_version", "show version"), ("show_inventory", "show inventory"),
-                            ("show_switch", "show switch")):
-        cands = [(STAMP_RE.search(n).group(1), n) for n in all_names
-                 if n.startswith(BACKUP_FILE_PREFIX + "_")]
-        if not cands:
-            continue
-        stamp, name = max(cands)
-        path = os.path.join(str(device_dir), name)
+        names = []
+    if names:
+        stamp, name = max((STAMP_RE.search(n).group(1), n) for n in names)
+        out.append((stamp, os.path.join(str(device_dir), name), "backup"))
+    if refresh_path:
         try:
-            key = (path, os.path.getmtime(path), prefix)
+            stamp = datetime.fromtimestamp(os.path.getmtime(refresh_path)).strftime("%Y%m%d_%H%M%S")
+            out.append((stamp, str(refresh_path), "refresh"))
         except OSError:
-            continue
-        if key not in _FACTS_CACHE:
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                    text = fh.read(8_000_000)
-            except OSError:
-                continue
-            text = split_command_sections(text).get(command, "")
+            pass
+    return sorted(out, reverse=True)
+
+
+def _section_facts(path, prefix, command):
+    """The parsed facts of one command saved in one file, or None when the file does not hold that command."""
+    try:
+        key = (path, os.path.getmtime(path), prefix)
+    except OSError:
+        return None
+    if key not in _FACTS_CACHE:
+        parsed = None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = split_command_sections(fh.read(8_000_000)).get(command, "")
+        except OSError:
+            text = ""
+        if text.strip() and not text.lstrip().startswith("!! FAILED"):
             parsed = (parse_show_version_facts(text) if prefix == "show_version"
                       else {"inventory": parse_inventory_facts(text)} if prefix == "show_inventory"
-                      else {"switch_roles": parse_show_switch(text) or []} if text else {})
-            parsed["_time"] = _stamp_to_time(stamp)
-            if len(_FACTS_CACHE) > 400:
-                _FACTS_CACHE.clear()
-            _FACTS_CACHE[key] = parsed
-        for k, v in _FACTS_CACHE[key].items():
-            if k == "_time":
-                facts["read_from_backup"] = max(facts.get("read_from_backup", ""), v)
-            else:
-                facts[k] = v
+                      else {"switch_roles": parse_show_switch(text) or []})
+        if len(_FACTS_CACHE) > 400:
+            _FACTS_CACHE.clear()
+        _FACTS_CACHE[key] = parsed
+    return _FACTS_CACHE[key]
+
+
+def read_device_facts(device_dir, refresh_path=None):
+    """Serial number, hardware version, uptime, stack members ... read from the newest saved 'show version' /
+    'show inventory' / 'show switch' output of this device: the newest one-file backup (config_backup_<stamp>.txt)
+    or the last Refresh Version (refresh_path), whichever is newer ({} if neither exists). A command missing from
+    the newer one is taken from the other. facts['read_from'] says where 'show version' came from."""
+    facts = {}
+    sources = _facts_sources(device_dir, refresh_path)
+    for prefix, command in (("show_version", "show version"), ("show_inventory", "show inventory"),
+                            ("show_switch", "show switch")):
+        for stamp, src, kind in sources:
+            parsed = _section_facts(src, prefix, command)
+            if parsed is None:
+                continue
+            facts.update(parsed)
+            if prefix == "show_version" or "read_from" not in facts:
+                facts["read_from"] = {"kind": kind, "time": _stamp_to_time(stamp)}
+            if kind == "backup":
+                facts["read_from_backup"] = max(facts.get("read_from_backup", ""), _stamp_to_time(stamp))
+            break
     inv = facts.get("inventory") or []
     members = facts.get("members") or []
     if members:                                        # every stack member, not only the active one
@@ -11961,19 +11995,28 @@ class Manager:
         dtype = BACKUP_DEVICE_TYPES.get(self.info[host]["type"], "cisco_xe")
         device = {"device_type": dtype, "host": host, "username": username, "password": password,
                   "secret": secret, "conn_timeout": 20, "auth_timeout": 20, "banner_timeout": 20}
+        runs_dir = self.runs_dir                        # this site's, even if another site is opened meanwhile
+        sections = []
         try:
             with ConnectHandler(**device) as conn:
                 if secret:
                     conn.enable()
                 sv = conn.send_command("show version", read_timeout=tmo('show_cmd'))
                 version, model = parse_version(sv), parse_model(sv)
+                sections.append(("show version", sv))
                 try:
                     sb = conn.send_command("show boot", read_timeout=tmo('show_cmd'))
                     boot = boot_state(sv, sb) if sb else None
                 except Exception:  # noqa: BLE001 - the version is still worth having
                     boot = None
+                for command in ("show switch", "show inventory"):    # the device drawer's stack members
+                    try:
+                        sections.append((command, conn.send_command(command, read_timeout=tmo('show_cmd'))))
+                    except Exception:  # noqa: BLE001 - the drawer then keeps the backup's values
+                        pass
             if not version:
                 raise ValueError("could not find the version in 'show version'")
+            self._save_refresh_facts(runs_dir, host, sections)
         except NetmikoAuthenticationException:
             self.events.add(host, self.label(host), "Version check failed: authentication failed", "bad")
             return
@@ -12003,6 +12046,23 @@ class Manager:
         info = (f" ({model})" if model else "") + (f", {boot['mode']} mode" if boot and boot.get("mode") else "")
         self.events.add(host, self.label(host), confirmed or f"Software version: {version}{info}",
                         "ok" if confirmed else "info")
+
+    def _save_refresh_facts(self, runs_dir, host, sections):
+        """Keep what Refresh Version read, so the device drawer shows it (newer than the last backup)."""
+        if runs_dir is None or not sections:
+            return
+        heading = f"Refresh Version - {self.label(host) or host} ({host}) - {now_str()}"
+        path = refresh_facts_path(runs_dir, host)
+        tmp = Path(str(path) + "." + secrets.token_hex(4) + ".tmp")
+        try:
+            Path(runs_dir).mkdir(parents=True, exist_ok=True)
+            tmp.write_text(command_sections_text(heading, sections) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def test_credentials(self, hosts, profile=None, adhoc=None):
         """Log in to the switches. With `profile` (a saved profile name) that profile is tried on every
@@ -13858,7 +13918,7 @@ class Manager:
         if not self.monitor.running:                  # up/down is only known while monitoring is on
             mon["status"], mon["monitoring_off"] = "DOWN", True
 
-        facts = read_device_facts(device_dir)
+        facts = read_device_facts(device_dir, refresh_facts_path(runs_dir, host))
         backups = list_device_backups(device_dir)
         run_files = list_run_files(runs_dir, host)
         model = ops.get("model") or facts.get("members", [{}])[0].get("model") or info.get("platform") or None
@@ -21397,6 +21457,11 @@ async function drForgetHostKey() {
 }
 // Every member of a stack, each with its own model, serial number, hardware / software version, uptime, MAC address and
 // power supplies / modules (from the newest backup's show version + show inventory; role and state from show switch).
+function drReadFrom(f) {
+  const r = f.read_from;
+  if (!r) return "Read from the newest backup.";
+  return (r.kind === "refresh" ? "Read by Refresh Version at " : "Read from the backup of ") + esc(r.time) + ".";
+}
 function drStack(f) {
   const ms = (f.members || []).slice().sort((a, b) => a.switch - b.switch);
   const body = ms.map(s => {
@@ -21404,12 +21469,11 @@ function drStack(f) {
     return '<div class="dr-mem"><h6>Switch ' + esc(s.switch) + " <small>" + esc(role) + (s.state ? " \u00B7 " + esc(s.state) : "") + "</small></h6>" +
       drKV([["Model", s.pid || s.model_number || s.model], ["Serial number", s.serial], ["Hardware version", s.hardware_version],
             ["Software version", s.version], ["Boot mode", s.mode], ["Ports", s.ports != null ? String(s.ports) : null],
-            ["Uptime (at last backup)", s.uptime], ["MAC address", s.mac],
+            ["Uptime (when last read)", s.uptime], ["MAC address", s.mac],
             ["Power supplies & modules", (s.parts || []).length ? s.parts.map(esc).join("<br>") : null, true]], true) + "</div>";
   }).join("");
   return drFold("stack", "Stack Members (" + ms.length + ")", "", body +
-    '<div class="dr-note">Read from the newest backup' + (f.read_from_backup ? " (" + esc(f.read_from_backup) + ")" : "") +
-    ". Run a backup to refresh them.</div>", true);
+    '<div class="dr-note">' + drReadFrom(f) + " Refresh Version or a backup updates them.</div>", true);
 }
 function drSec(title, right, inner) {
   return '<div class="dr-sec"><h5>' + esc(title) + '<span class="sp"></span>' + (right || "") + "</h5>" + inner + "</div>";
@@ -21535,14 +21599,14 @@ function drOverview(h, d) {
     ["Serial number" + act, f.serial], ["Hardware version" + act, f.hardware_version], ["Software version", h.version],
     ["Boot mode", h.boot && h.boot.mode ? h.boot.mode + (h.boot.detail ? " \u2014 " + h.boot.detail : "") : null],
     ["Credential profile", h.profile], ["SSH host key", d ? drHostKeys(h, d) : null, true],
-    ["Uptime (at last backup)" + act, f.uptime], ["Last reload reason", f.last_reload],
+    ["Uptime (when last read)" + act, f.uptime], ["Last reload reason", f.last_reload],
     ["Running image", f.image_file],
     ["Availability", h.availability != null ? h.availability.toFixed(1) + "% (" + h.successes + " of " + h.checks + " pings)" : null],
     ["Last checked", m.last_checked], ["Last status change", h.last_change]];
   out += drFold("devinfo", "Device information", "", drKV(rows.filter(r => r[0] !== "Stack" || r[1]), true) +
-    (d && !f.serial ? '<div class="dr-note">Serial number, hardware version and uptime are read from the newest saved ' +
-      "<i>show version</i> / <i>show inventory</i> backup. Run a backup to fill them in.</div>" :
-     d && f.read_from_backup ? '<div class="dr-note">Read from the backup of ' + esc(f.read_from_backup) + ".</div>" : ""), false);
+    (d && !f.serial ? '<div class="dr-note">Serial number, hardware version and uptime are read from the newest ' +
+      "<i>show version</i> / <i>show inventory</i>. Press Refresh Version or run a backup to fill them in.</div>" :
+     d && f.read_from ? '<div class="dr-note">' + drReadFrom(f) + "</div>" : ""), false);
   if (stack) out += drStack(f);
 
   // upgrade progress
