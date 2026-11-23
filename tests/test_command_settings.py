@@ -20,6 +20,12 @@ class FakeConn(object):
 
 
 ITEMS = {i["key"]: i for i in manager.SETTINGS_ITEMS if i["type"] == "commands"}
+CATALOG = {"commands_catalog": list(manager.SETTINGS_DEFAULT_CATALOG)}    # what the app saves with every list
+
+
+def sel(**lists):
+    """A saved selection as the app stores it (with the list of commands it offered)."""
+    return dict(CATALOG, **lists)
 
 
 class SelectionTests(unittest.TestCase):
@@ -28,8 +34,9 @@ class SelectionTests(unittest.TestCase):
 
     def test_defaults_select_every_command_once(self):
         values = manager.clean_settings({})
-        self.assertEqual(len(values["check_commands"]), 21)
-        self.assertEqual(len(set(values["check_commands"])), 21)
+        self.assertEqual(len(values["check_commands"]), 22)
+        self.assertEqual(len(set(values["check_commands"])), 22)
+        self.assertIn("show mac address-table dynamic", values["check_commands"])
         self.assertEqual(values["backup_commands"],
                          ["show running-config", "show vlan", "show version", "show boot", "show inventory"])
 
@@ -48,14 +55,14 @@ class SelectionTests(unittest.TestCase):
     def test_unknown_command_is_refused_and_a_damaged_value_becomes_the_default(self):
         with self.assertRaisesRegex(manager.ApiError, "Unknown command"):
             manager.clean_settings({"check_commands": ["show version", "show boot", "reload"]}, strict=True)
-        self.assertEqual(manager.clean_settings({"check_commands": "show version"})["check_commands"],
+        self.assertEqual(manager.clean_settings(sel(check_commands="show version"))["check_commands"],
                          ITEMS["check_commands"]["default"])
-        self.assertEqual(manager.clean_settings({"check_commands": ["show boot"]})["check_commands"],
+        self.assertEqual(manager.clean_settings(sel(check_commands=["show boot"]))["check_commands"],
                          ITEMS["check_commands"]["default"])
 
     def test_snapshot_and_health_follow_the_selection(self):
-        manager.apply_command_selection({"check_commands": ["show version", "show interfaces status", "show vlan brief",
-                                                            "show processes cpu"]})
+        manager.apply_command_selection(sel(check_commands=["show version", "show interfaces status", "show vlan brief",
+                                                            "show processes cpu"]))
         conn = FakeConn()
         outputs, _snap = manager.read_snapshot(conn)
         manager.read_health(conn)
@@ -64,10 +71,10 @@ class SelectionTests(unittest.TestCase):
         self.assertNotIn("show ip interface brief", manager.snapshot_text(outputs, "x"))
 
     def test_diagnosis_checks_use_the_selection(self):
-        manager.apply_command_selection({"check_commands": ["show clock", "show module", "show switch"]})
+        manager.apply_command_selection(sel(check_commands=["show clock", "show module", "show switch"]))
         self.assertEqual(manager.selected_check_commands(), ["show clock", "show version", "show module", "show switch"])
         manager.apply_command_selection({})
-        self.assertEqual(len(manager.selected_check_commands()), 21)
+        self.assertEqual(len(manager.selected_check_commands()), 22)
 
 
 class NoDuplicateTests(unittest.TestCase):
@@ -102,7 +109,7 @@ class NoDuplicateTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        manager.apply_command_selection({"backup_commands": ["show running-config", "show version", "show inventory"]})
+        manager.apply_command_selection(sel(backup_commands=["show running-config", "show version", "show inventory"]))
         self.addCleanup(manager.apply_command_selection, {})
         with tempfile.TemporaryDirectory() as tmp, patch.object(manager, "ConnectHandler", lambda **kw: Ctx()):
             manager.do_backup("10.0.0.1", "cisco_xe", "u", "p", "", tmp, "20261123_120000",
