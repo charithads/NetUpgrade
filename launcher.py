@@ -89,7 +89,7 @@ import pystray
 from PIL import Image, ImageTk
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.3.2"   # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
+APP_VERSION = "2.3.3"   # keep equal to APP_VERSION in ios_xe_upgrade_manager.py
 UI_FONT_SIZE = 8               # window size follows the font: 9 = the old, larger window; 8 = compact
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"

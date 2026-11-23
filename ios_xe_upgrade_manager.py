@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NetUpgrade v2.3.2 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
+NetUpgrade v2.3.3 - monitor, back up and upgrade Cisco Catalyst 9200 switches from one
 web page, with the firmware-upgrade worker built into the same file/program.
 
 What it does
@@ -104,13 +104,18 @@ from netupgrade_app.storage import repositories as nu_repo
 from netupgrade_app.storage.legacy import is_legacy_secret, unprotect_legacy
 
 APP_NAME = "NetUpgrade"
-APP_VERSION = "2.3.2"           # single place to change the release number (shown in the GUI, --version, reports)
+APP_VERSION = "2.3.3"           # single place to change the release number (shown in the GUI, --version, reports)
 APP_AUTHOR = "Charitha Dasanayaka"
 APP_REPO_URL = "https://github.com/charithads/NetUpgrade"   # shown in the footer
 
 # Features included in this release, shown under Settings > About.
 # Keep APP_VERSION above and APP_VERSION in launcher.py synchronized.
 CHANGELOG = [
+    {"version": "2.3.3", "date": "2026-11-24", "features": [
+        "Pre & post checks also check 802.1X / MAB authentication (show authentication sessions): the result shows how "
+        "many sessions are authenticated and lists the ports that are not, and warns about any device that was "
+        "authenticated before the upgrade but is not afterwards.",
+        "Sessions whose status carries a flag letter (for example 'Auth D') are counted as authenticated."]},
     {"version": "2.3.2", "date": "2026-11-23", "features": [
         "Pre & post checks also read the MAC addresses learnt on each access port (show mac address-table dynamic) and "
         "warn about any device that is not learnt again, or is learnt on another port, after the upgrade."]},
